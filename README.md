@@ -103,6 +103,8 @@ commits — so they can be recovered, but they are not fetched for you.
 You also need a game dump in `nx1/` and must run ReXGlue to produce `generated/`, since
 neither is distributed here.
 
+You will also need the Discord Social SDK for rich presense support.
+
 ---
 
 ## Credits
