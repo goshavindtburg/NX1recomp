@@ -10,7 +10,7 @@ Two targets are built:
 | Target | What it is |
 | --- | --- |
 | `nx1_sp` | Single-player. Runs on the ReXGlue graphics backend, plus a developer overlay. |
-| `nx1_mp` | Multiplayer. Uses a purpose-built **native D3D9 renderer** and has working netplay. |
+| `nx1_mp` | Multiplayer. Uses a purpose-built **native D3D9 renderer** and has working netplay. D3D9 Renderer is only enabled if nx1_d3d9 is enabled in the TOML :D |
 
 Current release: **v0.9** — see [CHANGELOG.md](CHANGELOG.md).
 
