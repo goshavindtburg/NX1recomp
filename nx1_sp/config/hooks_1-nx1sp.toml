@@ -1,0 +1,121 @@
+# Runtime probes for the loadable 1-nx1sp SP target.
+
+setjmp_address = 0x8277B5C0
+longjmp_address = 0x8277C540
+
+[[midasm_hook]]
+address = 0x825C82F8
+name = "rex_sp_skip_missing_allocator_assert"
+registers = ["r8", "r31"]
+jump_address_on_true = 0x825C8344
+
+[[midasm_hook]]
+address = 0x8242BE08
+name = "rex_sp_trace_com_error_verbose"
+registers = ["r12", "r3", "r4", "r5", "r6"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82287BB0
+name = "rex_sp_note_campaign_map"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x8227FD00
+name = "rex_sp_raise_game_map_pool_limit"
+registers = ["r3"]
+
+[[midasm_hook]]
+address = 0x8227FE40
+name = "rex_sp_supply_extra_game_map_asset"
+registers = ["r3", "r1"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8227FEC0
+name = "rex_sp_skip_game_map_pool_error"
+registers = ["r30", "r8", "r7"]
+jump_address_on_true = 0x8227FEC4
+
+[[midasm_hook]]
+address = 0x8227F148
+name = "rex_sp_skip_unlock_read_underflow"
+registers = ["r3", "r11"]
+jump_address_on_true = 0x8227F180
+
+[[midasm_hook]]
+address = 0x8227F280
+name = "rex_sp_skip_unlock_write_underflow"
+registers = ["r3", "r11"]
+jump_address_on_true = 0x8227F2BC
+
+[[midasm_hook]]
+address = 0x824BCD10
+name = "rex_sp_trace_massert_vargs"
+registers = ["r12", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824F52C8
+name = "rex_sp_expand_d3d_heap_for_high_resolution"
+registers = ["r3", "r6", "r7"]
+
+[[midasm_hook]]
+address = 0x826CEC74
+name = "rex_sp_skip_nxheap_region_alloc_assert"
+registers = ["r12", "r30", "r31", "r28", "r27", "r29", "r10", "r11"]
+jump_address_on_true = 0x826CEC98
+
+[[midasm_hook]]
+address = 0x825CB504
+name = "rex_sp_skip_memmap_profile_pop_overflow"
+registers = ["r13"]
+jump_address_on_true = 0x825CB598
+
+[[midasm_hook]]
+address = 0x825CB84C
+name = "rex_sp_skip_memmap_profile_pop_overflow"
+registers = ["r13"]
+jump_address_on_true = 0x825CB8F0
+
+[[midasm_hook]]
+address = 0x825CB95C
+name = "rex_sp_skip_memmap_profile_push_overflow"
+registers = ["r8", "r13", "r27"]
+jump_address_on_true = 0x825CBAB8
+
+[[midasm_hook]]
+address = 0x824F3ABC
+name = "rex_sp_skip_virtual_commit_memory_assert"
+registers = ["r8", "r22", "r20", "r23"]
+jump_address_on_true = 0x824F3AC0
+
+[[midasm_hook]]
+address = 0x824F3858
+name = "rex_sp_skip_virtual_decommit_memory_assert"
+registers = ["r8", "r20", "r19", "r22"]
+jump_address_on_true = 0x824F385C
+
+[[midasm_hook]]
+address = 0x824F35F0
+name = "rex_sp_skip_virtual_free_memory_assert"
+registers = ["r8", "r22", "r20", "r31"]
+jump_address_on_true = 0x824F35F4
+
+[[midasm_hook]]
+address = 0x82704E90
+name = "rex_sp_skip_blank_screen_memory_assert"
+registers = ["r31"]
+jump_address_on_true = 0x82704E94
+
+[[midasm_hook]]
+address = 0x82523580
+name = "rex_sp_trace_sys_quit"
+registers = ["r12"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8277C540
+name = "rex_sp_trace_longjmp"
+registers = ["r0", "r3", "r4"]
+after_instruction = true

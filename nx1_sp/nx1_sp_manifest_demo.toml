@@ -1,0 +1,11 @@
+# Temporary probe manifest for the SP demo image.
+
+[project]
+name = "nx1_sp_demo_probe"
+sdk_version = "0.8.0.0"
+game_root = "../nx1"
+
+[entrypoint]
+file_path = "../nx1/4-nx1sp_demo.rex.xex"
+out_directory_path = "generated/4-nx1sp_demo_rex"
+includes = ["config/map_functions.toml", "config/ida_functions.toml", "config/hooks.toml"]

@@ -1,0 +1,7 @@
+# Local runtime hooks for NX1 SP bring-up.
+
+[[midasm_hook]]
+address = 0x8240C890
+name = "rex_sp_skip_storage_selector"
+registers = ["r3"]
+return = true

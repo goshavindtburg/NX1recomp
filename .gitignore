@@ -1,0 +1,36 @@
+# ---- Game data / copyrighted material ----
+# Recompiled game code and extracted shaders. Must never be committed.
+/nx1/
+generated/
+tools/xenosrecomp_shader_dumps/
+tools/new_shader_dump/
+tools/xenosrecomp_hlsl/
+tools/nx1_native_shader_cache.cpp
+tools/nx1_sm3_shader_cache.cpp
+tools/xenosrecomp_failed_*.hlsl
+
+# ---- Third-party SDK ----
+/Discord SDK/
+
+# ---- Vendored dependencies ----
+# thirdparty/ trees are upstream submodule checkouts of XenosRecomp and
+# rexglue-sdk. Their URLs/commits are recorded in each project's own
+# .gitmodules, which IS committed, so they can be restored.
+thirdparty/
+
+# External research clones (upstream Xenia repos, unmodified).
+tools/netplay_research/
+
+# Disabled inner git dirs, kept so the upstream history/remotes of
+# XenosRecomp and rexglue-sdk remain recoverable.
+.git-disabled/
+
+# ---- Build output ----
+out/
+build/
+
+# ---- Scratch / temp ----
+.tmp_xenia_netplay/
+*.bak
+*.bak[0-9]
+*.log

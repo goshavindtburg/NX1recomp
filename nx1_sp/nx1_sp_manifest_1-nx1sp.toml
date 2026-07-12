@@ -1,0 +1,11 @@
+# SP target using the loadable 1-nx1sp image and its matching MSVC map.
+
+[project]
+name = "nx1_sp"
+sdk_version = "0.8.0.0"
+game_root = "../nx1"
+
+[entrypoint]
+file_path = "../nx1/1-nx1sp.xex"
+out_directory_path = "generated/1-nx1sp"
+includes = ["config/map_functions_1-nx1sp.toml", "config/hooks_1-nx1sp.toml"]

@@ -1,0 +1,249 @@
+# Optional function entries exported from IDA.
+#
+# Expected format:
+# [functions]
+# 0x82180000 = { name = "Profile_Begin" }
+
+[functions]
+0x820FD780 = { name = "NX1GetClipAmmoWidth_YAMPBUcg_s_H_Z", size = 0x128, parent = 0x820FD6B8 }
+0x821E1668 = { name = "NX1Glass_UseDeflection_YA_NPIBUFxGlassCrackWork_PIBUFxGlassClipSegment_IPBUFxGlassCrackEdge_PIBMMM_Z", size = 0xA0, parent = 0x821E1320 }
+0x8212F270 = { name = "rex_sp_synth_8212F270", parent = 0x8212E2C8 }
+0x82206678 = { name = "NX1Actor_EnemyInPathFightDist_YA_NPAUactor_s_PAUsentient_s_Z", size = 0x68, parent = 0x82206430 }
+0x8228BCD0 = { name = "NX1ScrCmd_SetDopplerSpeed_YAXUscr_entref_t_Z", size = 0x38, parent = 0x8228BC70 }
+0x821F2058 = { name = "rex_sp_synth_821F2058", parent = 0x821F1D58 }
+0x8228E508 = { name = "rex_sp_synth_8228E508", parent = 0x8228E460 }
+0x82297DB0 = { name = "rex_sp_synth_82297DB0", parent = 0x82297D68 }
+0x822B1E30 = { name = "rex_sp_synth_822B1E30", parent = 0x822B1B70 }
+0x822D28D8 = { name = "rex_sp_synth_822D28D8", parent = 0x822D27B0 }
+0x822D2938 = { name = "NX1cullPoints_YAXHQAMHHQAH_Z", size = 0x450, parent = 0x822D28D8 }
+0x822D3348 = { name = "rex_sp_synth_822D3348", parent = 0x822D2F20 }
+0x822D3CF0 = { name = "rex_sp_synth_822D3CF0", parent = 0x822D2F20 }
+0x822D4958 = { name = "NX1ODE_GeomTransformSetOffset", size = 0x20, parent = 0x822D48A8 }
+0x822D9E88 = { name = "rex_sp_synth_822D9E88", parent = 0x822D9DC8 }
+0x822DAB48 = { name = "rex_sp_synth_822DAB48", parent = 0x822DAA98 }
+0x822E5FA8 = { name = "rex_sp_synth_822E5FA8", parent = 0x822E5E88 }
+0x822EB920 = { name = "rex_sp_synth_822EB920", parent = 0x822EB880 }
+0x8232FEF8 = { name = "rex_sp_synth_8232FEF8", parent = 0x8232FE88 }
+0x823322D8 = { name = "rex_sp_synth_823322D8", parent = 0x82331A90 }
+0x823422B8 = { name = "rex_sp_synth_823422B8", parent = 0x82342200 }
+0x82348648 = { name = "rex_sp_synth_82348648", parent = 0x82348630 }
+0x82353F88 = { name = "rex_sp_synth_82353F88", parent = 0x82353D90 }
+0x8235E818 = { name = "rex_sp_synth_8235E818", parent = 0x8235E778, size = 0x20 }
+0x8237A7D8 = { name = "rex_sp_synth_8237A7D8", parent = 0x8237A408 }
+0x823CE4F0 = { name = "rex_sp_synth_823CE4F0", parent = 0x823CE3D8 }
+0x82483F10 = { name = "rex_sp_synth_82483F10", parent = 0x82483ED8, size = 0x8 }
+0x82527038 = { name = "rex_sp_synth_82527038", parent = 0x82527018, size = 0x10 }
+0x82527090 = { name = "rex_sp_synth_82527090", parent = 0x82527068, size = 0x8 }
+0x825270A0 = { name = "rex_sp_synth_825270A0", parent = 0x82527098, size = 0xC }
+0x825270C8 = { name = "rex_sp_synth_825270C8", parent = 0x825270B0, size = 0x10 }
+0x825270D8 = { name = "rex_sp_synth_825270D8", parent = 0x825270B0, size = 0x10 }
+0x825270E8 = { name = "rex_sp_synth_825270E8", parent = 0x825270B0, size = 0x10 }
+0x825270F8 = { name = "rex_sp_synth_825270F8", parent = 0x825270B0, size = 0x10 }
+0x82527108 = { name = "rex_sp_synth_82527108", parent = 0x825270B0, size = 0x10 }
+0x82527118 = { name = "rex_sp_synth_82527118", parent = 0x825270B0, size = 0xC }
+0x82527128 = { name = "rex_sp_synth_82527128", parent = 0x82527120, size = 0x10 }
+0x82527138 = { name = "rex_sp_synth_82527138", parent = 0x82527120, size = 0x10 }
+0x82527148 = { name = "rex_sp_synth_82527148", parent = 0x82527120, size = 0x10 }
+0x82527158 = { name = "rex_sp_synth_82527158", parent = 0x82527120, size = 0x10 }
+0x82527168 = { name = "rex_sp_synth_82527168", parent = 0x82527120, size = 0x10 }
+0x82527178 = { name = "rex_sp_synth_82527178", parent = 0x82527120, size = 0x10 }
+0x82527188 = { name = "rex_sp_synth_82527188", parent = 0x82527120, size = 0x10 }
+0x82527198 = { name = "rex_sp_synth_82527198", parent = 0x82527120, size = 0x10 }
+0x825271A8 = { name = "rex_sp_synth_825271A8", parent = 0x82527120, size = 0x18 }
+0x825271C0 = { name = "rex_sp_synth_825271C0", parent = 0x82527120, size = 0x18 }
+0x825271D8 = { name = "rex_sp_synth_825271D8", parent = 0x82527120, size = 0x10 }
+0x825271E8 = { name = "rex_sp_synth_825271E8", parent = 0x82527120, size = 0x10 }
+0x825271F8 = { name = "rex_sp_synth_825271F8", parent = 0x82527120, size = 0xC }
+0x82527208 = { name = "rex_sp_synth_82527208", parent = 0x82527200, size = 0x30 }
+0x82527238 = { name = "rex_sp_synth_82527238", parent = 0x82527200, size = 0x10 }
+0x82527298 = { name = "rex_sp_synth_82527298", parent = 0x82527200, size = 0xC }
+0x825272A8 = { name = "rex_sp_synth_825272A8", parent = 0x825272A0, size = 0x10 }
+0x825272B8 = { name = "rex_sp_synth_825272B8", parent = 0x825272A0, size = 0x10 }
+0x825272C8 = { name = "rex_sp_synth_825272C8", parent = 0x825272A0, size = 0x10 }
+0x825272D8 = { name = "rex_sp_synth_825272D8", parent = 0x825272A0, size = 0x4 }
+0x823D3E20 = { name = "rex_sp_synth_823D3E20", parent = 0x823D3D70 }
+0x823DAB58 = { name = "rex_sp_synth_823DAB58", parent = 0x823DAB20 }
+0x823EDAE8 = { name = "rex_sp_synth_823EDAE8", parent = 0x823EDA08 }
+0x823F0368 = { name = "rex_sp_synth_823F0368", parent = 0x823F02F0 }
+0x823F0460 = { name = "rex_sp_synth_823F0460", parent = 0x823F0410 }
+0x8240B920 = { name = "rex_sp_synth_8240B920", parent = 0x8240B5A8 }
+0x824181B0 = { name = "rex_sp_synth_824181B0", parent = 0x82418130 }
+0x8245A628 = { name = "rex_sp_synth_8245A628", parent = 0x8245A050 }
+0x82463A18 = { name = "rex_sp_synth_82463A18", parent = 0x824636E0 }
+0x824A0B80 = { name = "rex_sp_synth_824A0B80", parent = 0x824A0AB8 }
+0x824A6BA0 = { name = "rex_sp_synth_824A6BA0", parent = 0x824A6978 }
+0x824A7CD8 = { name = "rex_sp_synth_824A7CD8", parent = 0x824A7BB8 }
+0x824E6F28 = { name = "rex_sp_synth_824E6F28", parent = 0x824E6E30 }
+0x8250D100 = { name = "rex_sp_synth_8250D100", parent = 0x8250CF38 }
+0x825246C0 = { name = "rex_sp_synth_825246C0", parent = 0x82524648 }
+0x82318AE0 = { name = "NX1FindVariableIndexInternal_YAIII_Z", size = 0x48, parent = 0x82318A80 }
+0x82344628 = { name = "NX1Item_Bind_Paint_YAXPAUUiContext_PAUitemDef_s_Z", size = 0xA0, parent = 0x823444E8 }
+0x82403A20 = { name = "NX1_1bdAddr_QAA_XZ", size = 0x8, parent = 0x82403968 }
+0x82414518 = { name = "NX1StfcFsdClose", size = 0x78, parent = 0x82414490 }
+0x8241F628 = { name = "NX1IsInputFormatSupported_CXAPOBase_UAAJPBUtWAVEFORMATEX_0PAPAU2_Z", size = 0x128, parent = 0x8241F578 }
+0x82424428 = { name = "NX1MatrixMixFromFl32MonoToStereoVmx_OAPIPELINE_YAXPIBUSMatrixMixParameters_1_Z", size = 0x1E8, parent = 0x824241B8 }
+0x8242AEB8 = { name = "NX1XMAHALSetLoop", size = 0xC0, parent = 0x8242AE10 }
+0x8246B1C0 = { name = "rex_sp_synth_8246B1C0", size = 0x188, parent = 0x8246B060 }
+0x824E3710 = { name = "NX1R_SkinXSurfaceSkinned_YAXPBUXSurface_PBUDObjSkelMat_PAX_Z", size = 0x38, parent = 0x824E3670 }
+0x8250EB50 = { name = "NX1R_DrawStaticModelSurfLit_YAXPIAUGfxSModelSurfIter_UGfxCmdBufContext_PIBUGfxDrawListInfo_Z", size = 0xC0, parent = 0x8250EA50 }
+0x82535428 = { name = "rex_sp_synth_82535428", size = 0x1D8, parent = 0x82534F40 }
+0x82416898 = { name = "NX1StfcBeginDirectoryEntryUpdate", size = 0x70, parent = 0x82416818 }
+0x82416908 = { name = "NX1StfcUpdateDirectoryEntry", size = 0x80, parent = 0x82416818 }
+0x82416988 = { name = "NX1StfcEnsureWriteableDirectoryEntry", size = 0x80, parent = 0x82416818 }
+0x82416A08 = { name = "NX1StfcDeleteFileAllocation", size = 0x70, parent = 0x82416818 }
+0x82416A78 = { name = "NX1StfcTruncateFileAllocation", size = 0xA0, parent = 0x82416818 }
+0x82416B18 = { name = "NX1StfcExtendFileAllocation", size = 0xF8, parent = 0x82416818 }
+0x82416C10 = { name = "NX1StfcSetAllocationSize", size = 0xD8, parent = 0x82416818 }
+0x82416CE8 = { name = "NX1StfcFsdWrite", size = 0xE8, parent = 0x82416818 }
+0x8250C420 = { name = "rex_sp_synth_8250C420", size = 0x8, parent = 0x8250C130 }
+0x8251CA18 = { name = "rex_sp_synth_8251CA18", size = 0x30, parent = 0x8251C9D0 }
+0x82524FB0 = { name = "rex_sp_synth_82524FB0", size = 0x50, parent = 0x82524DE0 }
+0x82525010 = { name = "rex_sp_synth_82525010", size = 0x40, parent = 0x82525008 }
+
+# SP static initializer table targets from 0-Nightly SP maps.sp.xex, bounded with 4-nx1sp_demo.map ranges.
+0x82524D50 = { name = "rex_sp_init_82524D50", size = 0x90, parent = 0x82524B80 }
+0x82524DE8 = { name = "rex_sp_init_82524DE8", size = 0x98, parent = 0x82524DE0 }
+0x82524E80 = { name = "rex_sp_init_82524E80", size = 0x98, parent = 0x82524DE0 }
+0x82524F18 = { name = "rex_sp_init_82524F18", size = 0x98, parent = 0x82524DE0 }
+0x82525038 = { name = "rex_sp_init_82525038", size = 0x18, parent = 0x82525008 }
+0x82525060 = { name = "rex_sp_init_82525060", size = 0x20, parent = 0x82525050 }
+0x82525090 = { name = "rex_sp_init_82525090", size = 0x20, parent = 0x82525080 }
+0x825250B8 = { name = "rex_sp_init_825250B8", size = 0x10, parent = 0x825250B0 }
+0x825250E8 = { name = "rex_sp_init_825250E8", size = 0x28, parent = 0x825250C8 }
+0x82525110 = { name = "rex_sp_init_82525110", size = 0x28, parent = 0x825250C8 }
+0x82525138 = { name = "rex_sp_init_82525138", size = 0x30, parent = 0x825250C8 }
+0x82525168 = { name = "rex_sp_init_82525168", size = 0x28, parent = 0x825250C8 }
+0x82525190 = { name = "rex_sp_init_82525190", size = 0x28, parent = 0x825250C8 }
+0x825251B8 = { name = "rex_sp_init_825251B8", size = 0x28, parent = 0x825250C8 }
+0x82525208 = { name = "rex_sp_init_82525208", size = 0x28, parent = 0x825251E0 }
+0x82525230 = { name = "rex_sp_init_82525230", size = 0x28, parent = 0x825251E0 }
+0x82525258 = { name = "rex_sp_init_82525258", size = 0x28, parent = 0x825251E0 }
+0x825252A8 = { name = "rex_sp_init_825252A8", size = 0x10, parent = 0x82525280 }
+0x825252C8 = { name = "rex_sp_init_825252C8", size = 0x8, parent = 0x825252B8 }
+0x825252E8 = { name = "rex_sp_init_825252E8", size = 0x20, parent = 0x825252D0 }
+0x82525308 = { name = "rex_sp_init_82525308", size = 0x20, parent = 0x825252D0 }
+0x82525348 = { name = "rex_sp_init_82525348", size = 0x20, parent = 0x82525328 }
+0x82525368 = { name = "rex_sp_init_82525368", size = 0x20, parent = 0x82525328 }
+0x82525388 = { name = "rex_sp_init_82525388", size = 0x20, parent = 0x82525328 }
+0x825253A8 = { name = "rex_sp_init_825253A8", size = 0x10, parent = 0x82525328 }
+0x825253C0 = { name = "rex_sp_init_825253C0", size = 0x18, parent = 0x825253B8 }
+0x82525400 = { name = "rex_sp_init_82525400", size = 0x8, parent = 0x825253D8 }
+0x82525428 = { name = "rex_sp_init_82525428", size = 0x28, parent = 0x82525408 }
+0x82525450 = { name = "rex_sp_init_82525450", size = 0x8, parent = 0x82525408 }
+0x82525598 = { name = "rex_sp_init_82525598", size = 0x10, parent = 0x82525560 }
+0x825255F0 = { name = "rex_sp_init_825255F0", size = 0x10, parent = 0x82525560 }
+0x82525620 = { name = "rex_sp_init_82525620", size = 0x20, parent = 0x82525600 }
+0x82525640 = { name = "rex_sp_init_82525640", size = 0x20, parent = 0x82525600 }
+0x82525660 = { name = "rex_sp_init_82525660", size = 0x20, parent = 0x82525600 }
+0x82525680 = { name = "rex_sp_init_82525680", size = 0x20, parent = 0x82525600 }
+0x825256A0 = { name = "rex_sp_init_825256A0", size = 0x20, parent = 0x82525600 }
+0x825256E0 = { name = "rex_sp_init_825256E0", size = 0x20, parent = 0x825256C0 }
+0x82525700 = { name = "rex_sp_init_82525700", size = 0x20, parent = 0x825256C0 }
+0x82525720 = { name = "rex_sp_init_82525720", size = 0x8, parent = 0x825256C0 }
+0x82525740 = { name = "rex_sp_init_82525740", size = 0x20, parent = 0x82525728 }
+0x82525760 = { name = "rex_sp_init_82525760", size = 0x20, parent = 0x82525728 }
+0x82525780 = { name = "rex_sp_init_82525780", size = 0x18, parent = 0x82525728 }
+0x825257A0 = { name = "rex_sp_init_825257A0", size = 0x20, parent = 0x82525798 }
+0x825257C0 = { name = "rex_sp_init_825257C0", size = 0x20, parent = 0x82525798 }
+0x825257E0 = { name = "rex_sp_init_825257E0", size = 0x20, parent = 0x82525798 }
+0x82525800 = { name = "rex_sp_init_82525800", size = 0x14, parent = 0x82525798 }
+0x82525820 = { name = "rex_sp_init_82525820", size = 0x20, parent = 0x82525814 }
+0x82525860 = { name = "rex_sp_init_82525860", size = 0x20, parent = 0x82525840 }
+0x82525880 = { name = "rex_sp_init_82525880", size = 0x20, parent = 0x82525840 }
+0x825258A0 = { name = "rex_sp_init_825258A0", size = 0x20, parent = 0x82525840 }
+0x825258C0 = { name = "rex_sp_init_825258C0", size = 0x8, parent = 0x82525840 }
+0x825258E0 = { name = "rex_sp_init_825258E0", size = 0x20, parent = 0x825258C8 }
+0x82525900 = { name = "rex_sp_init_82525900", size = 0x20, parent = 0x825258C8 }
+0x82525920 = { name = "rex_sp_init_82525920", size = 0x20, parent = 0x825258C8 }
+0x82525940 = { name = "rex_sp_init_82525940", size = 0x20, parent = 0x825258C8 }
+0x82525960 = { name = "rex_sp_init_82525960", size = 0x10, parent = 0x825258C8 }
+0x82525980 = { name = "rex_sp_init_82525980", size = 0x20, parent = 0x82525970 }
+0x825259A0 = { name = "rex_sp_init_825259A0", size = 0x20, parent = 0x82525970 }
+0x825259C0 = { name = "rex_sp_init_825259C0", size = 0x20, parent = 0x82525970 }
+0x825259E0 = { name = "rex_sp_init_825259E0", size = 0x18, parent = 0x82525970 }
+0x82525A00 = { name = "rex_sp_init_82525A00", size = 0x20, parent = 0x825259F8 }
+0x82525A20 = { name = "rex_sp_init_82525A20", size = 0x20, parent = 0x825259F8 }
+0x82525A40 = { name = "rex_sp_init_82525A40", size = 0x20, parent = 0x825259F8 }
+0x82525A60 = { name = "rex_sp_init_82525A60", size = 0x20, parent = 0x825259F8 }
+0x82525AA0 = { name = "rex_sp_init_82525AA0", size = 0x20, parent = 0x82525A80 }
+0x82525AC0 = { name = "rex_sp_init_82525AC0", size = 0x20, parent = 0x82525A80 }
+0x82525AE0 = { name = "rex_sp_init_82525AE0", size = 0x20, parent = 0x82525A80 }
+0x82525B00 = { name = "rex_sp_init_82525B00", size = 0x20, parent = 0x82525A80 }
+0x82525B20 = { name = "rex_sp_init_82525B20", size = 0x20, parent = 0x82525A80 }
+0x82525B60 = { name = "rex_sp_init_82525B60", size = 0x20, parent = 0x82525B40 }
+0x82525B80 = { name = "rex_sp_init_82525B80", size = 0x20, parent = 0x82525B40 }
+0x82525BA0 = { name = "rex_sp_init_82525BA0", size = 0x20, parent = 0x82525B40 }
+0x82525BC0 = { name = "rex_sp_init_82525BC0", size = 0x20, parent = 0x82525B40 }
+0x82525BE0 = { name = "rex_sp_init_82525BE0", size = 0x18, parent = 0x82525B40 }
+0x82525C00 = { name = "rex_sp_init_82525C00", size = 0x20, parent = 0x82525BF8 }
+0x82525C20 = { name = "rex_sp_init_82525C20", size = 0x20, parent = 0x82525BF8 }
+0x82525C40 = { name = "rex_sp_init_82525C40", size = 0x20, parent = 0x82525BF8 }
+0x82525C60 = { name = "rex_sp_init_82525C60", size = 0x10, parent = 0x82525BF8 }
+0x82525C80 = { name = "rex_sp_init_82525C80", size = 0x20, parent = 0x82525C70 }
+0x82525CA0 = { name = "rex_sp_init_82525CA0", size = 0x20, parent = 0x82525C70 }
+0x82525CC0 = { name = "rex_sp_init_82525CC0", size = 0x18, parent = 0x82525C70 }
+0x82525CE0 = { name = "rex_sp_init_82525CE0", size = 0x20, parent = 0x82525CD8 }
+0x82525D00 = { name = "rex_sp_init_82525D00", size = 0x20, parent = 0x82525CD8 }
+0x82525D20 = { name = "rex_sp_init_82525D20", size = 0x20, parent = 0x82525CD8 }
+0x82525D60 = { name = "rex_sp_init_82525D60", size = 0x20, parent = 0x82525D40 }
+0x82525D80 = { name = "rex_sp_init_82525D80", size = 0x20, parent = 0x82525D40 }
+0x82525DA0 = { name = "rex_sp_init_82525DA0", size = 0x8, parent = 0x82525D40 }
+0x82525DC0 = { name = "rex_sp_init_82525DC0", size = 0x20, parent = 0x82525DA8 }
+0x82525DE0 = { name = "rex_sp_init_82525DE0", size = 0x20, parent = 0x82525DA8 }
+0x82525E00 = { name = "rex_sp_init_82525E00", size = 0x20, parent = 0x82525DA8 }
+0x82525E20 = { name = "rex_sp_init_82525E20", size = 0x20, parent = 0x82525DA8 }
+0x82525E60 = { name = "rex_sp_init_82525E60", size = 0x20, parent = 0x82525E40 }
+0x82525E80 = { name = "rex_sp_init_82525E80", size = 0x20, parent = 0x82525E40 }
+0x82525EA0 = { name = "rex_sp_init_82525EA0", size = 0x20, parent = 0x82525E40 }
+0x82525EC0 = { name = "rex_sp_init_82525EC0", size = 0x20, parent = 0x82525E40 }
+0x82525EE0 = { name = "rex_sp_init_82525EE0", size = 0x20, parent = 0x82525E40 }
+0x82525F00 = { name = "rex_sp_init_82525F00", size = 0x10, parent = 0x82525E40 }
+0x82525F20 = { name = "rex_sp_init_82525F20", size = 0x20, parent = 0x82525F10 }
+0x82525F40 = { name = "rex_sp_init_82525F40", size = 0x20, parent = 0x82525F10 }
+0x82525F60 = { name = "rex_sp_init_82525F60", size = 0x20, parent = 0x82525F10 }
+0x82525F80 = { name = "rex_sp_init_82525F80", size = 0x20, parent = 0x82525F10 }
+0x82525FA0 = { name = "rex_sp_init_82525FA0", size = 0x20, parent = 0x82525F10 }
+0x82525FE0 = { name = "rex_sp_init_82525FE0", size = 0x20, parent = 0x82525FC0 }
+0x82526000 = { name = "rex_sp_init_82526000", size = 0x20, parent = 0x82525FC0 }
+0x82526020 = { name = "rex_sp_init_82526020", size = 0x20, parent = 0x82525FC0 }
+0x82526040 = { name = "rex_sp_init_82526040", size = 0x10, parent = 0x82525FC0 }
+0x82526060 = { name = "rex_sp_init_82526060", size = 0x20, parent = 0x82526050 }
+0x82526080 = { name = "rex_sp_init_82526080", size = 0x20, parent = 0x82526050 }
+0x825260A0 = { name = "rex_sp_init_825260A0", size = 0x20, parent = 0x82526050 }
+0x825260C0 = { name = "rex_sp_init_825260C0", size = 0x20, parent = 0x82526050 }
+0x82526100 = { name = "rex_sp_init_82526100", size = 0x30, parent = 0x825260E0 }
+0x82526130 = { name = "rex_sp_init_82526130", size = 0x30, parent = 0x825260E0 }
+0x82526160 = { name = "rex_sp_init_82526160", size = 0x28, parent = 0x825260E0 }
+0x82526188 = { name = "rex_sp_init_82526188", size = 0x10, parent = 0x825260E0 }
+0x82526210 = { name = "rex_sp_init_82526210", size = 0x28, parent = 0x82526198 }
+0x82526238 = { name = "rex_sp_init_82526238", size = 0x28, parent = 0x82526198 }
+0x825262D0 = { name = "rex_sp_init_825262D0", size = 0x30, parent = 0x825262C0 }
+0x82526300 = { name = "rex_sp_init_82526300", size = 0x30, parent = 0x825262C0 }
+0x82526330 = { name = "rex_sp_init_82526330", size = 0x28, parent = 0x825262C0 }
+0x82526360 = { name = "rex_sp_init_82526360", size = 0x30, parent = 0x82526358 }
+0x82526390 = { name = "rex_sp_init_82526390", size = 0x30, parent = 0x82526358 }
+0x825264B8 = { name = "rex_sp_init_825264B8", size = 0x10, parent = 0x82526470 }
+0x825264C8 = { name = "rex_sp_init_825264C8", size = 0x10, parent = 0x82526470 }
+0x825264D8 = { name = "rex_sp_init_825264D8", size = 0x10, parent = 0x82526470 }
+0x825264E8 = { name = "rex_sp_init_825264E8", size = 0x10, parent = 0x82526470 }
+0x825264F8 = { name = "rex_sp_init_825264F8", size = 0x10, parent = 0x82526470 }
+0x82526508 = { name = "rex_sp_init_82526508", size = 0x10, parent = 0x82526470 }
+0x82526518 = { name = "rex_sp_init_82526518", size = 0x10, parent = 0x82526470 }
+0x82526528 = { name = "rex_sp_init_82526528", size = 0x10, parent = 0x82526470 }
+0x82526538 = { name = "rex_sp_init_82526538", size = 0x10, parent = 0x82526470 }
+0x82526548 = { name = "rex_sp_init_82526548", size = 0x10, parent = 0x82526470 }
+0x82526558 = { name = "rex_sp_init_82526558", size = 0x10, parent = 0x82526470 }
+0x825265F8 = { name = "rex_sp_init_825265F8", size = 0x10, parent = 0x825265C0 }
+0x82526608 = { name = "rex_sp_init_82526608", size = 0x10, parent = 0x825265C0 }
+0x82526618 = { name = "rex_sp_init_82526618", size = 0x28, parent = 0x825265C0 }
+0x82526DF8 = { name = "rex_sp_init_82526DF8", size = 0x30, parent = 0x82526DE0 }
+0x82526E48 = { name = "rex_sp_init_82526E48", size = 0x20, parent = 0x82526E28 }
+0x82526EA8 = { name = "rex_sp_init_82526EA8", size = 0x10, parent = 0x82526E8C }
+0x82526EE8 = { name = "rex_sp_init_82526EE8", size = 0x40, parent = 0x82526ED8 }
+0x82526F28 = { name = "rex_sp_init_82526F28", size = 0x28, parent = 0x82526ED8 }
+0x82526F68 = { name = "rex_sp_init_82526F68", size = 0x20, parent = 0x82526F50 }
+0x82526F88 = { name = "rex_sp_init_82526F88", size = 0x20, parent = 0x82526F50 }
+0x82526FA8 = { name = "rex_sp_init_82526FA8", size = 0x20, parent = 0x82526F50 }
+0x82526FC8 = { name = "rex_sp_init_82526FC8", size = 0x10, parent = 0x82526F50 }
+0x82527008 = { name = "rex_sp_init_82527008", size = 0x10, parent = 0x82527000 }
+0x82527028 = { name = "rex_sp_init_82527028", size = 0x10, parent = 0x82527018 }

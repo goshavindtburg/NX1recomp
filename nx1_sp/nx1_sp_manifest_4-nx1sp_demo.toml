@@ -1,0 +1,11 @@
+# SP demo target using the untouched XEX and its matching MSVC map.
+
+[project]
+name = "nx1_sp_demo"
+sdk_version = "0.8.0.0"
+game_root = "../nx1"
+
+[entrypoint]
+file_path = "../nx1/4-nx1sp_demo.xex"
+out_directory_path = "generated/4-nx1sp_demo"
+includes = ["config/map_functions.toml", "config/hooks.toml"]

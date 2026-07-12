@@ -1,0 +1,11 @@
+# Probe manifest for testing whether the demo SP XEX is usable directly.
+
+[project]
+name = "nx1_sp_demo_probe"
+sdk_version = "0.8.1.4"
+game_root = "../nx1"
+
+[entrypoint]
+file_path = "../nx1/4-nx1sp_demo.rex.xex"
+out_directory_path = "generated/4-nx1sp_demo_probe"
+includes = ["config/map_functions.toml", "config/ida_functions.toml"]
