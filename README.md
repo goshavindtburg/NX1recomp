@@ -1,6 +1,6 @@
 # NX1recomp
 
-A static recompilation of **NX1**, an Xbox 360 title built on an IW4-family engine, into
+A static recompilation of **NX1/Call of Duty: Future Warfare**, an Xbox 360 title built on an IW4-family engine, into
 native Windows executables. Rather than emulating the console, the game's PowerPC code is
 translated ahead of time into C++ and compiled into a real binary; its shaders and graphics
 calls are likewise translated to run on a real GPU driver.
