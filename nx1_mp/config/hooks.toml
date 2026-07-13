@@ -1,0 +1,9 @@
+# Runtime probes for the 5-nx1mp_demo MP target.
+#
+# Without these, codegen does not recognise the guest's setjmp/longjmp and emits
+# a plain recompiled call for them, which cannot restore the PPC context - it
+# silently breaks Com_Init's error recovery. Keep this file in the manifest
+# includes so a codegen re-run reproduces the inline ppc_setjmp/ppc_longjmp form.
+
+setjmp_address = 0x8253F370
+longjmp_address = 0x82540120

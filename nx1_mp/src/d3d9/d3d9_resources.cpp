@@ -20,6 +20,7 @@
 #include <cstring>
 #include <unordered_map>
 
+#include <d3dcompiler.h>
 #include <xxhash.h>
 
 #include "d3d9_resources.h"
@@ -421,13 +422,47 @@ struct ResolvedTarget {
   IDirect3DTexture9* tex = nullptr;
   uint32_t width = 0;
   uint32_t height = 0;
+  bool owned = true;  ///< false when it aliases a target we don't own (a depth texture)
 };
+
+struct SurfaceSize {
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
+/// One host render target standing in for a guest D3DSurface.
+struct HostTarget {
+  IDirect3DTexture9* tex = nullptr;      ///< null when this aliases the backbuffer
+  IDirect3DSurface9* surface = nullptr;  ///< the bindable surface
+  uint32_t width = 0;
+  uint32_t height = 0;
+  bool is_depth = false;
+  bool is_backbuffer = false;
+};
+
+/// D3DFMT_INTZ: a depth-stencil format that can also be sampled as a texture. This is
+/// how a D3D9 renderer gets the shadow maps and the scene depth back into a shader.
+#ifndef D3DFMT_INTZ
+#define D3DFMT_INTZ (D3DFORMAT(MAKEFOURCC('I', 'N', 'T', 'Z')))
+#endif
 
 using LayoutMap = std::unordered_map<uint64_t, VertexLayout>;
 using VertexBufferMap = std::unordered_map<uint64_t, VertexBufferEntry>;
 using IndexBufferMap = std::unordered_map<uint64_t, IndexBufferEntry>;
 using TextureMap = std::unordered_map<uint64_t, TextureEntry>;
 using ResolveMap = std::unordered_map<uint64_t, ResolvedTarget>;
+/// Keyed by EDRAM region, not by D3DSurface pointer -- see ReadSurfaceEdramKey.
+using TargetMap = std::unordered_map<uint64_t, HostTarget>;
+
+/// Physical page behind a guest address. The 360 maps the same RAM through several
+/// virtual windows, and a resolve destination is not written and read through the same
+/// one: the engine hands D3DDevice_Resolve a texture whose header base sits in the
+/// uncached 0xA0000000 window (0xBF6D8000 for the scene depth), then samples that exact
+/// same surface through a fetch constant holding the physical address (0x1F6D8000).
+/// Keying the resolve map by the raw address therefore misses on every read-back -- the
+/// lighting shaders sample raw untiled memory instead of the scene, the depth buffer and
+/// the shadow maps. Key by the physical page and both windows agree.
+constexpr uint32_t PhysicalAddress(uint32_t address) { return address & 0x1FFFFFFF; }
 
 /// Untile (or straight-copy) one 2D mip into `dst`, tightly packed at
 /// `dst_row_bytes` per block-row, applying the fetch constant's endian swap.
@@ -566,9 +601,55 @@ void ResourceTracker::Initialize(IDirect3DDevice9Ex* device) {
   index_buffers_ = new IndexBufferMap();
   textures_ = new TextureMap();
   resolves_ = new ResolveMap();
+  render_targets_ = new TargetMap();
+
+  // INTZ is what makes depth sampleable on D3D9. Without it the shadow maps and the
+  // scene depth can still be *rendered*, but never read back, and the lighting that
+  // depends on them stays wrong.
+  intz_supported_ = false;
+  IDirect3D9* d3d = nullptr;
+  if (SUCCEEDED(device_->GetDirect3D(&d3d)) && d3d) {
+    D3DDEVICE_CREATION_PARAMETERS cp{};
+    D3DDISPLAYMODE mode{};
+    if (SUCCEEDED(device_->GetCreationParameters(&cp)) &&
+        SUCCEEDED(d3d->GetAdapterDisplayMode(cp.AdapterOrdinal, &mode))) {
+      intz_supported_ =
+          SUCCEEDED(d3d->CheckDeviceFormat(cp.AdapterOrdinal, cp.DeviceType, mode.Format,
+                                           D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, D3DFMT_INTZ));
+    }
+    d3d->Release();
+  }
+  REXGPU_INFO("nx1_d3d9: INTZ sampleable depth {}", intz_supported_ ? "supported" : "UNAVAILABLE");
+
+  // The neutral stand-in for textures we cannot produce yet (see white_).
+  IDirect3DTexture9* staging = nullptr;
+  if (SUCCEEDED(device_->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &staging,
+                                       nullptr))) {
+    D3DLOCKED_RECT locked;
+    if (SUCCEEDED(staging->LockRect(0, &locked, nullptr, 0))) {
+      *static_cast<uint32_t*>(locked.pBits) = 0xFFFFFFFFu;
+      staging->UnlockRect(0);
+      if (SUCCEEDED(device_->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &white_,
+                                           nullptr))) {
+        device_->UpdateTexture(staging, white_);
+      }
+    }
+    staging->Release();
+  }
+  if (!white_) {
+    REXGPU_WARN("nx1_d3d9: could not create the white fallback texture");
+  }
 }
 
 void ResourceTracker::Shutdown() {
+  if (depth_blit_ps_) {
+    depth_blit_ps_->Release();
+    depth_blit_ps_ = nullptr;
+  }
+  if (white_) {
+    white_->Release();
+    white_ = nullptr;
+  }
   if (layouts_) {
     auto* map = static_cast<LayoutMap*>(layouts_);
     for (auto& [key, layout] : *map) {
@@ -604,11 +685,22 @@ void ResourceTracker::Shutdown() {
   if (resolves_) {
     auto* map = static_cast<ResolveMap*>(resolves_);
     for (auto& [key, entry] : *map) {
-      if (entry.tex) entry.tex->Release();
+      // Non-owned entries alias a depth target released with render_targets_ below.
+      if (entry.tex && entry.owned) entry.tex->Release();
     }
     delete map;
     resolves_ = nullptr;
   }
+  if (render_targets_) {
+    auto* map = static_cast<TargetMap*>(render_targets_);
+    for (auto& [key, t] : *map) {
+      if (t.surface && !t.is_backbuffer) t.surface->Release();
+      if (t.tex) t.tex->Release();
+    }
+    delete map;
+    render_targets_ = nullptr;
+  }
+  backbuffer_ = nullptr;
   device_ = nullptr;
 }
 
@@ -734,6 +826,25 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
   const uint64_t key = MixKey(MixKey(ucode.physical_address, ucode.dword_count), stream0_stride);
   auto* map = static_cast<LayoutMap*>(layouts_);
   if (auto it = map->find(key); it != map->end()) {
+    // DIAG(d3d9): this layout is cached on the *microcode* alone, but for a bound draw it
+    // has the guest's per-draw m_StreamStride baked into it. If the same shader is ever
+    // reused with a different stride, every vertex after the first is read at the wrong
+    // pitch -- which is what smeared world geometry looks like. TODO: drop.
+    if (!stream0_stride && it->second.decl) {
+      static std::atomic<uint32_t> budget{12};
+      for (uint32_t s = 0; s < it->second.stream_count; ++s) {
+        const uint32_t now = StreamStride(base, guest_device, s);
+        if (now && now != it->second.guest_stride[s] &&
+            budget.load(std::memory_order_relaxed) > 0) {
+          budget.fetch_sub(1, std::memory_order_relaxed);
+          REXGPU_WARN(
+              "nx1_d3d9: [stridediag] vs=0x{:08X} stream {} cached guest_stride={} but this "
+              "draw says {} (host_stride={} bulk_swap={})",
+              ucode.physical_address, s, it->second.guest_stride[s], now,
+              it->second.host_stride[s], it->second.bulk_swap[s]);
+        }
+      }
+    }
     return it->second.decl ? &it->second : nullptr;
   }
 
@@ -746,15 +857,31 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
   rex::string::StringBuffer disasm;
   shader.AnalyzeUcode(disasm);
 
-  // DIAG(d3d9): one-shot dump of a bound-draw shader's vfetch bindings. TODO: drop.
+  // DIAG(d3d9): dump every distinct bound-draw layout. The vfetch stride (stride_words)
+  // is what the GPU actually fetches with; m_StreamStride is what the code trusts. If the
+  // two ever disagree, vertices are read at the wrong pitch. TODO: drop.
   if (!stream0_stride) {
-    static bool layout_diag = false;
-    if (!layout_diag) {
-      layout_diag = true;
-      REXGPU_INFO("nx1_d3d9: bound VS vfetch: {} binding(s)", shader.vertex_bindings().size());
+    static std::atomic<uint32_t> budget{10};
+    if (budget.fetch_sub(1, std::memory_order_relaxed) > 0 &&
+        budget.load(std::memory_order_relaxed) < 0x80000000u) {
+      // Log the ucode hash so the analyzer's bindings can be diffed against the
+      // .nx1_vfetch sidecar XenosRecomp emitted for the same shader -- if the analyzer
+      // finds fewer attributes than the shader declares inputs, the host declaration is
+      // missing semantics and the shader reads unbound registers. TODO(d3d9): drop.
+      const uint64_t ucode_hash =
+          XXH3_64bits(ucode_dwords, size_t(ucode.dword_count) * sizeof(uint32_t));
+      REXGPU_INFO("nx1_d3d9: [layoutdiag] vs=0x{:08X} hash={:016X} {} binding(s)",
+                  ucode.physical_address, ucode_hash, shader.vertex_bindings().size());
       for (const auto& b : shader.vertex_bindings()) {
-        REXGPU_INFO("  binding fetch_constant={} -> stream={} stride_words={} attrs={}",
-                    b.fetch_constant, 95u - b.fetch_constant, b.stride_words, b.attributes.size());
+        const uint32_t s = 95u - b.fetch_constant;
+        REXGPU_INFO("  stream={} vfetch_stride={} m_StreamStride={} attrs={}", s,
+                    b.stride_words * 4u, StreamStride(base, guest_device, s),
+                    b.attributes.size());
+        for (const auto& a : b.attributes) {
+          const auto& at = a.fetch_instr.attributes;
+          REXGPU_INFO("    attr fmt={} off={} signed={} norm={}", uint32_t(at.data_format),
+                      at.offset * 4u, at.is_signed, !at.is_integer);
+        }
       }
     }
   }
@@ -905,6 +1032,33 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   entry.last_frame = frame_;
 
   const uint8_t* src = TranslatePhysical(fetch.base_address);
+
+  // DIAG(d3d9): the stride-44 world vertices smear while the stride-32 rigid models are
+  // fine, and we decode the world position as a float4 (Xenos fmt 38) at offset 0. Dump the
+  // raw guest vertex so we can see what is really there -- if bytes 12..15 are a packed
+  // dword rather than a float, our position.w is garbage and that is the smear.
+  // TODO(d3d9): drop.
+  if (guest_stride == 44) {
+    static bool dumped = false;
+    if (!dumped) {
+      dumped = true;
+      for (uint32_t v = 0; v < 3; ++v) {
+        const uint8_t* p = src + size_t(v) * guest_stride;
+        auto f = [p](uint32_t off) {
+          const uint32_t bits = LoadBE32(p + off);
+          float out;
+          std::memcpy(&out, &bits, sizeof(out));
+          return out;
+        };
+        REXGPU_INFO(
+            "nx1_d3d9: [vtxdiag] v{} dw {:08X} {:08X} {:08X} {:08X} {:08X} | as float "
+            "{: .3f} {: .3f} {: .3f} {: .3f} {: .3f}",
+            v, LoadBE32(p + 0), LoadBE32(p + 4), LoadBE32(p + 8), LoadBE32(p + 12),
+            LoadBE32(p + 16), f(0), f(4), f(8), f(12), f(16));
+      }
+    }
+  }
+
   const uint64_t content_hash = XXH3_64bits(src, size_t(count) * guest_stride);
   if (entry.vb && entry.bytes == host_bytes && entry.content_hash == content_hash) {
     return entry.vb;
@@ -1096,8 +1250,38 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // (scene compositing, post effects) work.
   if (resolves_) {
     auto* rmap = static_cast<ResolveMap*>(resolves_);
-    if (auto it = rmap->find(t.base_address); it != rmap->end() && it->second.tex) {
+    if (auto it = rmap->find(PhysicalAddress(t.base_address));
+        it != rmap->end() && it->second.tex) {
+      // DIAG(d3d9): which resolved targets does the guest actually sample back? If the
+      // scene colour never shows up here, the composite is not reading it. TODO: drop.
+      static uint32_t seen[16] = {};
+      static uint32_t seen_n = 0;
+      bool known = false;
+      for (uint32_t i = 0; i < seen_n; ++i) {
+        if (seen[i] == t.base_address) { known = true; break; }
+      }
+      if (!known && seen_n < 16) {
+        seen[seen_n++] = t.base_address;
+        REXGPU_INFO("nx1_d3d9: [samplediag] guest samples resolved 0x{:08X} ({}x{}) on sampler {}",
+                    t.base_address, it->second.width, it->second.height, sampler);
+      }
       return it->second.tex;
+    }
+  }
+  // DIAG(d3d9): a sampler that reaches here missed the resolve map. Log every distinct
+  // depth-format read (the shadow maps and the scene depth) -- if the guest samples a
+  // depth address we never published a resolve for, the lighting reads raw memory.
+  if (t.format == 22 || t.format == 23) {
+    static uint32_t miss[24] = {};
+    static uint32_t miss_n = 0;
+    bool known = false;
+    for (uint32_t i = 0; i < miss_n; ++i) {
+      if (miss[i] == t.base_address) { known = true; break; }
+    }
+    if (!known && miss_n < 24) {
+      miss[miss_n++] = t.base_address;
+      REXGPU_WARN("nx1_d3d9: [samplediag] sampler {} reads 0x{:08X} ({}x{} fmt {}) with NO resolve",
+                  sampler, t.base_address, t.width, t.height, t.format);
     }
   }
   // Only plain 2D textures for now. Cube/3D/stacked come later; skip rather than
@@ -1111,7 +1295,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     if ((unsupported_texture_formats_++ % 100) == 0) {
       REXGPU_WARN("nx1_d3d9: unsupported Xenos texture format {} (sampler {})", t.format, sampler);
     }
-    return nullptr;
+    // The guest *expects* a texture here, so leaving the sampler unbound is worse than
+    // wrong: a null sample reads back 0, and for the depth/shadow maps (fmt 23) that
+    // means "fully occluded" -- the whole world shades black. White reads as "far /
+    // unshadowed" and keeps lighting sane until real render targets land.
+    return white_;
   }
 
   const auto* fmt = rex::graphics::FormatInfo::Get(t.format);
@@ -1210,16 +1398,315 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   return entry.tex;
 }
 
+void ResourceTracker::SetBackbuffer(IDirect3DSurface9* surface, uint32_t width, uint32_t height) {
+  backbuffer_ = surface;
+  backbuffer_width_ = width;
+  backbuffer_height_ = height;
+}
+
+IDirect3DSurface9* ResourceTracker::GetRenderTargetSurface(const uint8_t* base,
+                                                           uint32_t guest_surface) {
+  if (!device_ || !render_targets_ || !guest_surface) {
+    return nullptr;
+  }
+  SurfaceSize s{};
+  if (!ReadSurfaceSize(base, guest_surface, &s.width, &s.height)) {
+    return nullptr;
+  }
+  auto* map = static_cast<TargetMap*>(render_targets_);
+  auto& t = (*map)[ReadSurfaceEdramKey(base, guest_surface)];
+  if (t.surface && t.width == s.width && t.height == s.height && !t.is_depth) {
+    return t.surface;
+  }
+  if (t.surface && !t.is_backbuffer) {
+    t.surface->Release();
+  }
+  if (t.tex) {
+    t.tex->Release();
+  }
+  t = HostTarget{};
+
+  // The guest's final composite goes to a display-sized target; render it straight
+  // into the backbuffer so Present shows it without an extra copy.
+  if (backbuffer_ && s.width == backbuffer_width_ && s.height == backbuffer_height_) {
+    t.surface = backbuffer_;
+    t.width = s.width;
+    t.height = s.height;
+    t.is_backbuffer = true;
+    return t.surface;
+  }
+
+  if (FAILED(device_->CreateTexture(s.width, s.height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8,
+                                    D3DPOOL_DEFAULT, &t.tex, nullptr)) ||
+      !t.tex) {
+    REXGPU_ERROR("nx1_d3d9: render target CreateTexture({}x{}) failed", s.width, s.height);
+    t = HostTarget{};
+    return nullptr;
+  }
+  if (FAILED(t.tex->GetSurfaceLevel(0, &t.surface))) {
+    t.tex->Release();
+    t = HostTarget{};
+    return nullptr;
+  }
+  t.width = s.width;
+  t.height = s.height;
+  REXGPU_INFO("nx1_d3d9: created colour target {}x{} for guest surface 0x{:08X}", s.width, s.height,
+              guest_surface);
+  return t.surface;
+}
+
+IDirect3DSurface9* ResourceTracker::GetDepthSurface(const uint8_t* base, uint32_t guest_surface,
+                                                    uint32_t min_width, uint32_t min_height) {
+  if (!device_ || !render_targets_ || !guest_surface) {
+    return nullptr;
+  }
+  SurfaceSize s{};
+  if (!ReadSurfaceSize(base, guest_surface, &s.width, &s.height)) {
+    return nullptr;
+  }
+  // D3D9 drops every draw whose depth-stencil is smaller than its render target, and the
+  // shadow depth surfaces really are smaller than what they render: they decode to
+  // 1024x1024 / 512x512 but the pass targets (and resolves) 1024x2048 / 512x2048, because
+  // the guest stacks cascades into an atlas. So grow the depth to cover the bound colour
+  // target -- but only in *height*. Growing the width too let a stale 1024- or 1920-wide
+  // target from a previous pass drag the narrow shadow depths up with it, and every grow
+  // reallocates, throwing away the contents mid-frame.
+  if (min_width <= s.width) {
+    s.height = std::max(s.height, min_height);
+  }
+  auto* map = static_cast<TargetMap*>(render_targets_);
+  auto& t = (*map)[ReadSurfaceEdramKey(base, guest_surface)];
+  // Reuse while it still covers what is being asked for; only ever grow.
+  if (t.surface && t.is_depth && t.width >= s.width && t.height >= s.height) {
+    return t.surface;
+  }
+  if (t.surface && t.is_depth) {
+    s.width = std::max(s.width, t.width);
+    s.height = std::max(s.height, t.height);
+  }
+  if (t.surface && !t.is_backbuffer) {
+    t.surface->Release();
+  }
+  if (t.tex) {
+    t.tex->Release();
+  }
+  t = HostTarget{};
+  t.is_depth = true;
+
+  // INTZ keeps the depth buffer sampleable, which is the whole point: the guest
+  // resolves its shadow maps and scene depth and the lighting shaders read them back.
+  // Fall back to a plain (unsampleable) depth-stencil if the driver lacks INTZ.
+  if (intz_supported_ &&
+      SUCCEEDED(device_->CreateTexture(s.width, s.height, 1, D3DUSAGE_DEPTHSTENCIL, D3DFMT_INTZ,
+                                       D3DPOOL_DEFAULT, &t.tex, nullptr)) &&
+      t.tex && SUCCEEDED(t.tex->GetSurfaceLevel(0, &t.surface))) {
+    t.width = s.width;
+    t.height = s.height;
+    REXGPU_INFO("nx1_d3d9: created INTZ depth target {}x{} for guest surface 0x{:08X}", s.width,
+                s.height, guest_surface);
+    return t.surface;
+  }
+  if (t.tex) {
+    t.tex->Release();
+    t.tex = nullptr;
+  }
+  if (FAILED(device_->CreateDepthStencilSurface(s.width, s.height, D3DFMT_D24S8,
+                                                D3DMULTISAMPLE_NONE, 0, TRUE, &t.surface,
+                                                nullptr))) {
+    REXGPU_ERROR("nx1_d3d9: depth target {}x{} failed", s.width, s.height);
+    t = HostTarget{};
+    return nullptr;
+  }
+  t.width = s.width;
+  t.height = s.height;
+  return t.surface;
+}
+
+IDirect3DTexture9* ResourceTracker::GetDepthTexture(const uint8_t* base, uint32_t guest_surface) {
+  if (!render_targets_ || !guest_surface) {
+    return nullptr;
+  }
+  auto* map = static_cast<TargetMap*>(render_targets_);
+  auto it = map->find(ReadSurfaceEdramKey(base, guest_surface));
+  return (it != map->end() && it->second.is_depth) ? it->second.tex : nullptr;
+}
+
+IDirect3DTexture9* ResourceTracker::GetResolvedTexture(uint32_t address) {
+  if (!resolves_ || !address) {
+    return nullptr;
+  }
+  auto* map = static_cast<ResolveMap*>(resolves_);
+  auto it = map->find(PhysicalAddress(address));
+  return it != map->end() ? it->second.tex : nullptr;
+}
+
+bool ResourceTracker::EnsureDepthBlit() {
+  if (depth_blit_ps_) {
+    return true;
+  }
+  if (depth_blit_failed_ || !device_) {
+    return false;
+  }
+  depth_blit_failed_ = true;  // cleared on success
+
+  // Reads the INTZ depth surface and writes it as a plain float. ps_2_0, not 3_0: the
+  // quad is drawn with pre-transformed (XYZRHW) vertices through the fixed-function
+  // vertex pipeline, and D3D9 refuses to pair that with a 3_0 pixel shader.
+  static const char kSource[] =
+      "sampler2D depth : register(s0);\n"
+      "float4 main(float2 uv : TEXCOORD0) : COLOR { return tex2D(depth, uv).rrrr; }\n";
+
+  ID3DBlob* code = nullptr;
+  ID3DBlob* errors = nullptr;
+  const HRESULT hr = D3DCompile(kSource, sizeof(kSource) - 1, "depth_blit", nullptr, nullptr,
+                                "main", "ps_2_0", 0, 0, &code, &errors);
+  if (FAILED(hr) || !code) {
+    REXGPU_ERROR("nx1_d3d9: depth-blit shader failed to compile: {}",
+                 errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+  } else if (SUCCEEDED(device_->CreatePixelShader(
+                 static_cast<const DWORD*>(code->GetBufferPointer()), &depth_blit_ps_))) {
+    depth_blit_failed_ = false;
+  }
+  if (code) {
+    code->Release();
+  }
+  if (errors) {
+    errors->Release();
+  }
+  return !depth_blit_failed_;
+}
+
+void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32_t height,
+                                   IDirect3DTexture9* src_depth, const RECT& src_rect,
+                                   const POINT& dest_point) {
+  if (!device_ || !resolves_ || !dest_address || !width || !height || !src_depth) {
+    return;
+  }
+  D3DSURFACE_DESC sd{};
+  if (FAILED(src_depth->GetLevelDesc(0, &sd)) || !sd.Width || !sd.Height || !EnsureDepthBlit()) {
+    return;
+  }
+
+  auto* map = static_cast<ResolveMap*>(resolves_);
+  auto& entry = (*map)[PhysicalAddress(dest_address)];
+  if (entry.tex && (!entry.owned || entry.width != width || entry.height != height)) {
+    if (entry.owned) {
+      entry.tex->Release();
+    }
+    entry.tex = nullptr;
+  }
+  const bool fresh = entry.tex == nullptr;
+  if (fresh) {
+    if (FAILED(device_->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F,
+                                      D3DPOOL_DEFAULT, &entry.tex, nullptr))) {
+      REXGPU_ERROR("nx1_d3d9: depth resolve target R32F {}x{} failed", width, height);
+      entry.tex = nullptr;
+      return;
+    }
+    entry.width = width;
+    entry.height = height;
+    entry.owned = true;
+    REXGPU_INFO("nx1_d3d9: depth resolve atlas R32F {}x{} for 0x{:08X} (src surface {}x{})", width,
+                height, PhysicalAddress(dest_address), sd.Width, sd.Height);
+  }
+  IDirect3DSurface9* dst = nullptr;
+  if (FAILED(entry.tex->GetSurfaceLevel(0, &dst)) || !dst) {
+    return;
+  }
+
+  RECT sr = src_rect;
+  if (sr.right <= sr.left || sr.bottom <= sr.top) {  // empty => whole surface
+    sr = RECT{0, 0, LONG(sd.Width), LONG(sd.Height)};
+  }
+  sr.right = std::min<LONG>(sr.right, LONG(sd.Width));
+  sr.bottom = std::min<LONG>(sr.bottom, LONG(sd.Height));
+  RECT dr{dest_point.x, dest_point.y, dest_point.x + (sr.right - sr.left),
+          dest_point.y + (sr.bottom - sr.top)};
+  dr.right = std::min<LONG>(dr.right, LONG(width));
+  dr.bottom = std::min<LONG>(dr.bottom, LONG(height));
+  if (dr.right <= dr.left || dr.bottom <= dr.top) {
+    dst->Release();
+    return;
+  }
+
+  // The render target and depth-stencil are the only device state the per-draw path does
+  // not rewrite, so they are all that has to be put back.
+  IDirect3DSurface9* old_rt = nullptr;
+  IDirect3DSurface9* old_ds = nullptr;
+  device_->GetRenderTarget(0, &old_rt);
+  device_->GetDepthStencilSurface(&old_ds);
+
+  device_->SetDepthStencilSurface(nullptr);  // before the target: depth must cover the RT
+  device_->SetRenderTarget(0, dst);
+  if (fresh) {
+    // 0 is "far" under this engine's reverse-Z, i.e. nothing occluding. A slot the guest
+    // has not resolved into yet then reads as unshadowed instead of fully shadowed.
+    device_->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+  }
+  const D3DVIEWPORT9 vp{0, 0, width, height, 0.0f, 1.0f};
+  device_->SetViewport(&vp);
+
+  device_->SetVertexShader(nullptr);
+  device_->SetVertexDeclaration(nullptr);
+  device_->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+  device_->SetPixelShader(depth_blit_ps_);
+  device_->SetTexture(0, src_depth);
+  device_->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+  device_->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+  device_->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+  device_->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+  device_->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+  device_->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+  device_->SetRenderState(D3DRS_ZENABLE, FALSE);
+  device_->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+  device_->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+  device_->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+  device_->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+  device_->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+  device_->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+  device_->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+
+  // Pre-transformed quad, half-pixel biased so texel centres land on pixel centres.
+  struct BlitVertex {
+    float x, y, z, rhw, u, v;
+  };
+  const float su = 1.0f / float(sd.Width);
+  const float sv = 1.0f / float(sd.Height);
+  const float u0 = float(sr.left) * su, u1 = float(sr.right) * su;
+  const float v0 = float(sr.top) * sv, v1 = float(sr.bottom) * sv;
+  const float x0 = float(dr.left) - 0.5f, x1 = float(dr.right) - 0.5f;
+  const float y0 = float(dr.top) - 0.5f, y1 = float(dr.bottom) - 0.5f;
+  const BlitVertex quad[4] = {{x0, y0, 0.0f, 1.0f, u0, v0},
+                              {x1, y0, 0.0f, 1.0f, u1, v0},
+                              {x0, y1, 0.0f, 1.0f, u0, v1},
+                              {x1, y1, 0.0f, 1.0f, u1, v1}};
+  device_->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(BlitVertex));
+
+  device_->SetTexture(0, nullptr);
+  device_->SetPixelShader(nullptr);
+  device_->SetRenderTarget(0, old_rt);
+  device_->SetDepthStencilSurface(old_ds);
+  if (old_rt) {
+    old_rt->Release();
+  }
+  if (old_ds) {
+    old_ds->Release();
+  }
+  dst->Release();
+}
+
 void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height,
-                                   const RECT& src_rect) {
+                                   const RECT& src_rect, const POINT& dest_point) {
   if (!device_ || !resolves_ || !dest_address || !width || !height) {
     return;
   }
   auto* map = static_cast<ResolveMap*>(resolves_);
-  auto& entry = (*map)[dest_address];
+  auto& entry = (*map)[PhysicalAddress(dest_address)];
 
-  if (entry.tex && (entry.width != width || entry.height != height)) {
-    entry.tex->Release();
+  if (entry.tex && (!entry.owned || entry.width != width || entry.height != height)) {
+    if (entry.owned) {
+      entry.tex->Release();
+    }
     entry.tex = nullptr;
   }
   if (!entry.tex) {
@@ -1232,16 +1719,33 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
     }
     entry.width = width;
     entry.height = height;
+    entry.owned = true;
   }
 
   IDirect3DSurface9* src = nullptr;
   IDirect3DSurface9* dst = nullptr;
   if (SUCCEEDED(device_->GetRenderTarget(0, &src)) && src &&
       SUCCEEDED(entry.tex->GetSurfaceLevel(0, &dst)) && dst) {
-    // The guest's EDRAM render target is our current backbuffer; copy the
-    // resolved region out of it. A null src rect resolves the whole surface.
+    // Copy the resolved region out of whichever host target the guest is currently
+    // rendering into. Under predicated tiling this is one *band* of the frame, and it
+    // must land at dest_point -- blitting it over the whole destination smears the last
+    // band across everything.
     const bool whole = src_rect.right <= src_rect.left || src_rect.bottom <= src_rect.top;
-    device_->StretchRect(src, whole ? nullptr : &src_rect, dst, nullptr, D3DTEXF_LINEAR);
+    D3DSURFACE_DESC sd{};
+    src->GetDesc(&sd);
+    RECT sr = whole ? RECT{0, 0, LONG(sd.Width), LONG(sd.Height)} : src_rect;
+    // Clamp the source to the target we actually have.
+    sr.right = std::min<LONG>(sr.right, LONG(sd.Width));
+    sr.bottom = std::min<LONG>(sr.bottom, LONG(sd.Height));
+    if (sr.right > sr.left && sr.bottom > sr.top) {
+      RECT dr{dest_point.x, dest_point.y, dest_point.x + (sr.right - sr.left),
+              dest_point.y + (sr.bottom - sr.top)};
+      dr.right = std::min<LONG>(dr.right, LONG(width));
+      dr.bottom = std::min<LONG>(dr.bottom, LONG(height));
+      if (dr.right > dr.left && dr.bottom > dr.top) {
+        device_->StretchRect(src, &sr, dst, &dr, D3DTEXF_POINT);
+      }
+    }
   }
   if (dst) dst->Release();
   if (src) src->Release();

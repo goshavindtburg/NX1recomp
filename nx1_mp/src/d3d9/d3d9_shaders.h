@@ -49,11 +49,11 @@ class ShaderCache {
   /// Returns nullptr on a cache miss -- the caller must skip or fall back.
   const Sm3Shader* Lookup(uint64_t ucode_hash);
 
-  /// Copy the guest's ALU constants into the host constant registers this shader
-  /// actually reads. `guest_constants` points at the stage's 256 float4 registers
-  /// in guest memory (big-endian); see guest_d3d.h.
-  void UploadConstants(const uint8_t* base, uint32_t guest_constants_addr,
-                       const Sm3Shader& shader, bool pixel_stage);
+  /// Copy the guest's ALU constants into the host constant registers this shader actually
+  /// reads. Registers come from the stage's shadow (device+0x780 / +0x1780, big-endian; see
+  /// guest_d3d.h) unless the device's ConstantRing says the ring owns them.
+  void UploadConstants(const uint8_t* base, uint32_t guest_device, const Sm3Shader& shader,
+                       bool pixel_stage);
 
  private:
   ShaderCache() = default;

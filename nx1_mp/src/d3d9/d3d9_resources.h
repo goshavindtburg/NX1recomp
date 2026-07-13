@@ -110,7 +110,58 @@ class ResourceTracker {
   /// Record a resolve: StretchRect the current render target (source rect) into a
   /// host texture keyed by the destination's guest address, so a later draw that
   /// samples that address gets the rendered image instead of untiled memory.
-  void ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height, const RECT& src_rect);
+  void ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height, const RECT& src_rect,
+                    const POINT& dest_point);
+
+  //--- Render targets --------------------------------------------------------
+  //
+  // The guest does not render to one surface: it draws the world into a 1024x600
+  // colour target, its shadow maps into 1024x2048 / 512x2048 depth targets, a bloom
+  // chain into 256x150, then composites into the 1920x1080 display buffers. Backing
+  // all of those with a single backbuffer + depth buffer (as this renderer first did)
+  // makes the shadow passes scribble light's-eye depth into the buffer the world
+  // colour pass tests against, so the world cannot shade correctly.
+  //
+  // Each guest surface therefore gets its own host target, keyed by the guest
+  // D3DSurface pointer. A colour target whose size matches the backbuffer *is* the
+  // backbuffer, so the guest's final composite lands where Present can show it.
+
+  /// Host colour surface for a guest render-target surface, or nullptr.
+  IDirect3DSurface9* GetRenderTargetSurface(const uint8_t* base, uint32_t guest_surface);
+
+  /// Host depth-stencil surface for a guest depth surface, or nullptr. Backed by a
+  /// D3DFMT_INTZ texture where supported, so the shadow maps and the scene depth stay
+  /// *sampleable* -- the guest resolves them and the lighting shaders read them back.
+  ///
+  /// `min_width`/`min_height` are the bound colour target's extent. D3D9 rejects every
+  /// draw whose depth-stencil is smaller than its render target, and the guest's depth
+  /// surfaces decode to a *different* padded height than their colour partners
+  /// (scene: 1024x1218 colour vs 1024x1105 depth), so the depth target is grown to
+  /// cover the colour one rather than trusted verbatim.
+  IDirect3DSurface9* GetDepthSurface(const uint8_t* base, uint32_t guest_surface,
+                                     uint32_t min_width, uint32_t min_height);
+
+  /// The sampleable texture behind a depth surface (INTZ), or nullptr.
+  IDirect3DTexture9* GetDepthTexture(const uint8_t* base, uint32_t guest_surface);
+
+  /// The host texture a previous resolve published under `address`, or nullptr.
+  IDirect3DTexture9* GetResolvedTexture(uint32_t address);
+
+  /// Copy one tile of a depth surface into the resolve destination's texture.
+  ///
+  /// A depth resolve cannot be a StretchRect (D3D9 will not blit depth-stencil), and it
+  /// cannot be an alias either: the guest renders its shadow atlas in EDRAM-sized tiles.
+  /// The 1024x2048 atlas is drawn through a *1024x1024* depth surface, one cascade at a
+  /// time, each with the same 0..1024 viewport, and each resolved to its own slot. Point
+  /// the atlas address at that shared surface and every cascade but the last is gone.
+  ///
+  /// So each resolve blits `src_rect` of the (INTZ, sampleable) depth surface into an
+  /// R32F texture at `dest_point`, and the cascades accumulate the way they do in guest
+  /// memory. `src_rect` empty means the whole surface.
+  void ResolveDepth(uint32_t dest_address, uint32_t width, uint32_t height,
+                    IDirect3DTexture9* src_depth, const RECT& src_rect, const POINT& dest_point);
+
+  void SetBackbuffer(IDirect3DSurface9* surface, uint32_t width, uint32_t height);
 
  private:
   ResourceTracker() = default;
@@ -118,12 +169,29 @@ class ResourceTracker {
   ResourceTracker(const ResourceTracker&) = delete;
   ResourceTracker& operator=(const ResourceTracker&) = delete;
 
+  /// Compile the depth-blit pixel shader on first use. Returns false once it has failed,
+  /// so a driver without it degrades to no shadows rather than retrying every resolve.
+  bool EnsureDepthBlit();
+
   IDirect3DDevice9Ex* device_ = nullptr;
+  IDirect3DPixelShader9* depth_blit_ps_ = nullptr;
+  bool depth_blit_failed_ = false;
+  /// 1x1 opaque white, bound in place of a texture we cannot yet produce (the
+  /// resolved scene depth and the shadow maps -- Xenos fmt 23 -- which need real
+  /// render-target support). Sampling an *unbound* sampler returns 0, which reads as
+  /// "fully occluded / fully shadowed" and shades the whole world black; white reads
+  /// as "far / nothing occluding", so lighting resolves to unshadowed instead.
+  IDirect3DTexture9* white_ = nullptr;
   void* layouts_ = nullptr;        ///< std::unordered_map<uint64_t, VertexLayout>*
   void* vertex_buffers_ = nullptr; ///< std::unordered_map<uint64_t, VertexBufferEntry>*
   void* index_buffers_ = nullptr;  ///< std::unordered_map<uint64_t, IndexBufferEntry>*
   void* textures_ = nullptr;       ///< std::unordered_map<uint64_t, TextureEntry>*
   void* resolves_ = nullptr;       ///< std::unordered_map<uint64_t, ResolvedTarget>*
+  void* render_targets_ = nullptr; ///< std::unordered_map<uint32_t, HostTarget>*
+  IDirect3DSurface9* backbuffer_ = nullptr;
+  uint32_t backbuffer_width_ = 0;
+  uint32_t backbuffer_height_ = 0;
+  bool intz_supported_ = false;
   uint64_t unsupported_formats_ = 0;
   uint64_t unsupported_texture_formats_ = 0;
   uint64_t frame_ = 0;  ///< bumped by AdvanceFrame; gates frame-coherent resource reuse

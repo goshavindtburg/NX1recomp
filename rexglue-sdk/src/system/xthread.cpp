@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 #include <fmt/format.h>
 
@@ -43,6 +44,12 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+#if REX_PLATFORM_WIN32
+// Linker-provided symbol marking the base of the module this code is linked
+// into. Used to turn a faulting host pc into an ASLR-independent RVA.
+extern "C" char __ImageBase;
+#endif
+
 namespace rex::system {
 
 const uint32_t XAPC::kSize;
@@ -52,6 +59,43 @@ const uint32_t XAPC::kDummyRundownRoutine;
 using namespace rex::literals;
 
 uint32_t next_xthread_id_ = 0;
+
+thread_local XThread* current_xthread_tls_ = nullptr;
+
+namespace {
+
+XThread* GetBoundCurrentXThread() {
+  return current_xthread_tls_;
+}
+
+// Base address of the host executable image, so a faulting host pc can be
+// reported as an RVA and symbolized against the build's map/pdb regardless of
+// where ASLR placed the image.
+uint64_t HostImageBase() {
+#if REX_PLATFORM_WIN32
+  return reinterpret_cast<uint64_t>(&__ImageBase);
+#else
+  return 0;
+#endif
+}
+
+// If the faulting host address lies inside the guest address space, report the
+// guest address it maps to. A guest null dereference shows up as a host fault
+// at membase + field_offset, which is otherwise easy to misread.
+uint32_t GuestFaultAddress(XThread* thread, uint64_t fault_address) {
+  auto* memory = thread->memory();
+  if (!memory) {
+    return 0;
+  }
+  const uint64_t base = reinterpret_cast<uint64_t>(memory->virtual_membase());
+  const uint64_t offset = fault_address - base;
+  if (fault_address < base || offset > UINT32_MAX) {
+    return 0;
+  }
+  return static_cast<uint32_t>(offset);
+}
+
+}  // namespace
 
 const char* AccessViolationOperationName(arch::Exception::AccessViolationOperation op) {
   switch (op) {
@@ -64,27 +108,50 @@ const char* AccessViolationOperationName(arch::Exception::AccessViolationOperati
   }
 }
 
-bool LogUnhandledGuestException(arch::Exception* ex, void* data) {
-  auto* thread = reinterpret_cast<XThread*>(data);
-  auto* ctx = thread && thread->thread_state() ? thread->thread_state()->context() : nullptr;
+bool LogUnhandledGuestException(arch::Exception* ex, void* /*data*/) {
+  // The host exception handler list is process-wide: a fault on any thread runs
+  // every installed handler. Only the thread that actually faulted may report,
+  // otherwise a single fault is logged once per live guest thread, each line
+  // carrying the *bystander's* guest context instead of the faulting one.
+  auto* thread = GetBoundCurrentXThread();
+  const uint64_t rva = ex->pc() - HostImageBase();
+
+  if (!thread) {
+    // A host-only thread (audio, web client, sockets...). There is no guest
+    // context to report, but the fault still has to be visible.
+    if (ex->code() == arch::Exception::Code::kAccessViolation) {
+      REXSYS_ERROR(
+          "Unhandled host access violation on non-guest thread at host pc={:016X} (rva {:08X}): {} "
+          "fault {:016X}",
+          ex->pc(), rva, AccessViolationOperationName(ex->access_violation_operation()),
+          ex->fault_address());
+    } else if (ex->code() == arch::Exception::Code::kIllegalInstruction) {
+      REXSYS_ERROR("Unhandled host illegal instruction on non-guest thread at host pc={:016X} "
+                   "(rva {:08X})",
+                   ex->pc(), rva);
+    }
+    return false;
+  }
+
+  auto* ctx = thread->thread_state() ? thread->thread_state()->context() : nullptr;
 
   if (ex->code() == arch::Exception::Code::kAccessViolation) {
     REXSYS_ERROR(
-        "Unhandled host access violation in thid {} ({}) at host pc={:016X}: {} fault {:016X}; "
-        "guest lr={:08X} ctr={:08X} r1={:08X} r3={:08X} r4={:08X} r11={:08X} r12={:08X} "
-        "r29={:08X} r30={:08X} r31={:08X} last_indirect={:08X}",
-        thread ? thread->thread_id() : 0, thread ? thread->name().c_str() : "<unknown>", ex->pc(),
+        "Unhandled host access violation in thid {} ({}) at host pc={:016X} (rva {:08X}): {} fault "
+        "{:016X} (guest {:08X}); guest lr={:08X} ctr={:08X} r1={:08X} r3={:08X} r4={:08X} "
+        "r11={:08X} r12={:08X} r29={:08X} r30={:08X} r31={:08X} last_indirect={:08X}",
+        thread->thread_id(), thread->name().c_str(), ex->pc(), rva,
         AccessViolationOperationName(ex->access_violation_operation()), ex->fault_address(),
-        ctx ? ctx->lr : 0, ctx ? ctx->ctr.u32 : 0, ctx ? ctx->r1.u32 : 0, ctx ? ctx->r3.u32 : 0,
-        ctx ? ctx->r4.u32 : 0, ctx ? ctx->r11.u32 : 0, ctx ? ctx->r12.u32 : 0,
-        ctx ? ctx->r29.u32 : 0, ctx ? ctx->r30.u32 : 0, ctx ? ctx->r31.u32 : 0,
-        ctx ? ctx->last_indirect_target : 0);
+        GuestFaultAddress(thread, ex->fault_address()), ctx ? ctx->lr : 0, ctx ? ctx->ctr.u32 : 0,
+        ctx ? ctx->r1.u32 : 0, ctx ? ctx->r3.u32 : 0, ctx ? ctx->r4.u32 : 0, ctx ? ctx->r11.u32 : 0,
+        ctx ? ctx->r12.u32 : 0, ctx ? ctx->r29.u32 : 0, ctx ? ctx->r30.u32 : 0,
+        ctx ? ctx->r31.u32 : 0, ctx ? ctx->last_indirect_target : 0);
   } else if (ex->code() == arch::Exception::Code::kIllegalInstruction) {
     REXSYS_ERROR(
-        "Unhandled host illegal instruction in thid {} ({}) at host pc={:016X}; guest lr={:08X} "
-        "ctr={:08X} r1={:08X} r3={:08X} last_indirect={:08X}",
-        thread ? thread->thread_id() : 0, thread ? thread->name().c_str() : "<unknown>", ex->pc(),
-        ctx ? ctx->lr : 0, ctx ? ctx->ctr.u32 : 0, ctx ? ctx->r1.u32 : 0, ctx ? ctx->r3.u32 : 0,
+        "Unhandled host illegal instruction in thid {} ({}) at host pc={:016X} (rva {:08X}); guest "
+        "lr={:08X} ctr={:08X} r1={:08X} r3={:08X} last_indirect={:08X}",
+        thread->thread_id(), thread->name().c_str(), ex->pc(), rva, ctx ? ctx->lr : 0,
+        ctx ? ctx->ctr.u32 : 0, ctx ? ctx->r1.u32 : 0, ctx ? ctx->r3.u32 : 0,
         ctx ? ctx->last_indirect_target : 0);
   }
 
@@ -146,16 +213,6 @@ XThread::~XThread() {
     REXSYS_ERROR("Thread disposed without exiting");
   }
 }
-
-thread_local XThread* current_xthread_tls_ = nullptr;
-
-namespace {
-
-XThread* GetBoundCurrentXThread() {
-  return current_xthread_tls_;
-}
-
-}  // namespace
 
 bool XThread::IsInThread() {
   return GetBoundCurrentXThread() != nullptr;
@@ -668,9 +725,16 @@ void XThread::Execute() {
                "r4={:016X}, r5={:016X}, r13={:016X}, lr={:016X}, stack={:08X}-{:08X})",
                address, ctx->r1.u64, ctx->r3.u64, ctx->r4.u64, ctx->r5.u64, ctx->r13.u64,
                ctx->lr, stack_limit_, stack_base_);
-  arch::ExceptionHandler::Install(LogUnhandledGuestException, this);
+  // The handler list is process-wide and bounded (kMaxHandlerCount), and the
+  // handler resolves the faulting thread from TLS - so install it once for the
+  // whole process rather than once per guest thread. Installing per-thread both
+  // overflowed the list once enough guest threads were live and made every
+  // thread report every other thread's faults.
+  static std::once_flag exception_handler_installed;
+  std::call_once(exception_handler_installed,
+                 []() { arch::ExceptionHandler::Install(LogUnhandledGuestException, nullptr); });
+
   func(*ctx, base);
-  arch::ExceptionHandler::Uninstall(LogUnhandledGuestException, this);
 
   exit_code = static_cast<int>(ctx->r3.u32);
   REXSYS_INFO("XThread::Execute - Function {:08X} returned r3={:08X} lr={:08X}; exiting thid {}",

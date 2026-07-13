@@ -37,6 +37,7 @@ set(NX1MP_SOURCES
     src/main.cpp
     src/platform_compat.cpp
     src/d3d9/d3d9_renderer.cpp
+    src/d3d9/d3d9_constants.cpp
     src/d3d9/d3d9_hooks.cpp
     src/d3d9/d3d9_resources.cpp
     src/d3d9/d3d9_shaders.cpp

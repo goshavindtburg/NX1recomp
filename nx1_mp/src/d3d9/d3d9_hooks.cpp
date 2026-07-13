@@ -22,6 +22,7 @@
  * and have no hookable entry point at all.
  */
 
+#include <atomic>
 #include <cstdint>
 
 #include <rex/hook.h>
@@ -29,6 +30,8 @@
 #include <rex/ppc/context.h>
 
 #include "d3d9_renderer.h"
+#include "d3d9_constants.h"
+#include "d3d9_resources.h"
 #include "guest_d3d.h"
 
 //=============================================================================
@@ -41,13 +44,62 @@ REX_EXTERN(__imp__rex_D3DDevice_DrawIndexedVerticesUP);
 REX_EXTERN(__imp__rex_D3DDevice_DrawVerticesUP);
 REX_EXTERN(__imp__rex_D3DDevice_Clear);
 REX_EXTERN(__imp__rex_D3DDevice_Resolve);
+REX_EXTERN(__imp__rex_D3DDevice_SetRenderTarget);
+REX_EXTERN(__imp__rex_D3DDevice_SetDepthStencilSurface);
 REX_EXTERN(__imp__rex_D3DDevice_Swap);
 REX_EXTERN(__imp__rex_D3DDevice_GpuBeginShaderConstantF4);
 REX_EXTERN(__imp__rex_XGSetVertexBufferHeader);
 REX_EXTERN(__imp__rex_XGSetIndexBufferHeader);
 REX_EXTERN(__imp__rex_XGSetTextureHeader);
+REX_EXTERN(__imp__rex_R_AddDrawCall_YAXPAUGfxViewInfo_I_Z);
+REX_EXTERN(__imp__rex_D3DDevice_BeginCommandBuffer);
 
 namespace {
+
+/// Sample the guest's float-constant dirty masks and retire any ring-owned register group
+/// the guest is about to flush from its shadow.
+///
+/// This MUST run before the draw's `__imp__`: the guest's flush zeroes the masks, so after
+/// it there is no way to tell which groups the shadow just overwrote. A set bit means the
+/// shadow flush wins (it is emitted after the SET_CONSTANT packet); a clear bit means a
+/// GpuBeginShaderConstantF4 record, if any, is what the GPU actually holds.
+/// `dvar_t* const r_cmdbuf_worker`, and the byte offset of `dvar_t::current.enabled`.
+/// Both read straight off R_AddDrawCall's disassembly (guest 0x824DA538).
+inline constexpr uint32_t kRCmdBufWorkerDvarPtr = 0x841765B0;
+inline constexpr uint32_t kDvarCurrentEnabled = 0x0C;
+
+/// Turn off NX1's deferred draw-call command buffers. See the R_AddDrawCall hook.
+void DisableCmdBufWorkerDvar(uint8_t* base) {
+#ifdef _WIN32
+  const uint32_t dvar = nx1::d3d9::GuestRead32(base, kRCmdBufWorkerDvarPtr);
+  if (!dvar) {
+    return;  // dvars not registered yet
+  }
+  uint8_t* enabled = base + dvar + kDvarCurrentEnabled;
+  if (*enabled) {
+    *enabled = 0;
+    REXGPU_INFO("nx1_d3d9: r_cmdbuf_worker disabled; recording draw lists on the render thread");
+  }
+#else
+  (void)base;
+#endif
+}
+
+void RetireRingConstants(const uint8_t* base, uint32_t device) {
+#ifdef _WIN32
+  if (!nx1::d3d9::IsEnabled() || !device) {
+    return;
+  }
+  auto& ring = nx1::d3d9::ConstantRing::For(device);
+  ring.Retire(/*pixel_stage=*/false,
+              nx1::d3d9::GuestRead64(base, device + nx1::d3d9::guest_device::kAluDirtyMaskVs));
+  ring.Retire(/*pixel_stage=*/true,
+              nx1::d3d9::GuestRead64(base, device + nx1::d3d9::guest_device::kAluDirtyMaskPs));
+#else
+  (void)base;
+  (void)device;
+#endif
+}
 
 /// Lazily bring the host device up on first use, from whichever thread the guest
 /// render backend happens to own the device on.
@@ -87,6 +139,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVertices) {
 #ifdef _WIN32
   const uint32_t device = ctx.r3.u32, prim = ctx.r4.u32, base_vtx = ctx.r5.u32,
                  start_index = ctx.r6.u32, index_count = ctx.r7.u32;
+  RetireRingConstants(base, device);
 #endif
   __imp__rex_D3DDevice_DrawIndexedVertices(ctx, base);
 #ifdef _WIN32
@@ -101,6 +154,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawVertices) {
   // r3 = device, r4 = primType, r5 = StartVertex, r6 = VertexCount
   const uint32_t device = ctx.r3.u32, prim = ctx.r4.u32, start_vtx = ctx.r5.u32,
                  vtx_count = ctx.r6.u32;
+  RetireRingConstants(base, device);
 #endif
   __imp__rex_D3DDevice_DrawVertices(ctx, base);
 #ifdef _WIN32
@@ -125,6 +179,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVerticesUP) {
                  index_count = ctx.r7.u32, indices = ctx.r8.u32, index_fmt = ctx.r9.u32,
                  verts = ctx.r10.u32;
   const uint32_t stride = nx1::d3d9::GuestRead32(base, ctx.r1.u32 + 0x54);
+  RetireRingConstants(base, device);
 #endif
   __imp__rex_D3DDevice_DrawIndexedVerticesUP(ctx, base);
 #ifdef _WIN32
@@ -141,6 +196,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawVerticesUP) {
 #ifdef _WIN32
   const uint32_t device = ctx.r3.u32, prim = ctx.r4.u32, vtx_count = ctx.r5.u32, verts = ctx.r6.u32,
                  stride = ctx.r7.u32;
+  RetireRingConstants(base, device);
 #endif
   __imp__rex_D3DDevice_DrawVerticesUP(ctx, base);
 #ifdef _WIN32
@@ -177,18 +233,58 @@ REX_HOOK_RAW(rex_D3DDevice_Clear) {
 //=============================================================================
 //
 // D3DDevice_Resolve(pDevice, Flags, pSourceRect, pDestTexture, pDestPoint, ...):
-//   r3 = pDevice   r4 = Flags   r5 = pSourceRect   r6 = pDestTexture
-// The render target ("EDRAM") is our backbuffer; capture the source rect into the
-// host texture the destination address maps to, so later samples of it work.
+//   r3 = pDevice   r4 = Flags   r5 = pSourceRect   r6 = pDestTexture   r7 = pDestPoint
+//
+// The guest renders through predicated tiling: the frame is drawn as a set of
+// horizontal bands, each resolved into the destination at its own pDestPoint offset.
+// Ignoring pDestPoint blits every band over the whole destination, so the last band
+// ends up smeared across the entire frame -- honour it and the tiles compose.
 
 REX_HOOK_RAW(rex_D3DDevice_Resolve) {
 #ifdef _WIN32
-  const uint32_t dest_texture = ctx.r6.u32, src_rect = ctx.r5.u32;
+  const uint32_t dest_texture = ctx.r6.u32, src_rect = ctx.r5.u32, dest_point = ctx.r7.u32;
 #endif
   __imp__rex_D3DDevice_Resolve(ctx, base);
 #ifdef _WIN32
   if (EnsureRenderer()) {
-    nx1::d3d9::Renderer::Get().Resolve(base, dest_texture, src_rect);
+    nx1::d3d9::Renderer::Get().Resolve(base, dest_texture, src_rect, dest_point);
+  }
+#endif
+}
+
+//=============================================================================
+// Render targets
+//=============================================================================
+//
+// D3DDevice_SetRenderTarget(pDevice, RenderTargetIndex, pRenderTarget):
+//   r3 = pDevice   r4 = RenderTargetIndex   r5 = pRenderTarget (D3DSurface*)
+// D3DDevice_SetDepthStencilSurface(pDevice, pNewZStencil):
+//   r3 = pDevice   r4 = pNewZStencil (D3DSurface*)
+//
+// The guest draws the world, its shadow maps, the bloom chain and the final composite
+// into different surfaces. Each gets its own host target; a display-sized colour
+// target aliases the backbuffer.
+
+REX_HOOK_RAW(rex_D3DDevice_SetRenderTarget) {
+#ifdef _WIN32
+  const uint32_t index = ctx.r4.u32, surface = ctx.r5.u32;
+#endif
+  __imp__rex_D3DDevice_SetRenderTarget(ctx, base);
+#ifdef _WIN32
+  if (EnsureRenderer()) {
+    nx1::d3d9::Renderer::Get().SetRenderTarget(base, index, surface);
+  }
+#endif
+}
+
+REX_HOOK_RAW(rex_D3DDevice_SetDepthStencilSurface) {
+#ifdef _WIN32
+  const uint32_t surface = ctx.r4.u32;
+#endif
+  __imp__rex_D3DDevice_SetDepthStencilSurface(ctx, base);
+#ifdef _WIN32
+  if (EnsureRenderer()) {
+    nx1::d3d9::Renderer::Get().SetDepthStencil(base, surface);
   }
 #endif
 }
@@ -208,20 +304,102 @@ REX_HOOK_RAW(rex_D3DDevice_Swap) {
 }
 
 //=============================================================================
+// Deferred command buffers -- force the single-threaded backend
+//=============================================================================
+//
+// R_AddDrawCall (guest 0x824DA538) is the only producer of WRKCMD_DRAW_LIT_OPAQUE, the only
+// worker command that records guest D3D. When it fires, a worker thread runs the ordinary
+// R_Draw* code against its own D3DDevice out of dx.cmdBufDevice[40] and the render thread
+// splices the result in later via D3DDevice_RunCommandBuffer.
+//
+// We execute draws where they are recorded, so worker recording means several threads
+// driving one host device at once: thread A's constants and shaders land between thread B's
+// setup and B's draw. That is the smeared-geometry-plus-flicker signature.
+//
+// The engine already ships the way out. R_AddDrawCall is gated on
+// r_smp_worker && r_smp_backend && r_cmdbuf_worker, and when the gate is false it does
+// nothing: p_cmdBufValid[type] stays 0, R_RunCommandBuffer (0x82519C70) replays nothing, and
+// RB_StandardDrawCommands' unconditional R_DrawLitOpaque/R_DepthPrepass*/... calls find a
+// full draw-list iterator and record everything inline on the render thread. Suppressing the
+// call reproduces that configuration exactly, without touching a dvar.
+//
+// Revisit if we ever replay per-device command lists at RunCommandBuffer time instead.
+
+REX_HOOK_RAW(rex_R_AddDrawCall_YAXPAUGfxViewInfo_I_Z) {
+#ifdef _WIN32
+  // Suppressing this function is not enough on its own: the PPC compiler *inlined*
+  // R_AddDrawCall into its callers (which is why R_GenerateSortedDrawSurfs calls
+  // Sys_AddWorkerCmd directly at eight sites), and a hook cannot reach an inlined copy.
+  //
+  // Every copy, inlined or not, tests the same gate, so clear the gate instead. From the
+  // disassembly of R_AddDrawCall (0x824DA538):
+  //
+  //     lwz    r10, r_cmdbuf_worker     ; dvar_t*
+  //     lbz    r8,  0xC(r10)            ; ->current.enabled
+  //     cmplwi cr6, r8, 0
+  //     beq    cr6, skip                ; false -> queue nothing, p_cmdBufValid stays 0
+  //
+  // With the gate false the engine records every draw list inline on the render thread
+  // (see the note above), which is the whole point.
+  if (nx1::d3d9::IsEnabled()) {
+    DisableCmdBufWorkerDvar(base);
+  }
+#endif
+  __imp__rex_R_AddDrawCall_YAXPAUGfxViewInfo_I_Z(ctx, base);
+}
+
+// DIAG(d3d9): R_InitCmdBuf -> D3DDevice_BeginCommandBuffer is the *only* way a guest device
+// enters recording mode, and R_DrawLitOpaqueCmd is its only caller. If this still fires with
+// R_AddDrawCall suppressed, something other than the draw-call worker command is opening a
+// command buffer. TODO(d3d9): drop.
+REX_HOOK_RAW(rex_D3DDevice_BeginCommandBuffer) {
+#ifdef _WIN32
+  if (nx1::d3d9::IsEnabled()) {
+    static std::atomic<uint32_t> begun{0};
+    const uint32_t n = begun.fetch_add(1, std::memory_order_relaxed);
+    if (n < 5) {
+      REXGPU_WARN("nx1_d3d9: [cmdbufdiag] BeginCommandBuffer on device {:#010x} (thread {})",
+                  ctx.r3.u32, uint32_t(::GetCurrentThreadId()));
+    }
+  }
+#endif
+  __imp__rex_D3DDevice_BeginCommandBuffer(ctx, base);
+}
+
+//=============================================================================
 // Shader constants -- GPU fast path
 //=============================================================================
 //
 // D3DDevice_GpuBeginShaderConstantF4(pDevice, PixelShader, StartRegister, Count)
 // returns a raw pointer *into the PM4 ring*, pre-stamped with a 0xC0002D00
-// SET_CONSTANT header; the engine then writes float4s directly there.
-// GpuEndShaderConstantF4 is a 4-byte no-op, so there is no "commit" to hook.
+// SET_CONSTANT header; the engine then writes float4s directly there. The data never
+// reaches m_Constants, and the caller clears the group's dirty bit so the draw-time
+// shadow flush cannot overwrite it. GpuEndShaderConstantF4 is a 4-byte no-op, so there
+// is no "commit" to hook.
 //
-// TODO(d3d9): hand back a guest-visible scratch buffer instead, record
-// (PixelShader, StartRegister, Count, scratch_addr), and fold it into the shadow
-// constant file at the next draw. Passing through for now keeps the ring valid.
+// This carries VS c4..c7 -- the object->world matrix -- on every model draw, so the
+// shadow is NOT authoritative for it. Let the original run (it keeps the ring valid and
+// m_pRing correct), then remember where it put the data so the draw can read it back.
+// See d3d9_constants.h for the full arbitration.
 
 REX_HOOK_RAW(rex_D3DDevice_GpuBeginShaderConstantF4) {
+#ifdef _WIN32
+  // r3 = pDevice, r4 = PixelShader, r5 = StartRegister, r6 = Vector4fCount. Capture before
+  // __imp__: the recompiled body runs on ctx and clobbers the volatile registers -- r3 in
+  // particular comes back holding the return value.
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t pixel_shader = ctx.r4.u32;
+  const uint32_t start_register = ctx.r5.u32;
+  const uint32_t count = ctx.r6.u32;
+#endif
   __imp__rex_D3DDevice_GpuBeginShaderConstantF4(ctx, base);
+#ifdef _WIN32
+  if (nx1::d3d9::IsEnabled() && device) {
+    // r3 is now the returned ring pointer (0 if the reservation failed).
+    nx1::d3d9::ConstantRing::For(device).Record(pixel_shader != 0, start_register, count,
+                                                ctx.r3.u32);
+  }
+#endif
 }
 
 //=============================================================================
@@ -250,3 +428,4 @@ REX_HOOK_RAW(rex_XGSetIndexBufferHeader) {
 REX_HOOK_RAW(rex_XGSetTextureHeader) {
   __imp__rex_XGSetTextureHeader(ctx, base);
 }
+

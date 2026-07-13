@@ -31,6 +31,13 @@ namespace guest_device {
 
 // --- D3DDevice ---
 inline constexpr uint32_t kPendingMask = 0x0000;  ///< uint64 m_Mask[5] -- dirty bits
+/// m_Mask[0] / m_Mask[1] tag the VS / PS float constants, one bit per group of 4
+/// registers, numbered from the MSB: register r is bit 63 - (r >> 2). A draw flushes the
+/// tagged groups out of the shadow and then *zeroes* the word -- so anything that needs to
+/// know what was dirty must read it before the guest's draw body runs. See
+/// d3d9_constants.h.
+inline constexpr uint32_t kAluDirtyMaskVs = kPendingMask + 0x0000;
+inline constexpr uint32_t kAluDirtyMaskPs = kPendingMask + 0x0008;
 inline constexpr uint32_t kRingPtr = 0x0030;      ///< uint32* m_pRing
 
 inline constexpr uint32_t kConstants = 0x0480;  ///< _D3DConstants (9120 bytes)
@@ -165,6 +172,10 @@ inline uint32_t GuestRead32(const uint8_t* base, uint32_t guest_addr) {
   const uint8_t* host =
       guest_addr >= 0xA0000000u ? GuestTranslatePhysical(guest_addr) : base + guest_addr;
   return *reinterpret_cast<const rex::be<uint32_t>*>(host);
+}
+
+inline uint64_t GuestRead64(const uint8_t* base, uint32_t guest_addr) {
+  return (uint64_t(GuestRead32(base, guest_addr)) << 32) | GuestRead32(base, guest_addr + 4);
 }
 
 inline float GuestReadF32(const uint8_t* base, uint32_t guest_addr) {
@@ -315,6 +326,63 @@ inline TextureFetchConstant ReadTextureFetchConstant(const uint8_t* base, uint32
 inline constexpr uint32_t kBaseTextureFormatOffset = 0x1C;
 inline TextureFetchConstant ReadBaseTextureFormat(const uint8_t* base, uint32_t texture_object) {
   return ReadTextureFetchConstantAt(base, texture_object + kBaseTextureFormatOffset);
+}
+
+/// Dimensions of a D3DSurface (an EDRAM render target).
+///
+/// A surface is *not* a texture: decoding its embedded fetch constant the way a
+/// D3DBaseTexture's is decoded yields nonsense (441x4066), because an EDRAM surface has
+/// no texture fetch constant. Its header instead carries a packed extent at +0x24:
+///
+///   ((width - 1) << 18) | ((height - 1) << 3)
+///
+/// This is the *logical* extent, and using it matters. The row pitch (+0x18) and byte
+/// size (+0x2C) also encode a size, but that one is EDRAM-*padded*: it decodes the scene
+/// depth as 1024x1105 and the shadow maps as 1024x2080 / 512x2240. Those surfaces get
+/// resolved and sampled back at their true 1024x600 / 1024x2048 extents, so a padded
+/// host target makes every depth and shadow lookup in the lighting shaders land on the
+/// wrong texel -- and, because a depth target must cover its colour target, the padding
+/// also dragged every depth surface up to the display's 1920 width as passes alternated.
+///
+/// Checked against every target NX1 uses: 1920x1080 display, 1024x600 scene,
+/// 1024x2048 / 512x2048 shadow maps, 256x150 bloom -- exact on all five.
+inline constexpr uint32_t kSurfaceExtentOffset = 0x24;
+inline bool ReadSurfaceSize(const uint8_t* base, uint32_t surface, uint32_t* width,
+                            uint32_t* height) {
+  const uint32_t packed = GuestRead32(base, surface + kSurfaceExtentOffset);
+  const uint32_t w = ((packed >> 18) & 0x3FFF) + 1;
+  const uint32_t h = ((packed >> 3) & 0x7FFF) + 1;
+  if (w < 2 || h < 2 || w > 8192 || h > 8192) {
+    return false;
+  }
+  *width = w;
+  *height = h;
+  return true;
+}
+
+/// GPU_COLORINFO (GPU_DEPTHINFO for a depth surface), the field D3DDevice_SetRenderTarget
+/// copies into m_DestinationPacket.Color0Info. Bits 0..11 are the EDRAM base in tiles;
+/// bits 16..19 are the format.
+inline constexpr uint32_t kSurfaceColorInfoOffset = 0x1C;
+inline constexpr uint32_t kColorInfoFormatMask = 0x000F0000;
+
+/// Identity of the EDRAM region a surface describes.
+///
+/// A D3DSurface is a *view*, not the memory. NX1 hands us two different D3DSurface objects
+/// for the scene colour target -- same EDRAM base (0x062), same 1024x600 extent, differing
+/// only in the format field -- draws the world through one and resolves through the other.
+/// The bloom chain does the same with its two 256x150 surfaces. On hardware that is free:
+/// EDRAM is a scratchpad and both views address the same tiles. Keying host render targets
+/// by the D3DSurface pointer instead splits one region into two textures, so every colour
+/// draw lands in one and the resolve reads the other -- a black frame with a perfectly
+/// healthy draw count.
+///
+/// So key by what the hardware keys by: the EDRAM base and the extent, with the format bits
+/// masked out. Surfaces that name the same tiles at the same size *are* the same target.
+inline uint64_t ReadSurfaceEdramKey(const uint8_t* base, uint32_t surface) {
+  const uint32_t info = GuestRead32(base, surface + kSurfaceColorInfoOffset) & ~kColorInfoFormatMask;
+  const uint32_t extent = GuestRead32(base, surface + kSurfaceExtentOffset);
+  return (uint64_t(info) << 32) | extent;
 }
 
 //=============================================================================

@@ -230,6 +230,26 @@ bool ShouldForceNx1DebugDvarOnName(uint8_t* base, uint32_t guest_name) {
          IsNx1DeveloperOverlayDvarName(base, guest_name);
 }
 
+// The stat-bar HUD (performance warnings and budget bars) needs both the debug
+// HUD and its stat-bar section turned on.
+bool IsNx1StatBarHudEnabled() {
+  return rex::system::IsNx1DebugHudEnabled() &&
+         rex::system::IsNx1DebugHudStatBarsEnabled();
+}
+
+// One-shot "did this draw path run at all" probe used while bringing the debug
+// HUD up. Logs the first time the guest reaches the function and then stays
+// quiet.
+void LogNx1DebugHudProbeOnce(bool& logged, const char* name) {
+  if (logged) {
+    return;
+  }
+
+  logged = true;
+  REXLOG_INFO("NX1 debug HUD probe: {} reached enabled={}", name,
+              rex::system::IsNx1DebugHudEnabled());
+}
+
 bool GetForcedNx1DvarValueName(uint8_t* base, uint32_t guest_name,
                                uint32_t* out_value) {
   if (ShouldForceNx1DebugDvarOnName(base, guest_name)) {
@@ -2111,12 +2131,18 @@ extern "C" void rex_CG_CornerDebugPrint_YAMPBUScreenPlacement_MMMPBD1QBM_Z(
 
 extern "C" void rex_CG_DrawDebugOverlays_YAXH_Z(PPCContext& ctx,
                                                  uint8_t* base) {
+  static bool logged = false;
+  LogNx1DebugHudProbeOnce(logged, "CG_DrawDebugOverlays");
+
   if (!rex::system::IsNx1DebugHudEnabled()) {
     return;
   }
 
   PinNx1DebugHudDvars(base);
-  __imp__rex_CG_DrawDebugOverlays_YAXH_Z(ctx, base);
+
+  // NX1 routes its debug overlays through the full-screen path; the original
+  // per-view overlay body is not used.
+  rex_CG_DrawFullScreenDebugOverlays_YAXH_Z(ctx, base);
 }
 
 extern "C" void rex_CG_DrawUpperRightDebugInfo(PPCContext& ctx,
@@ -2131,6 +2157,9 @@ extern "C" void rex_CG_DrawUpperRightDebugInfo(PPCContext& ctx,
 
 extern "C" void rex_CG_DrawFullScreenDebugOverlays_YAXH_Z(PPCContext& ctx,
                                                            uint8_t* base) {
+  static bool logged = false;
+  LogNx1DebugHudProbeOnce(logged, "CG_DrawFullScreenDebugOverlays");
+
   if (!rex::system::IsNx1DebugHudEnabled()) {
     return;
   }
@@ -2147,6 +2176,248 @@ extern "C" void rex_Con_DrawMiniConsole_YAXHHHMW4EScreenLayer_Z(
 
   __imp__rex_Con_DrawMiniConsole_YAXHHHMW4EScreenLayer_Z(ctx, base);
 }
+
+// Stat-bar HUD: performance warnings and budget bars, plus the StatMon entries
+// that feed them. Pure debug drawing, so it is suppressed unless the stat-bar
+// HUD is on. With StatMon_Warning stubbed no entries are ever recorded, which
+// keeps the stats count at 0.
+//
+// Do NOT add a wrapper for rex_StatMon_GetStatsArray_* here, and do not stub it
+// in the generated code either. It looks like it belongs to this cluster, but it
+// is a plain accessor with a second, non-HUD caller: SV_WriteOverlayBits() (the
+// server snapshot writer) indexes the returned array for every *non-loopback*
+// client - it only skips the read when the client is NA_LOOPBACK, and it never
+// null-checks. Handing back a null array there faults the host at guest 0x48
+// (= stats[6].endtime) the moment a remote player joins, which is invisible in
+// solo play. The HUD is already fully suppressed at the two drawing callers
+// below, so gating the accessor buys nothing and only reintroduces that crash.
+extern "C" void rex_CG_DrawPerformanceWarnings_YAXH_Z(PPCContext& ctx,
+                                                      uint8_t* base) {
+  if (!IsNx1StatBarHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawPerformanceWarnings_YAXH_Z(ctx, base);
+}
+
+extern "C" void rex_BudgetBar_DrawHoriz_YAXABUBudgetBar_MMMIM_Z(
+    PPCContext& ctx, uint8_t* base) {
+  if (!IsNx1StatBarHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_BudgetBar_DrawHoriz_YAXABUBudgetBar_MMMIM_Z(ctx, base);
+}
+
+extern "C" void rex_StatMon_Warning_YAXHHHPBD_Z(PPCContext& ctx,
+                                                uint8_t* base) {
+  if (!IsNx1StatBarHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_StatMon_Warning_YAXHHHPBD_Z(ctx, base);
+}
+
+//=============================================================================
+// Debug-HUD draw paths.
+//
+// These were previously stubbed by hand-editing the recompiled bodies in
+// generated/, which codegen silently discards on the next run. They live here
+// instead: DEFINE_REX_FUNC emits the real body as __imp__rex_X and only a *weak*
+// alias for rex_X, so a strong definition here wins at link time and survives
+// regeneration.
+//=============================================================================
+
+extern "C" void rex_CG_Draw2D_YAXH_Z(PPCContext& ctx, uint8_t* base) {
+  static bool logged = false;
+  LogNx1DebugHudProbeOnce(logged, "CG_Draw2D");
+
+  __imp__rex_CG_Draw2D_YAXH_Z(ctx, base);
+}
+
+extern "C" void rex_CG_DrawErrorMessages(PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawErrorMessages(ctx, base);
+}
+
+extern "C" void rex_CG_DrawImageCacheBars_YAXHPBUScreenPlacement_Z(
+    PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawImageCacheBars_YAXHPBUScreenPlacement_Z(ctx, base);
+}
+
+extern "C" void rex_CG_DrawImageCacheText_YAMMPBUScreenPlacement_MM_Z(
+    PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawImageCacheText_YAMMPBUScreenPlacement_MM_Z(ctx, base);
+}
+
+extern "C" void rex_CG_DrawLagometer_YAXH_Z(PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawLagometer_YAXH_Z(ctx, base);
+}
+
+extern "C" void rex_CG_DrawMemmap_YAXHPBUScreenPlacement_Z(PPCContext& ctx,
+                                                           uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawMemmap_YAXHPBUScreenPlacement_Z(ctx, base);
+}
+
+extern "C" void rex_CG_DrawMiniConsole(PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawMiniConsole(ctx, base);
+}
+
+extern "C" void rex_CG_DrawScriptUsage(PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawScriptUsage(ctx, base);
+}
+
+extern "C" void rex_CG_DrawSoundOverlay(PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawSoundOverlay(ctx, base);
+}
+
+extern "C" void rex_CG_DrawVersion_YAXXZ(PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawVersion_YAXXZ(ctx, base);
+}
+
+extern "C" void rex_CG_DrawViewpos(PPCContext& ctx, uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_CG_DrawViewpos(ctx, base);
+}
+
+extern "C" void rex_DrawMenuDebugText_YAXPAUUiContext_Z(PPCContext& ctx,
+                                                        uint8_t* base) {
+  if (!rex::system::IsNx1DebugHudEnabled()) {
+    return;
+  }
+
+  __imp__rex_DrawMenuDebugText_YAXPAUUiContext_Z(ctx, base);
+}
+
+//=============================================================================
+// Render paths forced off by the NX1 "force ... off" cvars. Same rationale as
+// above: keep the gate in tracked source, not in generated/.
+//
+// The R_Using*/RB_Using* predicates return their result in r3, so the forced-off
+// path has to zero r3 rather than just returning.
+//=============================================================================
+
+extern "C" void rex_TRACK_r_camoflauge_YAXXZ(PPCContext& ctx, uint8_t* base) {
+  if (rex::system::IsNx1ForceGpRdvarCamoOffEnabled()) {
+    return;
+  }
+
+  __imp__rex_TRACK_r_camoflauge_YAXXZ(ctx, base);
+}
+
+extern "C" void rex_R_UsingGlow_YA_NPBUGfxViewInfo_Z(PPCContext& ctx,
+                                                     uint8_t* base) {
+  if (rex::system::IsNx1ForceGlowOffEnabled()) {
+    ctx.r3.s64 = 0;
+    return;
+  }
+
+  __imp__rex_R_UsingGlow_YA_NPBUGfxViewInfo_Z(ctx, base);
+}
+
+extern "C" void rex_R_UsingDepthOfField_YA_NPBUGfxViewInfo_Z(PPCContext& ctx,
+                                                             uint8_t* base) {
+  if (rex::system::IsNx1ForceDofOffEnabled()) {
+    ctx.r3.s64 = 0;
+    return;
+  }
+
+  __imp__rex_R_UsingDepthOfField_YA_NPBUGfxViewInfo_Z(ctx, base);
+}
+
+extern "C" void rex_R_UsingHitDistortion_YA_NPBUGfxViewInfo_Z(PPCContext& ctx,
+                                                              uint8_t* base) {
+  if (rex::system::IsNx1ForceDistortionOffEnabled()) {
+    ctx.r3.s64 = 0;
+    return;
+  }
+
+  __imp__rex_R_UsingHitDistortion_YA_NPBUGfxViewInfo_Z(ctx, base);
+}
+
+extern "C" void rex_RB_UsingBlur(PPCContext& ctx, uint8_t* base) {
+  if (rex::system::IsNx1ForceBlurOffEnabled()) {
+    ctx.r3.s64 = 0;
+    return;
+  }
+
+  __imp__rex_RB_UsingBlur(ctx, base);
+}
+
+extern "C" void rex_RB_UsingRadialBlur(PPCContext& ctx, uint8_t* base) {
+  if (rex::system::IsNx1ForceBlurOffEnabled()) {
+    ctx.r3.s64 = 0;
+    return;
+  }
+
+  __imp__rex_RB_UsingRadialBlur(ctx, base);
+}
+
+extern "C" void rex_RB_CalcGlowEffect(PPCContext& ctx, uint8_t* base) {
+  if (rex::system::IsNx1ForceGlowOffEnabled()) {
+    return;
+  }
+
+  __imp__rex_RB_CalcGlowEffect(ctx, base);
+}
+
+extern "C" void rex_RB_GlowFilterImage_YAXPBUGfxViewInfo_Z(PPCContext& ctx,
+                                                           uint8_t* base) {
+  if (rex::system::IsNx1ForceGlowOffEnabled()) {
+    return;
+  }
+
+  __imp__rex_RB_GlowFilterImage_YAXPBUGfxViewInfo_Z(ctx, base);
+}
+
+//=============================================================================
+// Startup / shutdown probes and stubs.
+//=============================================================================
+
+extern "C" void rex_Com_Quit_f_YAXXZ(PPCContext& ctx, uint8_t* base) {
+  REXLOG_WARN("[NX1/MP demo] Com_Quit_f called");
+
+  __imp__rex_Com_Quit_f_YAXXZ(ctx, base);
+}
+
 
 extern "C" void rex_Con_DrawErrors_YAXHHHMW4EScreenLayer_Z(PPCContext& ctx,
                                                             uint8_t* base) {

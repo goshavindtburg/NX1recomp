@@ -84,10 +84,19 @@ class Renderer {
 
   void Clear(uint32_t flags, uint32_t color, float z, uint32_t stencil);
 
+  /// Bind the host target standing in for a guest render-target surface. The guest
+  /// renders the world, its shadow maps, the bloom chain and the final composite into
+  /// *different* surfaces; without this they all collapse onto one backbuffer and the
+  /// shadow passes corrupt the depth the world pass tests against.
+  void SetRenderTarget(const uint8_t* base, uint32_t index, uint32_t guest_surface);
+  void SetDepthStencil(const uint8_t* base, uint32_t guest_surface);
+
   /// Handle a guest EDRAM->texture resolve: capture the current render target into
   /// the host texture the resolve destination maps to. `dest_texture` is the guest
-  /// D3DBaseTexture address; `src_rect` is the guest _D3DRECT address (0 = whole).
-  void Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect);
+  /// D3DBaseTexture address; `src_rect` is the guest _D3DRECT address (0 = whole);
+  /// `dest_point` is the guest D3DPOINT address the band lands at (0 = origin).
+  void Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
+               uint32_t dest_point);
 
   /// Resolve the guest's bound shaders, bind their SM3 translations, and upload
   /// their constants. Returns false on a cache miss -- the draw must be skipped.
@@ -138,6 +147,12 @@ class Renderer {
   uint32_t backbuffer_width_ = 0;
   uint32_t backbuffer_height_ = 0;
 
+  // Size of the colour target currently bound to slot 0. The viewport and the clear
+  // are relative to *this*, not the backbuffer: a shadow map is 1024x2048, and
+  // clamping its viewport to the 1080-tall backbuffer would clip it in half.
+  uint32_t current_rt_width_ = 0;
+  uint32_t current_rt_height_ = 0;
+
   // Guest-clip-space -> host-clip-space fold, resolved per draw from the guest
   // viewport registers and applied inside the translated vertex shaders.
   float ndc_scale_[3] = {1.0f, 1.0f, 1.0f};
@@ -150,12 +165,49 @@ class Renderer {
 
   uint64_t shader_cache_misses_ = 0;
 
+  // Set once the guest resolves the 1024x600 scene target, i.e. we are actually
+  // rendering the world. Frame-number gates are unreliable (they depend on how long
+  // the player sat in menus); this is a direct signal.
+  std::atomic<bool> saw_scene_target_{false};
+
+  // The guest depth surface currently bound, so a depth resolve knows which host
+  // (INTZ) texture to publish under the resolve's destination address.
+  uint32_t current_depth_surface_ = 0;
+
+  // The guest never binds the display as a render target: it draws into EDRAM
+  // surfaces and *resolves* the finished frame to one of two display buffers. So the
+  // last display-sized resolve is the frame to show -- Present blits it to the
+  // backbuffer. Without this, everything renders correctly into offscreen targets and
+  // the window stays empty.
+  uint32_t display_resolve_addr_ = 0;
+
+  // DIAG(d3d9): the 1024x600 scene colour resolve, presented directly (when
+  // nx1_d3d9_debug_clear is on) to see the raw world render without the composite.
+  uint32_t scene_resolve_addr_ = 0;
+
   // Diagnostics, reported periodically from Present so a black window can be told
   // apart from an idle one. draws_attempted_ counts every guest draw we saw;
   // draws_submitted_ counts the ones that reached DrawIndexedPrimitive/DrawPrimitive.
   uint64_t frames_presented_ = 0;
   uint64_t draws_attempted_ = 0;
   uint64_t draws_submitted_ = 0;
+
+  // DIAG(d3d9): with the worker command buffers suppressed the world went black even
+  // though the draw count per frame is unchanged, so the draws are landing on a target
+  // we never present. Tally each draw against the colour target bound at the time and
+  // dump the tally from Present. TODO(d3d9): drop.
+  uint32_t current_rt_surface_ = 0;
+  bool current_draw_writes_color_ = false;
+  struct RtTally {
+    uint32_t surface;
+    uint32_t width;
+    uint32_t height;
+    uint32_t draws;
+    uint32_t color_draws;
+  };
+  RtTally rt_tally_[12] = {};
+  uint32_t rt_tally_n_ = 0;
+  void TallyDraw();
 };
 
 /// Best-effort discovery of the game's top-level window.

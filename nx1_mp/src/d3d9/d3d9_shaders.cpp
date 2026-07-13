@@ -13,6 +13,7 @@
 
 #include <rex/logging/macros.h>
 
+#include "d3d9_constants.h"
 #include "guest_d3d.h"
 
 #ifdef NX1_HAVE_SM3_SHADER_CACHE
@@ -160,10 +161,10 @@ bool NeedsHostNdcTransform(const Sm3Shader& shader) {
 #endif
 }
 
-void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_constants_addr,
+void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
                                   const Sm3Shader& shader, bool pixel_stage) {
 #ifndef NX1_HAVE_SM3_SHADER_CACHE
-  (void)base; (void)guest_constants_addr; (void)shader; (void)pixel_stage;
+  (void)base; (void)guest_device; (void)shader; (void)pixel_stage;
 #else
   if (!device_ || !shader.entry) {
     return;
@@ -173,19 +174,70 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_constants_
   float staging[kMaxHostConstants * 4];
   uint32_t count;
 
+  // A register the engine wrote through D3DDevice_GpuBeginShaderConstantF4 lives in the
+  // PM4 ring, not in the shadow constant file -- notably VS c4..c7, the object->world
+  // matrix of every model draw. Resolve() hands back whichever address currently owns the
+  // register. See d3d9_constants.h.
+  const uint32_t guest_constants_addr =
+      guest_device + (pixel_stage ? guest_device::kPsConstants : guest_device::kVsConstants);
+  const ConstantRing& ring = ConstantRing::For(guest_device);
+
   if (e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS) {
     // Relative addressing: the shader can index any register, so upload all 256.
     count = kMaxHostConstants;
-    for (uint32_t i = 0; i < count * 4; ++i) {
-      staging[i] = GuestReadF32(base, guest_constants_addr + i * 4);
+    for (uint32_t r = 0; r < count; ++r) {
+      const uint32_t addr = ring.Resolve(pixel_stage, r, guest_constants_addr);
+      for (uint32_t c = 0; c < 4; ++c) {
+        staging[r * 4 + c] = GuestReadF32(base, addr + c * 4);
+      }
     }
   } else {
     count = e.remapCount;
     for (uint32_t i = 0; i < count; ++i) {
       const uint32_t src = g_nx1Sm3ConstantRemap[e.remapOffset + i];
+      const uint32_t addr = ring.Resolve(pixel_stage, src, guest_constants_addr);
       for (uint32_t c = 0; c < 4; ++c) {
-        staging[i * 4 + c] = GuestReadF32(base, guest_constants_addr + (src * 4 + c) * 4);
+        staging[i * 4 + c] = GuestReadF32(base, addr + c * 4);
       }
+    }
+  }
+
+  // DIAG(d3d9): vertices, indices, layouts and the rigid-model ring matrices all check out,
+  // so the suspect is a ring record outliving its owner. A rigid model writes c4..c7 through
+  // the ring; the record only retires when the guest re-dirties the group. If a later draw
+  // (the world, whose vertices are already in world space) reads c4..c7 expecting the
+  // *shadow* value and the engine's redundancy cache skipped re-setting them, we hand it the
+  // previous model's matrix. Log which registers each VS reads and who owns them.
+  // TODO(d3d9): drop.
+  if (!pixel_stage && !(e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS)) {
+    // Skip the menu entirely -- it drains any sample budget before the map loads, and it
+    // never touches the ring. Start once some device has taken a ring record.
+    static uint32_t seen = 0;
+    static uint32_t dumped = 0;
+    if (ConstantRing::EverRecorded() && (seen++ % 400) == 0 && dumped < 24) {
+      ++dumped;
+      char regs[256];
+      int n = 0;
+      uint32_t ring_owned = 0;
+      for (uint32_t i = 0; i < e.remapCount && n < 200; ++i) {
+        const uint32_t src = g_nx1Sm3ConstantRemap[e.remapOffset + i];
+        const bool owned = ring.Lookup(false, src) != 0;
+        ring_owned += owned ? 1 : 0;
+        n += snprintf(regs + n, sizeof(regs) - n, "%s%u%s", n ? " " : "", src, owned ? "*" : "");
+      }
+      REXGPU_INFO("nx1_d3d9: [regdiag] vs reads [{}] ({} of {} from ring; * = ring)", regs,
+                  ring_owned, e.remapCount);
+      // Everything upstream of the transform is verified, so print what the draw actually
+      // multiplies by: c0..c3 should be a view-projection (a projection has a lone +-1 in
+      // the last row and 0 in its .w except for z), c4..c7 the object->world.
+      for (uint32_t r = 0; r < 8; ++r) {
+        const uint32_t a = ring.Resolve(false, r, guest_constants_addr);
+        REXGPU_INFO("nx1_d3d9: [cdump]   c{} [{: 10.3f} {: 10.3f} {: 10.3f} {: 10.3f}] {}", r,
+                    GuestReadF32(base, a + 0), GuestReadF32(base, a + 4),
+                    GuestReadF32(base, a + 8), GuestReadF32(base, a + 12),
+                    ring.Lookup(false, r) ? "(ring)" : "(shadow)");
+      }
+      REXGPU_INFO("nx1_d3d9: [cdump]   ndc scale/offset applied by the host fold follows");
     }
   }
 
