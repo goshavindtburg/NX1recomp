@@ -23,4 +23,10 @@ const uint8_t* GuestTranslatePhysical(uint32_t guest_addr) {
   return rex::system::kernel_state()->memory()->TranslateVirtual<const uint8_t*>(guest_addr);
 }
 
+const uint8_t* GuestTranslateGpuPhysical(uint32_t gpu_physical) {
+  // A raw GPU physical address (< 0x20000000) -- a vertex-fetch base, or a shader's literal
+  // constant payload. Unlike the device-shadow reads above, these really are physical.
+  return rex::system::kernel_state()->memory()->TranslatePhysical<const uint8_t*>(gpu_physical);
+}
+
 }  // namespace nx1::d3d9

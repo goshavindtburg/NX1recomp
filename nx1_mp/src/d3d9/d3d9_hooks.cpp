@@ -42,7 +42,7 @@ REX_EXTERN(__imp__rex_D3DDevice_DrawIndexedVertices);
 REX_EXTERN(__imp__rex_D3DDevice_DrawVertices);
 REX_EXTERN(__imp__rex_D3DDevice_DrawIndexedVerticesUP);
 REX_EXTERN(__imp__rex_D3DDevice_DrawVerticesUP);
-REX_EXTERN(__imp__rex_D3DDevice_Clear);
+REX_EXTERN(__imp__rex_D3DDevice_ClearF);
 REX_EXTERN(__imp__rex_D3DDevice_Resolve);
 REX_EXTERN(__imp__rex_D3DDevice_SetRenderTarget);
 REX_EXTERN(__imp__rex_D3DDevice_SetDepthStencilSurface);
@@ -52,7 +52,6 @@ REX_EXTERN(__imp__rex_XGSetVertexBufferHeader);
 REX_EXTERN(__imp__rex_XGSetIndexBufferHeader);
 REX_EXTERN(__imp__rex_XGSetTextureHeader);
 REX_EXTERN(__imp__rex_R_AddDrawCall_YAXPAUGfxViewInfo_I_Z);
-REX_EXTERN(__imp__rex_D3DDevice_BeginCommandBuffer);
 
 namespace {
 
@@ -210,44 +209,66 @@ REX_HOOK_RAW(rex_D3DDevice_DrawVerticesUP) {
 // Clear
 //=============================================================================
 //
-// D3DDevice_Clear(pDevice, Count, pRects, Flags, Color, Z, Stencil, ...):
-//   r3 = pDevice   r4 = Count    r5 = pRects   r6 = Flags
-//   r7 = Color     f1 = Z (double, first FP arg)   r8 = Stencil
-// We ignore the rect list and clear the whole target.
+// D3DDevice_ClearF(pDevice, Flags, pRect, pColor, Z, Stencil):
+//   r3 = pDevice   r4 = Flags   r5 = pRect (_D3DRECT*, may be null)
+//   r6 = pColor (__vector4 of floats)   f1 = Z   r8 = Stencil
+//
+// ClearF, *not* Clear, is the choke point: D3DDevice_Clear only unpacks its D3DCOLOR
+// into a float vector and forwards here, and NX1's own frame clear
+// (R_ClearScreenInternal, guest 0x825256F8) calls ClearF directly -- which is why
+// hooking D3DDevice_Clear saw exactly one call in a whole session, at startup, and the
+// scene's colour and depth were never cleared at all.
+//
+// Flags are Xenos, not desktop: bits 0-3 are colour targets 0-3 (D3D::ClearF loops
+// `(1 << i) & flags` over the four render targets), 0x10 is depth, 0x20 is stencil.
+// Reading them as desktop D3DCLEAR_* bits gets every one of them wrong.
 
-REX_HOOK_RAW(rex_D3DDevice_Clear) {
+REX_HOOK_RAW(rex_D3DDevice_ClearF) {
 #ifdef _WIN32
-  const uint32_t flags = ctx.r6.u32, color = ctx.r7.u32, stencil = ctx.r8.u32;
+  const uint32_t flags = ctx.r4.u32, rect = ctx.r5.u32, color = ctx.r6.u32, stencil = ctx.r8.u32;
   const float z = float(ctx.f1.f64);
 #endif
-  __imp__rex_D3DDevice_Clear(ctx, base);
+  __imp__rex_D3DDevice_ClearF(ctx, base);
 #ifdef _WIN32
   if (EnsureRenderer()) {
-    nx1::d3d9::Renderer::Get().Clear(flags, color, z, stencil);
+    nx1::d3d9::Renderer::Get().Clear(base, flags, rect, color, z, stencil);
   }
 #endif
 }
 
 //=============================================================================
-// Resolve (EDRAM -> texture)
+// Resolve (EDRAM -> texture, and the frame clear)
 //=============================================================================
 //
-// D3DDevice_Resolve(pDevice, Flags, pSourceRect, pDestTexture, pDestPoint, ...):
-//   r3 = pDevice   r4 = Flags   r5 = pSourceRect   r6 = pDestTexture   r7 = pDestPoint
+// D3DDevice_Resolve(pDevice, Flags, pSourceRect, pDestTexture, pDestPoint,
+//                   DestLevel, DestSliceIndex, pClearColor, ClearZ, ClearStencil, pParams):
+//   r3 = pDevice   r4 = Flags       r5 = pSourceRect   r6 = pDestTexture  r7 = pDestPoint
+//   r8 = DestLevel r9 = DestSlice   r10 = pClearColor  f1 = ClearZ
+//   ClearStencil is the 10th argument, in the caller's parameter save area at r1+0x5C.
 //
 // The guest renders through predicated tiling: the frame is drawn as a set of
 // horizontal bands, each resolved into the destination at its own pDestPoint offset.
 // Ignoring pDestPoint blits every band over the whole destination, so the last band
 // ends up smeared across the entire frame -- honour it and the tiles compose.
+//
+// The Xbox 360 also *clears* EDRAM as part of the resolve, and NX1 uses only that path:
+// R_ResolveAndClear_Xbox360 (guest 0x824F05C8) folds the caller's `whichToClear` into
+// D3DRESOLVE_CLEARRENDERTARGET (0x100) / D3DRESOLVE_CLEARDEPTHSTENCIL (0x200) and hands
+// the clear colour, Z and stencil to Resolve. D3DDevice_Clear is never called at all --
+// so this is the one and only thing that clears the scene's colour and depth buffers.
 
 REX_HOOK_RAW(rex_D3DDevice_Resolve) {
 #ifdef _WIN32
   const uint32_t dest_texture = ctx.r6.u32, src_rect = ctx.r5.u32, dest_point = ctx.r7.u32;
+  const uint32_t flags = ctx.r4.u32, clear_color = ctx.r10.u32;
+  const uint32_t clear_stencil = nx1::d3d9::GuestRead32(base, ctx.r1.u32 + 0x5C);
+  const float clear_z = float(ctx.f1.f64);
 #endif
   __imp__rex_D3DDevice_Resolve(ctx, base);
 #ifdef _WIN32
   if (EnsureRenderer()) {
-    nx1::d3d9::Renderer::Get().Resolve(base, dest_texture, src_rect, dest_point);
+    nx1::d3d9::Renderer::Get().Resolve(base, dest_texture, src_rect, dest_point, flags,
+                                       clear_color, clear_z, clear_stencil);
   }
 #endif
 }
@@ -346,24 +367,6 @@ REX_HOOK_RAW(rex_R_AddDrawCall_YAXPAUGfxViewInfo_I_Z) {
   }
 #endif
   __imp__rex_R_AddDrawCall_YAXPAUGfxViewInfo_I_Z(ctx, base);
-}
-
-// DIAG(d3d9): R_InitCmdBuf -> D3DDevice_BeginCommandBuffer is the *only* way a guest device
-// enters recording mode, and R_DrawLitOpaqueCmd is its only caller. If this still fires with
-// R_AddDrawCall suppressed, something other than the draw-call worker command is opening a
-// command buffer. TODO(d3d9): drop.
-REX_HOOK_RAW(rex_D3DDevice_BeginCommandBuffer) {
-#ifdef _WIN32
-  if (nx1::d3d9::IsEnabled()) {
-    static std::atomic<uint32_t> begun{0};
-    const uint32_t n = begun.fetch_add(1, std::memory_order_relaxed);
-    if (n < 5) {
-      REXGPU_WARN("nx1_d3d9: [cmdbufdiag] BeginCommandBuffer on device {:#010x} (thread {})",
-                  ctx.r3.u32, uint32_t(::GetCurrentThreadId()));
-    }
-  }
-#endif
-  __imp__rex_D3DDevice_BeginCommandBuffer(ctx, base);
 }
 
 //=============================================================================

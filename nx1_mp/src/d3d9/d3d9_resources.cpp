@@ -6,6 +6,7 @@
 // rex headers must precede <windows.h> (pulled in transitively by d3d9.h):
 // rex/thread.h declares Sleep(std::chrono::milliseconds), which the Win32
 // Sleep macro otherwise mangles.
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -25,6 +26,11 @@
 
 #include "d3d9_resources.h"
 #include "guest_d3d.h"
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
+                    "Give textures a mip chain, filtered down from level 0 by the driver. Off "
+                    "leaves every minified surface aliasing (the coloured speckle).")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 #ifdef _WIN32
 
@@ -221,9 +227,19 @@ enum class TexDecode { kNone, kDXT3A, kDXT5A };
 
 struct HostTextureFormat {
   D3DFORMAT d3d;
-  bool rb_swap;  ///< uncompressed only: swap R<->B per texel after the endian swap
+  /// 32-bit RGBA source landing in A8R8G8B8: apply the fetch constant's channel swizzle
+  /// after the endian swap (see MakeSwizzle32). The other formats' swizzles are the
+  /// natural replicating ones -- (X,X,X,Y) for 8_8 into A8L8, (X,X,X,1) for 8 into L8 --
+  /// which their host format already reproduces.
+  bool swizzle32;
   bool valid;
   TexDecode decode = TexDecode::kNone;
+  /// A block-compressed format the D3D9 runtime does not recognise as one (a FourCC it
+  /// passes straight through to the driver). It sizes such a surface as if it were one byte
+  /// per texel: LockRect reports `pitch == width` rather than the block row's
+  /// `blocks_wide * bytes_per_block`, and the smallest levels get less storage than a single
+  /// block. Both have to be worked around -- see the upload in GetTexture.
+  bool opaque_block = false;
 };
 
 HostTextureFormat PickHostTextureFormat(uint32_t xenos_format) {
@@ -238,7 +254,8 @@ HostTextureFormat PickHostTextureFormat(uint32_t xenos_format) {
     case kTex_DXT4_5_AS_16_16_16_16:
       return {D3DFMT_DXT5, false, true};
     case kTex_DXN:  // BC5 / two-channel normal maps
-      return {D3DFORMAT(MAKEFOURCC('A', 'T', 'I', '2')), false, true};
+      return {D3DFORMAT(MAKEFOURCC('A', 'T', 'I', '2')), false, true, TexDecode::kNone,
+              /*opaque_block=*/true};
     case kTex_DXT3A:  // single-channel explicit-alpha BC -> decode + replicate
       return {D3DFMT_A8R8G8B8, false, true, TexDecode::kDXT3A};
     case kTex_DXT5A:  // single-channel interpolated-alpha BC -> decode + replicate
@@ -272,6 +289,35 @@ HostTextureFormat PickHostTextureFormat(uint32_t xenos_format) {
 }
 
 inline uint32_t Log2Exact(uint32_t v) { return v ? __builtin_ctz(v) : 0; }
+
+/// Can the driver filter a mip chain down from level 0 for this format? Block-compressed
+/// formats often cannot (and an unrecognised FourCC like ATI2 almost never can), and asking
+/// for it anyway fails the CreateTexture outright -- so ask first, once per format, and fall
+/// back to a single level for the ones that say no.
+bool SupportsAutoMips(IDirect3DDevice9Ex* device, D3DFORMAT format) {
+  static std::unordered_map<uint32_t, bool> cache;
+  const auto it = cache.find(uint32_t(format));
+  if (it != cache.end()) {
+    return it->second;
+  }
+  bool supported = false;
+  IDirect3D9* d3d = nullptr;
+  D3DDEVICE_CREATION_PARAMETERS params{};
+  D3DDISPLAYMODE mode{};
+  if (SUCCEEDED(device->GetDirect3D(&d3d)) && d3d) {
+    if (SUCCEEDED(device->GetCreationParameters(&params)) &&
+        SUCCEEDED(d3d->GetAdapterDisplayMode(params.AdapterOrdinal, &mode))) {
+      supported = SUCCEEDED(d3d->CheckDeviceFormat(params.AdapterOrdinal, params.DeviceType,
+                                                   mode.Format, D3DUSAGE_AUTOGENMIPMAP,
+                                                   D3DRTYPE_TEXTURE, format));
+    }
+    d3d->Release();
+  }
+  cache.emplace(uint32_t(format), supported);
+  REXGPU_INFO("nx1_d3d9: auto mip generation for host format 0x{:08X}: {}", uint32_t(format),
+              supported ? "supported" : "NOT supported (single level)");
+  return supported;
+}
 
 /// Read a big-endian dword out of a guest buffer.
 inline uint32_t LoadBE32(const uint8_t* p) {
@@ -393,6 +439,23 @@ uint64_t MixKey(uint64_t a, uint64_t b) {
   return h;
 }
 
+/// Hash everything about a layout that changes the bytes it produces -- and nothing about
+/// which shader or declaration it came from. See VertexLayout::content_key.
+uint64_t LayoutContentKey(const VertexLayout& layout) {
+  uint64_t h = MixKey(0x5644656C6C61796Full, layout.stream_count);
+  for (uint32_t s = 0; s < kMaxHostStreams; ++s) {
+    h = MixKey(h, (uint64_t(layout.guest_stride[s]) << 32) | layout.host_stride[s]);
+    h = MixKey(h, layout.bulk_swap[s] ? 1 : 0);
+  }
+  for (const ConvertOp& op : layout.ops) {
+    h = MixKey(h, (uint64_t(op.src_offset) << 48) | (uint64_t(op.dst_offset) << 32) |
+                      (uint64_t(op.stream) << 24) | (uint64_t(op.format) << 16) |
+                      (uint64_t(op.src_size) << 8) | op.dst_size);
+    h = MixKey(h, (op.is_signed ? 1u : 0u) | (op.is_normalized ? 2u : 0u) | (op.expand ? 4u : 0u));
+  }
+  return h;
+}
+
 // last_frame gates frame-coherent reuse: a resource bound by many draws in one
 // frame is hashed/validated only on its first use that frame, not per draw.
 struct VertexBufferEntry {
@@ -409,11 +472,26 @@ struct IndexBufferEntry {
   uint32_t index_size = 0;
   uint64_t content_hash = 0;
   uint64_t last_frame = 0;
+  /// Host-order copy of the indices. A draw's fetch constant covers the whole pooled
+  /// vertex buffer, not the model in it, so the only way to know how many vertices a draw
+  /// actually touches is to look at its indices -- and scanning this beats re-reading
+  /// big-endian guest memory.
+  std::vector<uint8_t> cpu;
 };
+
+/// Memoized "highest index this draw range references", so the scan happens once per
+/// distinct draw rather than once per frame per draw.
+using IndexRangeMap = std::unordered_map<uint64_t, uint32_t>;
 
 struct TextureEntry {
   IDirect3DTexture9* tex = nullptr;
-  uint64_t layout_key = 0;  ///< base address + format + dims; a change rebuilds the texture
+  /// Volume textures are a separate D3D9 type. The composite's colour-grading LUT is a 3D
+  /// texture and its tone-map curve a 1D one; leaving either unbound samples black, which
+  /// blacks out the whole composited frame.
+  IDirect3DVolumeTexture9* vol = nullptr;
+  /// Cube maps (environment/reflection), a third D3D9 type again.
+  IDirect3DCubeTexture9* cube = nullptr;
+  uint64_t layout_key = 0;  ///< base address + format + dims + mips; a change rebuilds it
   uint64_t content_hash = 0;
   uint64_t last_frame = 0;
 };
@@ -448,6 +526,12 @@ struct HostTarget {
 
 using LayoutMap = std::unordered_map<uint64_t, VertexLayout>;
 using VertexBufferMap = std::unordered_map<uint64_t, VertexBufferEntry>;
+/// Guest-memory hash of a vertex buffer, memoized for the frame it was taken in.
+struct VertexHash {
+  uint64_t frame = 0;  ///< frame_ + 1, so a default-constructed entry never matches frame 0
+  uint64_t hash = 0;
+};
+using VertexHashMap = std::unordered_map<uint64_t, VertexHash>;
 using IndexBufferMap = std::unordered_map<uint64_t, IndexBufferEntry>;
 using TextureMap = std::unordered_map<uint64_t, TextureEntry>;
 using ResolveMap = std::unordered_map<uint64_t, ResolvedTarget>;
@@ -466,10 +550,15 @@ constexpr uint32_t PhysicalAddress(uint32_t address) { return address & 0x1FFFFF
 
 /// Untile (or straight-copy) one 2D mip into `dst`, tightly packed at
 /// `dst_row_bytes` per block-row, applying the fetch constant's endian swap.
-/// `src` points at the texture base in guest memory.
+/// `src` points at the level's base in guest memory.
+///
+/// `offset_x`/`offset_y` are the level's origin *within* that image, in blocks. They are
+/// non-zero only for a packed mip tail: once a level shrinks to 16 texels or less, Xenos
+/// stops giving it its own image and parks it alongside its siblings inside one 32x32-block
+/// tile (see TextureInfo::GetPackedTileOffset).
 void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
                  const rex::graphics::TextureExtent& extent, uint32_t bytes_per_block,
-                 uint32_t endian, bool tiled) {
+                 uint32_t endian, bool tiled, uint32_t offset_x = 0, uint32_t offset_y = 0) {
   namespace tu = rex::graphics::texture_util;
   namespace tc = rex::graphics::texture_conversion;
   const auto xe_endian = static_cast<rex::graphics::xenos::Endian>(endian);
@@ -482,8 +571,8 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
     for (uint32_t by = 0; by < blocks_high; ++by) {
       uint8_t* dst_row = dst + size_t(by) * dst_row_bytes;
       for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
-        const int32_t src_off =
-            tu::GetTiledOffset2D(int32_t(bx), int32_t(by), pitch_blocks, bpb_log2);
+        const int32_t src_off = tu::GetTiledOffset2D(int32_t(offset_x + bx), int32_t(offset_y + by),
+                                                     pitch_blocks, bpb_log2);
         tc::CopySwapBlock(xe_endian, dst_row + size_t(bx) * bytes_per_block, src + src_off,
                           bytes_per_block);
       }
@@ -492,9 +581,37 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
     // Linear: block rows are 256-byte aligned in guest memory.
     const uint32_t src_row_bytes = extent.block_pitch_h * bytes_per_block;
     const uint32_t row_copy = blocks_wide * bytes_per_block;
+    const size_t src_origin = size_t(offset_y) * src_row_bytes + size_t(offset_x) * bytes_per_block;
     for (uint32_t by = 0; by < blocks_high; ++by) {
       tc::CopySwapBlock(xe_endian, dst + size_t(by) * dst_row_bytes,
-                        src + size_t(by) * src_row_bytes, row_copy);
+                        src + src_origin + size_t(by) * src_row_bytes, row_copy);
+    }
+  }
+}
+
+/// Untile one 3D mip slice-by-slice into `dst`, which is laid out as `depth` slices of
+/// `slice_bytes`, each `row_bytes` per block-row. Xenos tiles 3D textures in 32x32x4 blocks,
+/// so a slice is not simply a 2D mip -- GetTiledOffset3D walks it.
+void DetileMip3D(uint8_t* dst, uint32_t row_bytes, uint32_t slice_bytes, const uint8_t* src,
+                 uint32_t blocks_wide, uint32_t blocks_high, uint32_t depth, uint32_t pitch_blocks,
+                 uint32_t bytes_per_block, uint32_t endian, bool tiled) {
+  namespace tu = rex::graphics::texture_util;
+  namespace tc = rex::graphics::texture_conversion;
+  const auto xe_endian = static_cast<rex::graphics::xenos::Endian>(endian);
+  const uint32_t bpb_log2 = Log2Exact(bytes_per_block);
+
+  for (uint32_t z = 0; z < depth; ++z) {
+    uint8_t* slice = dst + size_t(z) * slice_bytes;
+    for (uint32_t by = 0; by < blocks_high; ++by) {
+      uint8_t* row = slice + size_t(by) * row_bytes;
+      for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
+        const size_t src_off =
+            tiled ? size_t(tu::GetTiledOffset3D(int32_t(bx), int32_t(by), int32_t(z), pitch_blocks,
+                                                blocks_high, bpb_log2))
+                  : ((size_t(z) * blocks_high + by) * pitch_blocks + bx) * bytes_per_block;
+        tc::CopySwapBlock(xe_endian, row + size_t(bx) * bytes_per_block, src + src_off,
+                          bytes_per_block);
+      }
     }
   }
 }
@@ -551,10 +668,51 @@ void DecodeBCAlphaToArgb(uint8_t* dst, uint32_t dst_pitch, const uint8_t* src, u
   }
 }
 
-/// In-place R<->B swap over a run of A8R8G8B8 texels.
-void SwapRedBlue(uint8_t* row, uint32_t texels) {
+/// The per-texel byte permutation a fetch constant's channel swizzle implies, for a
+/// 32-bit format landing in D3DFMT_A8R8G8B8.
+///
+/// After the endian swap a Xenos texel's bytes are its components in order: [X][Y][Z][W].
+/// D3DFMT_A8R8G8B8 reads that same memory as [B][G][R][A]. The swizzle says where each
+/// output channel comes from -- R = comp[swz.x], G = comp[swz.y], B = comp[swz.z],
+/// A = comp[swz.w] -- so the destination byte for R (index 2) takes source byte swz.x,
+/// and so on. Component values 4 and 5 are the constants 0 and 1.
+///
+/// This is *not* a fixed red/blue swap. NX1's textures are overwhelmingly swizzle 0x60A
+/// (R<-Z, G<-Y, B<-X), which is already exactly D3D's byte order and needs no work at
+/// all; the identity swizzle 0x688 is the one that needs the swap. Applying a blanket
+/// R<->B swap to every 8888 texture inverted red and blue on all of them -- including the
+/// colour-grading LUT the composite runs the whole frame through, which is what turned
+/// the sky orange.
+struct Swizzle32 {
+  uint8_t src[4];  ///< per destination byte (B,G,R,A): source byte 0-3, or 4=zero, 5=one
+  bool identity;
+};
+
+Swizzle32 MakeSwizzle32(uint32_t swizzle) {
+  Swizzle32 s{};
+  const uint8_t comp[4] = {
+      uint8_t(swizzle & 0x7),         // -> R (dst byte 2)
+      uint8_t((swizzle >> 3) & 0x7),  // -> G (dst byte 1)
+      uint8_t((swizzle >> 6) & 0x7),  // -> B (dst byte 0)
+      uint8_t((swizzle >> 9) & 0x7),  // -> A (dst byte 3)
+  };
+  s.src[2] = comp[0];
+  s.src[1] = comp[1];
+  s.src[0] = comp[2];
+  s.src[3] = comp[3];
+  s.identity = s.src[0] == 0 && s.src[1] == 1 && s.src[2] == 2 && s.src[3] == 3;
+  return s;
+}
+
+/// Apply `s` in place over a run of 32-bit texels.
+void SwizzleRow32(uint8_t* row, uint32_t texels, const Swizzle32& s) {
   for (uint32_t i = 0; i < texels; ++i) {
-    std::swap(row[i * 4 + 0], row[i * 4 + 2]);
+    uint8_t* p = row + size_t(i) * 4;
+    const uint8_t in[4] = {p[0], p[1], p[2], p[3]};
+    for (uint32_t d = 0; d < 4; ++d) {
+      const uint8_t c = s.src[d];
+      p[d] = c < 4 ? in[c] : (c == 5 ? 0xFF : 0x00);
+    }
   }
 }
 
@@ -598,7 +756,9 @@ void ResourceTracker::Initialize(IDirect3DDevice9Ex* device) {
   device_ = device;
   layouts_ = new LayoutMap();
   vertex_buffers_ = new VertexBufferMap();
+  vertex_hashes_ = new VertexHashMap();
   index_buffers_ = new IndexBufferMap();
+  index_ranges_ = new IndexRangeMap();
   textures_ = new TextureMap();
   resolves_ = new ResolveMap();
   render_targets_ = new TargetMap();
@@ -666,6 +826,14 @@ void ResourceTracker::Shutdown() {
     delete map;
     vertex_buffers_ = nullptr;
   }
+  if (vertex_hashes_) {
+    delete static_cast<VertexHashMap*>(vertex_hashes_);
+    vertex_hashes_ = nullptr;
+  }
+  if (index_ranges_) {
+    delete static_cast<IndexRangeMap*>(index_ranges_);
+    index_ranges_ = nullptr;
+  }
   if (index_buffers_) {
     auto* map = static_cast<IndexBufferMap*>(index_buffers_);
     for (auto& [key, entry] : *map) {
@@ -678,6 +846,8 @@ void ResourceTracker::Shutdown() {
     auto* map = static_cast<TextureMap*>(textures_);
     for (auto& [key, entry] : *map) {
       if (entry.tex) entry.tex->Release();
+      if (entry.vol) entry.vol->Release();
+      if (entry.cube) entry.cube->Release();
     }
     delete map;
     textures_ = nullptr;
@@ -796,6 +966,7 @@ const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32
 
   // A failed layout is cached too: the same declaration will fail every draw,
   // and re-deriving it each time would be pure overhead.
+  layout.content_key = LayoutContentKey(layout);
   auto& stored = map->emplace(key, std::move(layout)).first->second;
   return stored.decl ? &stored : nullptr;
 }
@@ -826,25 +997,6 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
   const uint64_t key = MixKey(MixKey(ucode.physical_address, ucode.dword_count), stream0_stride);
   auto* map = static_cast<LayoutMap*>(layouts_);
   if (auto it = map->find(key); it != map->end()) {
-    // DIAG(d3d9): this layout is cached on the *microcode* alone, but for a bound draw it
-    // has the guest's per-draw m_StreamStride baked into it. If the same shader is ever
-    // reused with a different stride, every vertex after the first is read at the wrong
-    // pitch -- which is what smeared world geometry looks like. TODO: drop.
-    if (!stream0_stride && it->second.decl) {
-      static std::atomic<uint32_t> budget{12};
-      for (uint32_t s = 0; s < it->second.stream_count; ++s) {
-        const uint32_t now = StreamStride(base, guest_device, s);
-        if (now && now != it->second.guest_stride[s] &&
-            budget.load(std::memory_order_relaxed) > 0) {
-          budget.fetch_sub(1, std::memory_order_relaxed);
-          REXGPU_WARN(
-              "nx1_d3d9: [stridediag] vs=0x{:08X} stream {} cached guest_stride={} but this "
-              "draw says {} (host_stride={} bulk_swap={})",
-              ucode.physical_address, s, it->second.guest_stride[s], now,
-              it->second.host_stride[s], it->second.bulk_swap[s]);
-        }
-      }
-    }
     return it->second.decl ? &it->second : nullptr;
   }
 
@@ -856,35 +1008,6 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
                                ucode_dwords, ucode.dword_count, std::endian::big);
   rex::string::StringBuffer disasm;
   shader.AnalyzeUcode(disasm);
-
-  // DIAG(d3d9): dump every distinct bound-draw layout. The vfetch stride (stride_words)
-  // is what the GPU actually fetches with; m_StreamStride is what the code trusts. If the
-  // two ever disagree, vertices are read at the wrong pitch. TODO: drop.
-  if (!stream0_stride) {
-    static std::atomic<uint32_t> budget{10};
-    if (budget.fetch_sub(1, std::memory_order_relaxed) > 0 &&
-        budget.load(std::memory_order_relaxed) < 0x80000000u) {
-      // Log the ucode hash so the analyzer's bindings can be diffed against the
-      // .nx1_vfetch sidecar XenosRecomp emitted for the same shader -- if the analyzer
-      // finds fewer attributes than the shader declares inputs, the host declaration is
-      // missing semantics and the shader reads unbound registers. TODO(d3d9): drop.
-      const uint64_t ucode_hash =
-          XXH3_64bits(ucode_dwords, size_t(ucode.dword_count) * sizeof(uint32_t));
-      REXGPU_INFO("nx1_d3d9: [layoutdiag] vs=0x{:08X} hash={:016X} {} binding(s)",
-                  ucode.physical_address, ucode_hash, shader.vertex_bindings().size());
-      for (const auto& b : shader.vertex_bindings()) {
-        const uint32_t s = 95u - b.fetch_constant;
-        REXGPU_INFO("  stream={} vfetch_stride={} m_StreamStride={} attrs={}", s,
-                    b.stride_words * 4u, StreamStride(base, guest_device, s),
-                    b.attributes.size());
-        for (const auto& a : b.attributes) {
-          const auto& at = a.fetch_instr.attributes;
-          REXGPU_INFO("    attr fmt={} off={} signed={} norm={}", uint32_t(at.data_format),
-                      at.offset * 4u, at.is_signed, !at.is_integer);
-        }
-      }
-    }
-  }
 
   // stream0_stride != 0 -> UP draw: one interleaved stream 0 with the supplied
   // stride. stream0_stride == 0 -> bound-buffer draw (BindStreams): each vfetch
@@ -985,6 +1108,7 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
     }
   }
 
+  layout.content_key = LayoutContentKey(layout);
   auto& stored = map->emplace(key, std::move(layout)).first->second;
   return stored.decl ? &stored : nullptr;
 }
@@ -992,6 +1116,7 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
 IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, uint32_t guest_device,
                                                          uint32_t stream,
                                                          const VertexLayout& layout,
+                                                         uint32_t needed_vertices,
                                                          uint32_t* vertex_count) {
   *vertex_count = 0;
   if (!device_ || !vertex_buffers_ || stream >= kMaxHostStreams) {
@@ -1000,30 +1125,32 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   const uint32_t guest_stride = layout.guest_stride[stream];
   const uint32_t host_stride = layout.host_stride[stream];
   const VertexFetchConstant fetch = ReadVertexFetchConstant(base, guest_device, stream);
-  // DIAG(d3d9): one-shot dump of the fetch-constant/stride values for the first
-  // bound-buffer stream that fails, so we can see why in-game draws bail. TODO: drop.
-  static bool vb_diag = false;
-  if (!vb_diag && (!guest_stride || !host_stride || !fetch.base_address ||
-                   fetch.size_bytes < guest_stride)) {
-    vb_diag = true;
-    REXGPU_INFO("nx1_d3d9: GetVertexBuffer bail stream={} guest_stride={} host_stride={} "
-                "base=0x{:08X} size={} endian={}",
-                stream, guest_stride, host_stride, fetch.base_address, fetch.size_bytes,
-                fetch.endian);
-  }
   if (!guest_stride || !host_stride) {
     return nullptr;
   }
   if (!fetch.base_address || fetch.size_bytes < guest_stride) {
     return nullptr;
   }
-  const uint32_t count = fetch.size_bytes / guest_stride;
+
+  // Keyed on the layout's *content*, not on the shader that asked for it: the same pooled
+  // buffer read through the same vertex format converts to the same bytes no matter which
+  // of the frame's ~120 vertex shaders is bound.
+  const uint64_t key = MixKey(MixKey(fetch.base_address, layout.content_key), stream);
+  auto* map = static_cast<VertexBufferMap*>(vertex_buffers_);
+  auto& entry = (*map)[key];
+
+  // The fetch constant's size is the distance to the end of the buffer, which for the
+  // engine's shared pools is megabytes -- not this model's vertex count. Mirroring all of
+  // it hashed and converted ~78k vertices for a draw that touches a few hundred. Bound it
+  // by what the draw's indices actually reference, and only ever grow: several draws share
+  // an entry, and re-creating the buffer whenever one of them needs fewer vertices than the
+  // last would thrash it.
+  const uint32_t pool_count = fetch.size_bytes / guest_stride;
+  uint32_t count = needed_vertices ? std::min(needed_vertices, pool_count) : pool_count;
+  count = std::max(count, entry.vertex_count);
   const uint32_t host_bytes = count * host_stride;
   *vertex_count = count;
 
-  const uint64_t key = MixKey(MixKey(fetch.base_address, layout.key), stream);
-  auto* map = static_cast<VertexBufferMap*>(vertex_buffers_);
-  auto& entry = (*map)[key];
   // Frame-coherent reuse: already validated this frame -> skip the content hash.
   if (entry.vb && entry.last_frame == frame_ && entry.bytes == host_bytes) {
     *vertex_count = entry.vertex_count;
@@ -1033,33 +1160,21 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
 
   const uint8_t* src = TranslatePhysical(fetch.base_address);
 
-  // DIAG(d3d9): the stride-44 world vertices smear while the stride-32 rigid models are
-  // fine, and we decode the world position as a float4 (Xenos fmt 38) at offset 0. Dump the
-  // raw guest vertex so we can see what is really there -- if bytes 12..15 are a packed
-  // dword rather than a float, our position.w is garbage and that is the smear.
-  // TODO(d3d9): drop.
-  if (guest_stride == 44) {
-    static bool dumped = false;
-    if (!dumped) {
-      dumped = true;
-      for (uint32_t v = 0; v < 3; ++v) {
-        const uint8_t* p = src + size_t(v) * guest_stride;
-        auto f = [p](uint32_t off) {
-          const uint32_t bits = LoadBE32(p + off);
-          float out;
-          std::memcpy(&out, &bits, sizeof(out));
-          return out;
-        };
-        REXGPU_INFO(
-            "nx1_d3d9: [vtxdiag] v{} dw {:08X} {:08X} {:08X} {:08X} {:08X} | as float "
-            "{: .3f} {: .3f} {: .3f} {: .3f} {: .3f}",
-            v, LoadBE32(p + 0), LoadBE32(p + 4), LoadBE32(p + 8), LoadBE32(p + 12),
-            LoadBE32(p + 16), f(0), f(4), f(8), f(12), f(16));
-      }
+  // Hash the guest bytes at most once per buffer per frame. The hash only depends on the
+  // guest memory, so every layout reading the same buffer gets the same answer -- and the
+  // buffers are large enough (a shared pool runs to megabytes) that re-hashing one per
+  // reader was half a gigabyte of memory traffic a frame.
+  const size_t guest_bytes = size_t(count) * guest_stride;
+  uint64_t content_hash = 0;
+  {
+    auto* hashes = static_cast<VertexHashMap*>(vertex_hashes_);
+    auto& cached = (*hashes)[MixKey(fetch.base_address, guest_bytes)];
+    if (cached.frame != frame_ + 1) {  // +1: a default-constructed entry must not match frame 0
+      cached.frame = frame_ + 1;
+      cached.hash = XXH3_64bits(src, guest_bytes);
     }
+    content_hash = cached.hash;
   }
-
-  const uint64_t content_hash = XXH3_64bits(src, size_t(count) * guest_stride);
   if (entry.vb && entry.bytes == host_bytes && entry.content_hash == content_hash) {
     return entry.vb;
   }
@@ -1109,6 +1224,60 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   return entry.vb;
 }
 
+void ResourceTracker::AdvanceFrame() {
+  ++frame_;
+
+  // Sweep periodically rather than every frame: walking the maps is O(entries), and an
+  // entry only has to survive long enough that a resource used every few frames is not
+  // thrashed. kKeepFrames is generous -- this is a leak guard, not a memory budget.
+  constexpr uint64_t kSweepEvery = 300;
+  constexpr uint64_t kKeepFrames = 600;
+  if (frame_ % kSweepEvery || frame_ < kKeepFrames) {
+    return;
+  }
+  const uint64_t cutoff = frame_ - kKeepFrames;
+
+  if (auto* map = static_cast<VertexBufferMap*>(vertex_buffers_)) {
+    for (auto it = map->begin(); it != map->end();) {
+      if (it->second.last_frame < cutoff) {
+        if (it->second.vb) it->second.vb->Release();
+        it = map->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (auto* map = static_cast<IndexBufferMap*>(index_buffers_)) {
+    for (auto it = map->begin(); it != map->end();) {
+      if (it->second.last_frame < cutoff) {
+        if (it->second.ib) it->second.ib->Release();
+        it = map->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  // Only textures we uploaded live here; the resolve/depth aliases we do not own are in
+  // resolves_, which is left alone.
+  if (auto* map = static_cast<TextureMap*>(textures_)) {
+    for (auto it = map->begin(); it != map->end();) {
+      if (it->second.last_frame < cutoff) {
+        if (it->second.tex) it->second.tex->Release();
+        if (it->second.vol) it->second.vol->Release();
+        if (it->second.cube) it->second.cube->Release();
+        it = map->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (auto* map = static_cast<VertexHashMap*>(vertex_hashes_)) {
+    for (auto it = map->begin(); it != map->end();) {
+      it = it->second.frame < cutoff ? map->erase(it) : std::next(it);
+    }
+  }
+}
+
 IDirect3DIndexBuffer9* ResourceTracker::GetIndexBuffer(const uint8_t* base, uint32_t guest_device,
                                                        uint32_t* index_size) {
   *index_size = 0;
@@ -1150,14 +1319,13 @@ IDirect3DIndexBuffer9* ResourceTracker::GetIndexBuffer(const uint8_t* base, uint
     return nullptr;
   }
 
-  void* mapped = nullptr;
-  if (FAILED(entry.ib->Lock(0, 0, &mapped, 0))) {
-    return nullptr;
-  }
+  // Byteswap once into the CPU copy, then hand that to D3D -- GetDrawMaxIndex reads it
+  // back to bound each draw's vertex range.
+  entry.cpu.resize(state.size_bytes);
   if (state.index_size == 4) {
-    SwapDwords(static_cast<uint8_t*>(mapped), src, state.size_bytes & ~3u);
+    SwapDwords(entry.cpu.data(), src, state.size_bytes & ~3u);
   } else {
-    auto* dst = static_cast<uint16_t*>(mapped);
+    auto* dst = reinterpret_cast<uint16_t*>(entry.cpu.data());
     const uint32_t n = state.size_bytes / 2;
     for (uint32_t i = 0; i < n; ++i) {
       uint16_t v;
@@ -1165,12 +1333,61 @@ IDirect3DIndexBuffer9* ResourceTracker::GetIndexBuffer(const uint8_t* base, uint
       dst[i] = Swap16(v);
     }
   }
+
+  void* mapped = nullptr;
+  if (FAILED(entry.ib->Lock(0, 0, &mapped, 0))) {
+    return nullptr;
+  }
+  std::memcpy(mapped, entry.cpu.data(), state.size_bytes);
   entry.ib->Unlock();
 
   entry.bytes = state.size_bytes;
   entry.index_size = state.index_size;
   entry.content_hash = content_hash;
   return entry.ib;
+}
+
+uint32_t ResourceTracker::GetDrawMaxIndex(const uint8_t* base, uint32_t guest_device,
+                                          uint32_t start_index, uint32_t index_count) {
+  if (!index_buffers_ || !index_ranges_ || !index_count) {
+    return 0;
+  }
+  const IndexBufferState state = ReadIndexBuffer(base, guest_device);
+  if (!state.valid()) {
+    return 0;
+  }
+  auto* map = static_cast<IndexBufferMap*>(index_buffers_);
+  auto it = map->find(MixKey(state.base_address, state.size_bytes));
+  if (it == map->end() || it->second.cpu.empty()) {
+    return 0;
+  }
+  const IndexBufferEntry& ib = it->second;
+
+  // Keyed on the index buffer's *contents* as well as the draw range, so a rewritten
+  // dynamic index buffer invalidates the memo instead of returning a stale range.
+  auto* ranges = static_cast<IndexRangeMap*>(index_ranges_);
+  const uint64_t key =
+      MixKey(MixKey(ib.content_hash, start_index), (uint64_t(index_count) << 1) | ib.index_size);
+  if (auto found = ranges->find(key); found != ranges->end()) {
+    return found->second;
+  }
+
+  uint32_t max_index = 0;
+  if (ib.index_size == 4) {
+    const uint32_t n = uint32_t(ib.cpu.size() / 4);
+    const auto* idx = reinterpret_cast<const uint32_t*>(ib.cpu.data());
+    for (uint32_t i = start_index; i < start_index + index_count && i < n; ++i) {
+      max_index = std::max(max_index, idx[i]);
+    }
+  } else {
+    const uint32_t n = uint32_t(ib.cpu.size() / 2);
+    const auto* idx = reinterpret_cast<const uint16_t*>(ib.cpu.data());
+    for (uint32_t i = start_index; i < start_index + index_count && i < n; ++i) {
+      max_index = std::max(max_index, uint32_t(idx[i]));
+    }
+  }
+  (*ranges)[key] = max_index;
+  return max_index;
 }
 
 uint32_t ResourceTracker::ConvertInlineVertices(uint32_t verts_addr, uint32_t count,
@@ -1252,42 +1469,49 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     auto* rmap = static_cast<ResolveMap*>(resolves_);
     if (auto it = rmap->find(PhysicalAddress(t.base_address));
         it != rmap->end() && it->second.tex) {
-      // DIAG(d3d9): which resolved targets does the guest actually sample back? If the
-      // scene colour never shows up here, the composite is not reading it. TODO: drop.
-      static uint32_t seen[16] = {};
-      static uint32_t seen_n = 0;
-      bool known = false;
-      for (uint32_t i = 0; i < seen_n; ++i) {
-        if (seen[i] == t.base_address) { known = true; break; }
-      }
-      if (!known && seen_n < 16) {
-        seen[seen_n++] = t.base_address;
-        REXGPU_INFO("nx1_d3d9: [samplediag] guest samples resolved 0x{:08X} ({}x{}) on sampler {}",
-                    t.base_address, it->second.width, it->second.height, sampler);
-      }
       return it->second.tex;
     }
   }
-  // DIAG(d3d9): a sampler that reaches here missed the resolve map. Log every distinct
-  // depth-format read (the shadow maps and the scene depth) -- if the guest samples a
-  // depth address we never published a resolve for, the lighting reads raw memory.
-  if (t.format == 22 || t.format == 23) {
-    static uint32_t miss[24] = {};
-    static uint32_t miss_n = 0;
-    bool known = false;
-    for (uint32_t i = 0; i < miss_n; ++i) {
-      if (miss[i] == t.base_address) { known = true; break; }
-    }
-    if (!known && miss_n < 24) {
-      miss[miss_n++] = t.base_address;
-      REXGPU_WARN("nx1_d3d9: [samplediag] sampler {} reads 0x{:08X} ({}x{} fmt {}) with NO resolve",
-                  sampler, t.base_address, t.width, t.height, t.format);
-    }
+  // xenos::DataDimension: 0 = 1D, 1 = 2D, 2 = 3D, 3 = cube.
+  //
+  // The composite's pixel shader ends with a 1D tone-map curve and a 3D colour-grading LUT:
+  //   r0.x   = tfetch1D(s8, ..)
+  //   r0.xyz = tfetch3D(s7, r0)
+  //   oC0    = r0
+  // so its entire output comes from those two. An unbound D3D9 sampler reads black, which
+  // blacked out the whole composited frame while the scene texture feeding it was perfect.
+  //
+  // 1D needs no special case: on D3D9 a 1D texture *is* a 2D texture one row tall, which is
+  // exactly what ps_3_0 compiles tex1D into. Fall through with height forced to 1.
+  if (t.dimension == 2) {
+    return GetVolumeTexture(t, sampler);
   }
-  // Only plain 2D textures for now. Cube/3D/stacked come later; skip rather than
-  // sampling something laid out differently than we expect.
-  if (t.dimension != 1 || t.depth > 1) {
-    return nullptr;
+  if (t.dimension == 3) {
+    return GetCubeTexture(t, sampler);
+  }
+  const uint32_t height = t.dimension == 0 ? 1u : t.height;
+
+  // The layout key is derived from the fetch constant alone, so it can be built -- and the
+  // cache consulted -- before any of the format/extent work below. That matters: a scene is
+  // ~5000 draws x 16 samplers, so this early-out runs ~80k times a frame and everything it
+  // skips is multiplied by that.
+  //
+  // When the key changes, the texture object is rebuilt; the content hash further down
+  // catches in-place edits to the same layout. The swizzle is part of the key: the same
+  // memory bound with a different channel swizzle is a different texture. So is the mip
+  // chain -- it decides the host texture's level count.
+  const uint64_t layout_key = MixKey(
+      MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
+             MixKey((uint64_t(height) << 1) | (t.tiled ? 1 : 0), t.swizzle)),
+      MixKey(t.mip_address, (uint64_t(t.mip_max_level) << 1) | (t.packed_mips ? 1 : 0)));
+
+  const uint64_t key = MixKey(t.base_address, sampler);
+  auto* map = static_cast<TextureMap*>(textures_);
+  auto& entry = (*map)[key];
+  // Frame-coherent reuse: same texture already uploaded/validated this frame ->
+  // reuse it without re-hashing megabytes of guest memory (the dominant per-draw cost).
+  if (entry.tex && entry.last_frame == frame_ && entry.layout_key == layout_key) {
+    return entry.tex;
   }
 
   const HostTextureFormat host = PickHostTextureFormat(t.format);
@@ -1301,6 +1525,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     // unshadowed" and keeps lighting sane until real render targets land.
     return white_;
   }
+  entry.last_frame = frame_;
 
   const auto* fmt = rex::graphics::FormatInfo::Get(t.format);
   if (!fmt) {
@@ -1309,7 +1534,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   const uint32_t bpb = fmt->bytes_per_block();
   const uint32_t pitch_pixels = t.pitch_pixels ? t.pitch_pixels : t.width;
   rex::graphics::TextureExtent extent = rex::graphics::TextureExtent::Calculate(
-      fmt, pitch_pixels, t.height, /*depth=*/1, t.tiled, /*is_guest=*/true);
+      fmt, pitch_pixels, height, /*depth=*/1, t.tiled, /*is_guest=*/true);
   // Calculate() derives block_width from the pitch, but the host texture is created
   // at the *visible* width t.width. Cap the copy width to the visible blocks so
   // DetileMip2D fills exactly the created texture and never writes past its rows
@@ -1317,20 +1542,28 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // the padded pitch width into a t.width texture corrupts the heap.
   extent.block_width = (t.width + fmt->block_width - 1) / fmt->block_width;
 
-  // A layout key that, when it changes, forces a fresh texture object; the
-  // content hash below catches in-place edits to the same layout.
-  const uint64_t layout_key = MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
-                                     (uint64_t(t.height) << 1) | (t.tiled ? 1 : 0));
-
-  const uint64_t key = MixKey(t.base_address, sampler);
-  auto* map = static_cast<TextureMap*>(textures_);
-  auto& entry = (*map)[key];
-  // Frame-coherent reuse: same texture already uploaded/validated this frame ->
-  // reuse it without re-hashing megabytes of guest memory (the dominant per-draw cost).
-  if (entry.tex && entry.last_frame == frame_ && entry.layout_key == layout_key) {
-    return entry.tex;
-  }
-  entry.last_frame = frame_;
+  // Mips are generated on the host, not read from the guest.
+  //
+  // NX1's fetch constants do declare a chain (mip_max_level 6..10) with the levels in a
+  // separate allocation at mip_address -- but for most textures that memory does not hold
+  // this texture's mips. Dumping the guest bytes and decoding them offline showed level 1 of
+  // a trash decal resolving, cleanly and at exactly the pitch and tiling the layout predicts,
+  // into an entirely different image; only textures whose mip_address happens to be
+  // `base_address + base_size` (one contiguous allocation) carry their own chain. The rest
+  // point into a shared pool that this build never fills -- it has no imagefile to stream
+  // from -- so those levels are another image's pixels, permanently. Reading them is what
+  // turned every minified surface into confetti.
+  //
+  // We only need *a* correct chain, not the artist's: the defect being fixed is aliasing.
+  // Let the driver filter one down from level 0, which is data we know is right.
+  //
+  // This includes the CPU-decoded BC-alpha formats. They were excluded once, which left them
+  // as the only textures in the game with no mip chain at all -- and the scope's noise masks
+  // are exactly that: a DXT5A grain map, tiled hard and heavily minified. With no mips it
+  // aliased its own noise, which is what filled the scope lens with coloured static. They
+  // decode to A8R8G8B8, which mips like anything else.
+  const bool want_mips =
+      REXCVAR_GET(nx1_d3d9_mips) && t.mip_max_level > 0 && SupportsAutoMips(device_, host.d3d);
 
   const uint8_t* src = TranslatePhysical(t.base_address);
   const size_t guest_bytes = size_t(extent.block_pitch_h) * extent.block_pitch_v * bpb;
@@ -1342,12 +1575,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     entry.tex->Release();
     entry.tex = nullptr;
   }
+
   // IDirect3DDevice9Ex has no D3DPOOL_MANAGED. Fill a lockable SYSTEMMEM staging
-  // texture and UpdateTexture it into a DEFAULT texture that can be sampled.
+  // texture with level 0 and UpdateTexture it into a DEFAULT texture that can be sampled.
   IDirect3DTexture9* staging = nullptr;
-  if (FAILED(device_->CreateTexture(t.width, t.height, 1, 0, host.d3d, D3DPOOL_SYSTEMMEM, &staging,
+  if (FAILED(device_->CreateTexture(t.width, height, 1, 0, host.d3d, D3DPOOL_SYSTEMMEM, &staging,
                                     nullptr))) {
-    REXGPU_ERROR("nx1_d3d9: staging CreateTexture({}x{}, fmt {}) failed", t.width, t.height,
+    REXGPU_ERROR("nx1_d3d9: staging CreateTexture({}x{}, fmt {}) failed", t.width, height,
                  t.format);
     return nullptr;
   }
@@ -1357,6 +1591,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     staging->Release();
     return nullptr;
   }
+  // The runtime's pitch for a block format it does not recognise counts texels, not the block
+  // row it actually has to hold -- 4x too small for BC5. The driver reads such a level as
+  // tightly packed block rows, which is exactly what its `width * height` bytes hold.
+  const uint32_t dst_row_bytes =
+      host.opaque_block ? extent.block_width * bpb : uint32_t(locked.Pitch);
   auto* dst = static_cast<uint8_t*>(locked.Pitch >= 0 ? locked.pBits : nullptr);
   if (dst) {
     if (host.decode != TexDecode::kNone) {
@@ -1365,33 +1604,41 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       std::vector<uint8_t> scratch(size_t(extent.block_width) * extent.block_height * bpb);
       DetileMip2D(scratch.data(), extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
       DecodeBCAlphaToArgb(dst, uint32_t(locked.Pitch), scratch.data(), extent.block_width,
-                          extent.block_height, t.width, t.height,
+                          extent.block_height, t.width, height,
                           host.decode == TexDecode::kDXT5A);
     } else {
-      DetileMip2D(dst, uint32_t(locked.Pitch), src, extent, bpb, t.endian, t.tiled);
-      if (host.rb_swap) {
+      DetileMip2D(dst, dst_row_bytes, src, extent, bpb, t.endian, t.tiled);
+      const Swizzle32 swz = MakeSwizzle32(t.swizzle);
+      if (host.swizzle32 && !swz.identity) {
         for (uint32_t by = 0; by < extent.block_height; ++by) {
-          SwapRedBlue(dst + size_t(by) * locked.Pitch, extent.block_width);
+          SwizzleRow32(dst + size_t(by) * dst_row_bytes, extent.block_width, swz);
         }
       }
     }
   }
   staging->UnlockRect(0);
 
+  // A D3DUSAGE_AUTOGENMIPMAP texture reports a single level and keeps its sub-levels to
+  // itself: UpdateTexture writes level 0 and the driver filters the rest down from it.
   if (!entry.tex &&
-      FAILED(device_->CreateTexture(t.width, t.height, 1, 0, host.d3d, D3DPOOL_DEFAULT, &entry.tex,
-                                    nullptr))) {
-    REXGPU_ERROR("nx1_d3d9: CreateTexture({}x{}, fmt {}) failed", t.width, t.height, t.format);
+      FAILED(device_->CreateTexture(t.width, height, want_mips ? 0 : 1,
+                                    want_mips ? D3DUSAGE_AUTOGENMIPMAP : 0, host.d3d,
+                                    D3DPOOL_DEFAULT, &entry.tex, nullptr))) {
+    REXGPU_ERROR("nx1_d3d9: CreateTexture({}x{}, fmt {}) failed", t.width, height, t.format);
     staging->Release();
     entry.tex = nullptr;
     return nullptr;
   }
   if (FAILED(device_->UpdateTexture(staging, entry.tex))) {
-    REXGPU_ERROR("nx1_d3d9: UpdateTexture({}x{}, fmt {}) failed", t.width, t.height, t.format);
+    REXGPU_ERROR("nx1_d3d9: UpdateTexture({}x{}, fmt {}) failed", t.width, height, t.format);
     staging->Release();
     return nullptr;
   }
   staging->Release();
+  if (want_mips) {
+    entry.tex->SetAutoGenFilterType(D3DTEXF_LINEAR);
+    entry.tex->GenerateMipSubLevels();
+  }
 
   entry.layout_key = layout_key;
   entry.content_hash = content_hash;
@@ -1529,6 +1776,184 @@ IDirect3DTexture9* ResourceTracker::GetDepthTexture(const uint8_t* base, uint32_
   auto* map = static_cast<TargetMap*>(render_targets_);
   auto it = map->find(ReadSurfaceEdramKey(base, guest_surface));
   return (it != map->end() && it->second.is_depth) ? it->second.tex : nullptr;
+}
+
+IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConstant& t,
+                                                         uint32_t sampler) {
+  const HostTextureFormat host = PickHostTextureFormat(t.format);
+  if (!host.valid || host.decode != TexDecode::kNone) {
+    return nullptr;  // no compressed/decoded volume formats in the corpus
+  }
+  const auto* fmt = rex::graphics::FormatInfo::Get(t.format);
+  if (!fmt || !t.depth) {
+    return nullptr;
+  }
+  const uint32_t bpb = fmt->bytes_per_block();
+  const uint32_t pitch_pixels = t.pitch_pixels ? t.pitch_pixels : t.width;
+  const rex::graphics::TextureExtent extent = rex::graphics::TextureExtent::Calculate(
+      fmt, pitch_pixels, t.height, t.depth, t.tiled, /*is_guest=*/true);
+  const uint32_t blocks_wide = (t.width + fmt->block_width - 1) / fmt->block_width;
+  const uint32_t blocks_high = (t.height + fmt->block_height - 1) / fmt->block_height;
+
+  const uint64_t layout_key =
+      MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
+             MixKey((uint64_t(t.height) << 16) | t.depth, (uint64_t(t.swizzle) << 1) | t.tiled));
+  const uint64_t key = MixKey(t.base_address, sampler | 0x8000u);  // distinct from the 2D key
+  auto* map = static_cast<TextureMap*>(textures_);
+  auto& entry = (*map)[key];
+  if (entry.vol && entry.last_frame == frame_ && entry.layout_key == layout_key) {
+    return entry.vol;
+  }
+  entry.last_frame = frame_;
+
+  const uint8_t* src = TranslatePhysical(t.base_address);
+  const size_t guest_bytes =
+      size_t(extent.block_pitch_h) * extent.block_pitch_v * std::max(1u, t.depth) * bpb;
+  const uint64_t content_hash = XXH3_64bits(src, guest_bytes);
+  if (entry.vol && entry.layout_key == layout_key && entry.content_hash == content_hash) {
+    return entry.vol;
+  }
+  if (entry.vol && entry.layout_key != layout_key) {
+    entry.vol->Release();
+    entry.vol = nullptr;
+  }
+
+  IDirect3DVolumeTexture9* staging = nullptr;
+  if (FAILED(device_->CreateVolumeTexture(t.width, t.height, t.depth, 1, 0, host.d3d,
+                                          D3DPOOL_SYSTEMMEM, &staging, nullptr))) {
+    REXGPU_ERROR("nx1_d3d9: staging CreateVolumeTexture({}x{}x{}, fmt {}) failed", t.width,
+                 t.height, t.depth, t.format);
+    return nullptr;
+  }
+  D3DLOCKED_BOX box;
+  if (FAILED(staging->LockBox(0, &box, nullptr, 0))) {
+    staging->Release();
+    return nullptr;
+  }
+  DetileMip3D(static_cast<uint8_t*>(box.pBits), uint32_t(box.RowPitch), uint32_t(box.SlicePitch),
+              src, blocks_wide, blocks_high, t.depth, extent.block_pitch_h, bpb, t.endian, t.tiled);
+  const Swizzle32 swz = MakeSwizzle32(t.swizzle);
+  if (host.swizzle32 && !swz.identity) {
+    for (uint32_t z = 0; z < t.depth; ++z) {
+      auto* slice = static_cast<uint8_t*>(box.pBits) + size_t(z) * box.SlicePitch;
+      for (uint32_t y = 0; y < blocks_high; ++y) {
+        SwizzleRow32(slice + size_t(y) * box.RowPitch, blocks_wide, swz);
+      }
+    }
+  }
+  staging->UnlockBox(0);
+
+  if (!entry.vol &&
+      FAILED(device_->CreateVolumeTexture(t.width, t.height, t.depth, 1, 0, host.d3d,
+                                          D3DPOOL_DEFAULT, &entry.vol, nullptr))) {
+    REXGPU_ERROR("nx1_d3d9: CreateVolumeTexture({}x{}x{}, fmt {}) failed", t.width, t.height,
+                 t.depth, t.format);
+    staging->Release();
+    entry.vol = nullptr;
+    return nullptr;
+  }
+  const HRESULT hr = device_->UpdateTexture(staging, entry.vol);
+  staging->Release();
+  if (FAILED(hr)) {
+    REXGPU_ERROR("nx1_d3d9: UpdateTexture(volume {}x{}x{}) failed", t.width, t.height, t.depth);
+    return nullptr;
+  }
+  entry.layout_key = layout_key;
+  entry.content_hash = content_hash;
+  return entry.vol;
+}
+
+IDirect3DBaseTexture9* ResourceTracker::GetCubeTexture(const TextureFetchConstant& t,
+                                                       uint32_t sampler) {
+  const HostTextureFormat host = PickHostTextureFormat(t.format);
+  // The CPU BC-alpha decode is a 2D-only path; NX1's cube maps are all DXT1/DXN, so it
+  // never comes up. Skip rather than upload garbage.
+  if (!host.valid || host.decode != TexDecode::kNone) {
+    return nullptr;
+  }
+  const auto* fmt = rex::graphics::FormatInfo::Get(t.format);
+  if (!fmt || !t.width || t.width != t.height) {
+    return nullptr;
+  }
+  const uint32_t bpb = fmt->bytes_per_block();
+  const uint32_t pitch_pixels = t.pitch_pixels ? t.pitch_pixels : t.width;
+  rex::graphics::TextureExtent extent = rex::graphics::TextureExtent::Calculate(
+      fmt, pitch_pixels, t.height, /*depth=*/1, t.tiled, /*is_guest=*/true);
+  // As in the 2D path: copy only the visible blocks, so the detile fills exactly the
+  // texture we create at t.width and never runs past its rows.
+  extent.block_width = (t.width + fmt->block_width - 1) / fmt->block_width;
+
+  // The six faces are consecutive array slices, and Xenos aligns every array slice to
+  // 4 KB -- so the face stride is the padded face size, not the visible one.
+  const uint32_t align =
+      1u << rex::graphics::xenos::kTextureSubresourceAlignmentBytesLog2;
+  const uint32_t face_bytes = extent.block_pitch_h * extent.block_pitch_v * bpb;
+  const uint32_t face_stride = (face_bytes + align - 1) & ~(align - 1);
+
+  const uint64_t layout_key =
+      MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
+             MixKey((uint64_t(t.height) << 1) | (t.tiled ? 1 : 0), t.swizzle));
+  const uint64_t key = MixKey(t.base_address, sampler | 0x4000u);  // distinct from 2D and 3D
+  auto* map = static_cast<TextureMap*>(textures_);
+  auto& entry = (*map)[key];
+  if (entry.cube && entry.last_frame == frame_ && entry.layout_key == layout_key) {
+    return entry.cube;
+  }
+  entry.last_frame = frame_;
+
+  const uint8_t* src = TranslatePhysical(t.base_address);
+  const uint64_t content_hash = XXH3_64bits(src, size_t(face_stride) * 6);
+  if (entry.cube && entry.layout_key == layout_key && entry.content_hash == content_hash) {
+    return entry.cube;
+  }
+  if (entry.cube && entry.layout_key != layout_key) {
+    entry.cube->Release();
+    entry.cube = nullptr;
+  }
+
+  IDirect3DCubeTexture9* staging = nullptr;
+  if (FAILED(device_->CreateCubeTexture(t.width, 1, 0, host.d3d, D3DPOOL_SYSTEMMEM, &staging,
+                                        nullptr))) {
+    REXGPU_ERROR("nx1_d3d9: staging CreateCubeTexture({}, fmt {}) failed", t.width, t.format);
+    return nullptr;
+  }
+  // Xenos face order is D3D's: +X, -X, +Y, -Y, +Z, -Z. Each face is an ordinary tiled 2D
+  // image, so the 2D detiler handles it -- only the base pointer moves.
+  for (uint32_t face = 0; face < 6; ++face) {
+    D3DLOCKED_RECT locked;
+    if (FAILED(staging->LockRect(D3DCUBEMAP_FACES(D3DCUBEMAP_FACE_POSITIVE_X + face), 0, &locked,
+                                 nullptr, 0))) {
+      staging->Release();
+      return nullptr;
+    }
+    auto* dst = static_cast<uint8_t*>(locked.pBits);
+    DetileMip2D(dst, uint32_t(locked.Pitch), src + size_t(face) * face_stride, extent, bpb,
+                t.endian, t.tiled);
+    const Swizzle32 swz = MakeSwizzle32(t.swizzle);
+    if (host.swizzle32 && !swz.identity) {
+      for (uint32_t by = 0; by < extent.block_height; ++by) {
+        SwizzleRow32(dst + size_t(by) * locked.Pitch, extent.block_width, swz);
+      }
+    }
+    staging->UnlockRect(D3DCUBEMAP_FACES(D3DCUBEMAP_FACE_POSITIVE_X + face), 0);
+  }
+
+  if (!entry.cube && FAILED(device_->CreateCubeTexture(t.width, 1, 0, host.d3d, D3DPOOL_DEFAULT,
+                                                       &entry.cube, nullptr))) {
+    REXGPU_ERROR("nx1_d3d9: CreateCubeTexture({}, fmt {}) failed", t.width, t.format);
+    staging->Release();
+    entry.cube = nullptr;
+    return nullptr;
+  }
+  const HRESULT hr = device_->UpdateTexture(staging, entry.cube);
+  staging->Release();
+  if (FAILED(hr)) {
+    REXGPU_ERROR("nx1_d3d9: UpdateTexture(cube {}, fmt {}) failed", t.width, t.format);
+    return nullptr;
+  }
+  entry.layout_key = layout_key;
+  entry.content_hash = content_hash;
+  return entry.cube;
 }
 
 IDirect3DTexture9* ResourceTracker::GetResolvedTexture(uint32_t address) {

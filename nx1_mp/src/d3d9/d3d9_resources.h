@@ -26,6 +26,8 @@
 
 namespace nx1::d3d9 {
 
+struct TextureFetchConstant;  // guest_d3d.h
+
 inline constexpr uint32_t kMaxHostStreams = 4;
 
 /// How one guest vertex element becomes one host vertex element.
@@ -51,7 +53,18 @@ struct VertexLayout {
   /// whole stream can be byteswapped in one sweep instead of per element.
   bool bulk_swap[kMaxHostStreams] = {};
   uint32_t stream_count = 0;
+  /// Cache key for the *layout object*: the declaration or the vertex shader that produced
+  /// it. Two shaders with identical vertex formats get two entries here, which is fine --
+  /// building one is cheap.
   uint64_t key = 0;
+  /// Hash of what actually determines the converted bytes: the ops and the strides. Two
+  /// layouts with the same content share it even when they came from different shaders.
+  ///
+  /// The mirrored vertex buffers are keyed on *this*, not on `key`. Keying them on the
+  /// shader meant the same pooled buffer was hashed and converted once per shader that
+  /// read it -- half a gigabyte hashed and 3.3M vertices converted per frame, for
+  /// byte-identical results.
+  uint64_t content_key = 0;
 };
 
 /// Owns the mirrored buffers and the vertex-declaration cache.
@@ -65,7 +78,10 @@ class ResourceTracker {
   /// Advance the frame counter. Call once per frame (BeginFrame) so the vertex/
   /// index/texture caches hash+validate each resource at most once per frame
   /// instead of once per draw (a scene has ~1000 draws sharing far fewer resources).
-  void AdvanceFrame() { ++frame_; }
+  /// Also evicts resources no draw has touched for a while -- the guest allocates its
+  /// dynamic buffers out of a moving pool, so their addresses churn and the caches would
+  /// otherwise grow without bound (measured: 22k live vertex buffers and still climbing).
+  void AdvanceFrame();
 
   /// Translate the guest's bound D3D::CVertexDeclaration. Returns nullptr if any
   /// element uses a Xenos vertex format we cannot express or decode.
@@ -81,14 +97,27 @@ class ResourceTracker {
   const VertexLayout* GetShaderVertexLayout(const uint8_t* base, uint32_t guest_device,
                                             uint32_t stream0_stride);
 
-  /// Mirror vertex stream `stream`. `vertex_count` receives the stream's length.
+  /// Mirror vertex stream `stream`. `vertex_count` receives the mirrored length.
+  ///
+  /// `needed_vertices` caps how much of the buffer is mirrored (0 = all of it). The guest's
+  /// fetch constant reports the distance to the end of the buffer, and its dynamic geometry
+  /// lives in shared pools -- so for a skinned model that is megabytes, and mirroring it all
+  /// meant hashing and converting ~78k vertices for a draw that touches a few hundred. Pass
+  /// the draw's actual vertex reach (see GetDrawMaxIndex).
   IDirect3DVertexBuffer9* GetVertexBuffer(const uint8_t* base, uint32_t guest_device,
                                           uint32_t stream, const VertexLayout& layout,
-                                          uint32_t* vertex_count);
+                                          uint32_t needed_vertices, uint32_t* vertex_count);
 
   /// Mirror the bound index buffer. `index_size` receives 2 or 4.
   IDirect3DIndexBuffer9* GetIndexBuffer(const uint8_t* base, uint32_t guest_device,
                                         uint32_t* index_size);
+
+  /// The highest vertex index the draw range [start_index, start_index + index_count)
+  /// references, or 0 if it cannot be determined. Memoized per (index-buffer contents,
+  /// range), so the scan runs once per distinct draw rather than every frame.
+  /// GetIndexBuffer must have been called for this draw first.
+  uint32_t GetDrawMaxIndex(const uint8_t* base, uint32_t guest_device, uint32_t start_index,
+                           uint32_t index_count);
 
   /// Convert an inline (user-pointer) vertex stream for a *UP draw: `count`
   /// vertices at guest address `verts_addr`, guest stride `guest_stride`, through
@@ -106,6 +135,14 @@ class ResourceTracker {
   /// Untile + upload the texture bound to `sampler`, or nullptr if that fetch
   /// constant holds no texture or an unsupported format.
   IDirect3DBaseTexture9* GetTexture(const uint8_t* base, uint32_t guest_device, uint32_t sampler);
+
+  /// Untile + upload a 3D (volume) texture. The composite's colour-grading LUT is one, and an
+  /// unbound sampler reads black -- which blacks out the entire composited frame.
+  IDirect3DBaseTexture9* GetVolumeTexture(const TextureFetchConstant& t, uint32_t sampler);
+
+  /// Untile + upload a cube map (the environment/reflection maps). The six faces are stored
+  /// as consecutive array slices, each 4 KB aligned, and each is an ordinary tiled 2D image.
+  IDirect3DBaseTexture9* GetCubeTexture(const TextureFetchConstant& t, uint32_t sampler);
 
   /// Record a resolve: StretchRect the current render target (source rect) into a
   /// host texture keyed by the destination's guest address, so a later draw that
@@ -184,7 +221,9 @@ class ResourceTracker {
   IDirect3DTexture9* white_ = nullptr;
   void* layouts_ = nullptr;        ///< std::unordered_map<uint64_t, VertexLayout>*
   void* vertex_buffers_ = nullptr; ///< std::unordered_map<uint64_t, VertexBufferEntry>*
+  void* vertex_hashes_ = nullptr;  ///< std::unordered_map<uint64_t, VertexHash>*
   void* index_buffers_ = nullptr;  ///< std::unordered_map<uint64_t, IndexBufferEntry>*
+  void* index_ranges_ = nullptr;   ///< std::unordered_map<uint64_t, uint32_t>* (draw -> max index)
   void* textures_ = nullptr;       ///< std::unordered_map<uint64_t, TextureEntry>*
   void* resolves_ = nullptr;       ///< std::unordered_map<uint64_t, ResolvedTarget>*
   void* render_targets_ = nullptr; ///< std::unordered_map<uint32_t, HostTarget>*

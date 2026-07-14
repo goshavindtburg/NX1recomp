@@ -62,6 +62,7 @@ inline constexpr uint32_t kValuesPacket = 0x28CC;   ///< GPU_VALUESPACKET
 inline constexpr uint32_t kControlPacket = 0x2934;  ///< GPU_CONTROLPACKET
 
 inline constexpr uint32_t kAlphaRef = kValuesPacket + 0x38;      ///< float, already 0..1
+inline constexpr uint32_t kColorMask = kValuesPacket + 0x10;     ///< RB_COLOR_MASK, 4 bits per RT
 
 // GPU_CONTROLPACKET fields (all 32-bit GPU register shadows the setters write).
 inline constexpr uint32_t kDepthControl = kControlPacket + 0x00;   ///< GPU_DEPTHCONTROL
@@ -92,13 +93,19 @@ inline constexpr uint32_t kStreamStride = 0x31E8;
 
 inline constexpr uint32_t kMaxVertexStreams = 16;
 
-// EDRAM tiling clear values. NX1 clears the frame through the predicated-tiling /
-// resolve path rather than D3DDevice_Clear, but stashes the clear values here.
-inline constexpr uint32_t kTilingClearColor = 0x3480;    ///< __vector4 (r,g,b,a floats)
-inline constexpr uint32_t kTilingClearZ = 0x3490;        ///< float (reverse-Z: 0.0 = far)
-inline constexpr uint32_t kTilingClearStencil = 0x3494;  ///< uint32
-
 }  // namespace guest_device
+
+// D3DCLEAR_* flags as the Xbox 360 defines them -- *not* the desktop D3D9 values.
+// D3D::ClearF (guest 0x820E6860) loops `(1 << i) & flags` over render targets 0..3, so
+// the low nibble is the colour targets and depth/stencil live above it.
+inline constexpr uint32_t kClearTargetAny = 0x0F;  ///< D3DCLEAR_TARGET0..3
+inline constexpr uint32_t kClearZBuffer = 0x10;
+inline constexpr uint32_t kClearStencil = 0x20;
+
+// D3DRESOLVE_* flags, as R_ResolveAndClear_Xbox360 (guest 0x824F05C8) sets them: the
+// Xbox 360 can also clear EDRAM on the way out of a resolve.
+inline constexpr uint32_t kResolveClearRenderTarget = 0x100;
+inline constexpr uint32_t kResolveClearDepthStencil = 0x200;
 
 /// D3DIndexBuffer, and the D3DVertexDeclaration the guest stamps for a decl.
 namespace guest_resource {
@@ -143,6 +150,7 @@ inline constexpr uint32_t kPsPhysicalOffset = 0x18;   ///< CPixelShader::m_dwPhy
 // _UCODE_PASS_HEADER { definitionTableOffset, microcodeOffset }
 inline constexpr uint32_t kUcodePassArray = 0x14;
 inline constexpr uint32_t kUcodePassStride = 8;
+inline constexpr uint32_t kDefinitionTableOffsetField = 0;
 inline constexpr uint32_t kUcodeMicrocodeOffsetField = 4;
 
 /// _UCODE_HEADER::Cookie bit 0x20: this vertex shader carries a second pass,
@@ -168,10 +176,21 @@ inline constexpr uint32_t kCookieHasSecondPass = 0x20;
 // memory system -- which drags std::min in behind <windows.h>'s min macro.
 const uint8_t* GuestTranslatePhysical(uint32_t guest_addr);
 
+/// Host pointer to a raw GPU *physical* address (< 0x20000000): a vertex-fetch base, or a
+/// shader's literal-constant payload. Not the same translation as the 0xA0000000+ mirrors
+/// above -- passing one of those through `base + addr` faults.
+const uint8_t* GuestTranslateGpuPhysical(uint32_t gpu_physical);
+
 inline uint32_t GuestRead32(const uint8_t* base, uint32_t guest_addr) {
   const uint8_t* host =
       guest_addr >= 0xA0000000u ? GuestTranslatePhysical(guest_addr) : base + guest_addr;
   return *reinterpret_cast<const rex::be<uint32_t>*>(host);
+}
+
+inline uint16_t GuestRead16(const uint8_t* base, uint32_t guest_addr) {
+  const uint8_t* host =
+      guest_addr >= 0xA0000000u ? GuestTranslatePhysical(guest_addr) : base + guest_addr;
+  return *reinterpret_cast<const rex::be<uint16_t>*>(host);
 }
 
 inline uint64_t GuestRead64(const uint8_t* base, uint32_t guest_addr) {
@@ -277,6 +296,15 @@ struct TextureFetchConstant {
   uint32_t mag_filter;
   uint32_t min_filter;
   uint32_t mip_filter;
+  /// The mip chain the guest declares. Note the renderer does NOT read the guest's mip
+  /// levels: for most textures the memory at mip_address holds a different image entirely
+  /// (a streaming pool this build never fills), so the host filters its own chain down from
+  /// level 0 instead. Only mip_max_level (is there a chain at all?) and the addresses (which
+  /// key the texture cache) are used.
+  uint32_t mip_min_level;
+  uint32_t mip_max_level;
+  uint32_t mip_address;
+  bool packed_mips;
 };
 
 /// Decode a `GPUTEXTURE_FETCH_CONSTANT` (6 dwords) at an arbitrary guest address.
@@ -287,6 +315,7 @@ inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint
   const uint32_t d1 = GuestRead32(base, addr + 4);
   const uint32_t d2 = GuestRead32(base, addr + 8);
   const uint32_t d3 = GuestRead32(base, addr + 12);
+  const uint32_t d4 = GuestRead32(base, addr + 16);
   const uint32_t d5 = GuestRead32(base, addr + 20);
 
   TextureFetchConstant t{};
@@ -301,6 +330,10 @@ inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint
   t.mag_filter = (d3 >> 19) & 0x3;
   t.min_filter = (d3 >> 21) & 0x3;
   t.mip_filter = (d3 >> 23) & 0x3;
+  t.mip_min_level = (d4 >> 2) & 0xF;
+  t.mip_max_level = (d4 >> 6) & 0xF;
+  t.packed_mips = ((d5 >> 11) & 0x1) != 0;
+  t.mip_address = ((d5 >> 12) & 0xFFFFF) << 12;
 
   // Size is stored with 1 subtracted from each component; the field layout
   // depends on the dimension.
@@ -441,6 +474,64 @@ inline GuestUcode ReadGuestUcode(const uint8_t* base, uint32_t shader_object, bo
   ucode.physical_address = (((raw >> 20) + 512) & 0x1000) + (raw & 0x1FFFFFFCu);
   ucode.dword_count = GuestRead32(base, function + microcode_offset + 4) >> 2;
   return ucode;
+}
+
+//=============================================================================
+// Shader literal constants
+//=============================================================================
+
+/// One literal-constant record out of a shader's definition table.
+struct ShaderLiteral {
+  uint32_t reg;      ///< ALU constant-file index (the file is shared: VS 0..255, PS 256..511)
+  uint32_t float4s;  ///< how many consecutive registers this record supplies
+  uint32_t address;  ///< GPU physical address of the payload (big-endian floats)
+};
+
+/// The Xenos ALU has no immediate float operands: a shader's literals live in the constant
+/// file, and the compiler parks them at the top of it (c254/c255 -- the classic `(0,1,..)`
+/// register a shader tests with `select(c255.x == 0, .., c255.y)`).
+///
+/// They never reach `m_Constants`. `D3D::SetLiteralShaderConstants` (guest 0x820D9808) walks
+/// the shader's definition table and loads them *straight into the GPU constant file* over
+/// PM4 -- the same shadow bypass as GpuBeginShaderConstantF4. Reading the shadow for those
+/// registers yields zero, which collapses the vertex position of every shader that folds a
+/// literal into its transform. Reproduce the guest's walk so the draw can resolve them.
+///
+/// Definition table: a 20-byte header (dword[4] = byte size of the record area) followed by
+/// records of `{ u16 reg, u16 dwordCount, u32 dataOffset }`, terminated by dwordCount == 0.
+/// The payload sits at `m_dwPhysical + dataOffset`.
+inline uint32_t ReadShaderLiterals(const uint8_t* base, uint32_t shader_object, bool pixel_shader,
+                                   ShaderLiteral* out, uint32_t max_out) {
+  if (!shader_object || !max_out) {
+    return 0;
+  }
+  using namespace guest_shader;
+  const uint32_t function = shader_object + (pixel_shader ? kPsFunctionOffset : kVsFunctionOffset);
+  const uint32_t def_offset =
+      GuestRead32(base, function + kUcodePassArray + kDefinitionTableOffsetField);
+  if (!def_offset) {
+    return 0;
+  }
+  const uint32_t physical =
+      GuestRead32(base, shader_object + (pixel_shader ? kPsPhysicalOffset : kVsPhysicalOffset));
+  const uint32_t table = function + def_offset;
+  const uint32_t end = table + 20 + GuestRead32(base, table + 16);
+
+  uint32_t n = 0;
+  for (uint32_t p = table + 20; p + 8 <= end && n < max_out; p += 8) {
+    const uint32_t reg = GuestRead16(base, p);
+    const uint32_t dwords = GuestRead16(base, p + 2);
+    if (!dwords) {
+      break;  // terminator
+    }
+    // Same physical-address fold the guest applies (and that ReadGuestUcode replicates).
+    const uint32_t raw = physical + GuestRead32(base, p + 4);
+    out[n].reg = reg;
+    out[n].float4s = dwords / 4;
+    out[n].address = (((raw >> 20) + 512) & 0x1000) + (raw & 0x1FFFFFFCu);
+    ++n;
+  }
+  return n;
 }
 
 /// Which of a vertex shader's two passes the GPU will execute.
@@ -596,6 +687,17 @@ inline BlendState ReadBlendState(const uint8_t* base, uint32_t device) {
   return b;
 }
 
+/// RB_COLOR_MASK, render target 0's nibble. Xenos packs it R,G,B,A from bit 0 -- the same
+/// order as D3DCOLORWRITEENABLE_*, so the nibble is already a D3D9 write mask.
+///
+/// The engine leans on this: the menus composite through *destination alpha*, and the passes
+/// that build that alpha mask run with colour writes masked off (mask 0x8). Forcing 0xF made
+/// those passes paint their blend over RGB as well -- which is what erased the map behind the
+/// minimap and the menu map preview, then washed the region to white.
+inline uint32_t ReadColorWriteMask(const uint8_t* base, uint32_t device) {
+  return GuestRead32(base, device + guest_device::kColorMask) & 0xF;
+}
+
 /// GPU_MODECONTROL (PA_SU_SC_MODE_CNTL): bit0 cull front, bit1 cull back,
 /// bit2 front-face winding (0 = CCW is front, 1 = CW is front).
 struct CullState {
@@ -607,29 +709,6 @@ struct CullState {
 inline CullState ReadCullState(const uint8_t* base, uint32_t device) {
   const uint32_t mc = GuestRead32(base, device + guest_device::kModeControl);
   return CullState{(mc & 0x1) != 0, (mc & 0x2) != 0, (mc & 0x4) != 0};
-}
-
-//=============================================================================
-// Frame clear values
-//=============================================================================
-
-/// The EDRAM tiling clear the guest set up for the current frame.
-struct TilingClear {
-  float r, g, b, a;
-  float z;
-  uint32_t stencil;
-};
-
-inline TilingClear ReadTilingClear(const uint8_t* base, uint32_t device) {
-  using namespace guest_device;
-  return TilingClear{
-      GuestReadF32(base, device + kTilingClearColor + 0),
-      GuestReadF32(base, device + kTilingClearColor + 4),
-      GuestReadF32(base, device + kTilingClearColor + 8),
-      GuestReadF32(base, device + kTilingClearColor + 12),
-      GuestReadF32(base, device + kTilingClearZ),
-      GuestRead32(base, device + kTilingClearStencil),
-  };
 }
 
 //=============================================================================

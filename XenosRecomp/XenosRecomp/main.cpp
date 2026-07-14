@@ -871,10 +871,15 @@ int main(int argc, char** argv)
     // Optional: also emit a Shader Model 3.0 cache for the native D3D9 renderer.
     //   XenosRecomp <in> <out> <include> --sm3 <sm3 output path>
     const char* sm3Output = nullptr;
+    // Optional: --sm3-hlsl <dir> writes the SM3 HLSL each shader is compiled from, so a
+    // misbehaving translated shader can be read (and diffed against the DXIL lowering).
+    const char* sm3HlslDir = nullptr;
     for (int i = 4; i + 1 < argc; ++i)
     {
         if (std::strcmp(argv[i], "--sm3") == 0)
             sm3Output = argv[i + 1];
+        else if (std::strcmp(argv[i], "--sm3-hlsl") == 0)
+            sm3HlslDir = argv[i + 1];
     }
     std::atomic<uint32_t> sm3Failures = 0;
 
@@ -993,6 +998,16 @@ int main(int argc, char** argv)
                     }
                     else
                     {
+                        if (sm3HlslDir != nullptr)
+                        {
+                            std::filesystem::create_directories(sm3HlslDir);
+                            const std::string path =
+                                fmt::format("{}/shader_{:016X}.sm3.{}.hlsl", sm3HlslDir,
+                                            uint64_t(hashShaderPair.first),
+                                            recompiler.isPixelShader ? "frag" : "vert");
+                            std::ofstream f(path);
+                            f << sm3.hlsl;
+                        }
                         shader.sm3 = compileSm3(sm3.hlsl, recompiler.isPixelShader, sm3Error);
                         if (shader.sm3.empty())
                         {

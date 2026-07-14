@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <execution>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <smolv.h>
 #include <fmt/core.h>

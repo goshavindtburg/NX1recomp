@@ -45,18 +45,11 @@ ConstantRing& ConstantRing::For(uint32_t guest_device) {
   return overflow;
 }
 
-namespace {
-std::atomic<bool> g_ever_recorded{false};  // DIAG(d3d9): see EverRecorded. TODO: drop.
-}  // namespace
-
-bool ConstantRing::EverRecorded() { return g_ever_recorded.load(std::memory_order_relaxed); }
-
 void ConstantRing::Record(bool pixel_stage, uint32_t start_register, uint32_t count,
                           uint32_t ring_addr) {
   if (!ring_addr || start_register >= kAluRegisters) {
     return;
   }
-  g_ever_recorded.store(true, std::memory_order_relaxed);
   uint32_t* addr = addr_[pixel_stage ? 1 : 0];
   const uint32_t end = start_register + count < kAluRegisters ? start_register + count
                                                               : kAluRegisters;

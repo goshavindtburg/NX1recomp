@@ -82,7 +82,11 @@ class Renderer {
   void DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
               uint32_t vertex_count, uint32_t guest_vertex_addr, uint32_t vertex_stride);
 
-  void Clear(uint32_t flags, uint32_t color, float z, uint32_t stencil);
+  /// Handle a guest D3DDevice_ClearF. `flags` are Xenos clear bits (see kClear*),
+  /// `rect_addr` is a guest _D3DRECT (0 = whole viewport) and `color_addr` a guest
+  /// __vector4 of floats.
+  void Clear(const uint8_t* base, uint32_t flags, uint32_t rect_addr, uint32_t color_addr, float z,
+             uint32_t stencil);
 
   /// Bind the host target standing in for a guest render-target surface. The guest
   /// renders the world, its shadow maps, the bloom chain and the final composite into
@@ -95,21 +99,37 @@ class Renderer {
   /// the host texture the resolve destination maps to. `dest_texture` is the guest
   /// D3DBaseTexture address; `src_rect` is the guest _D3DRECT address (0 = whole);
   /// `dest_point` is the guest D3DPOINT address the band lands at (0 = origin).
+  ///
+  /// A resolve also *clears* EDRAM when `flags` carries D3DRESOLVE_CLEARRENDERTARGET /
+  /// D3DRESOLVE_CLEARDEPTHSTENCIL, and NX1 clears the frame no other way -- it never
+  /// calls D3DDevice_Clear. `clear_color` is the guest address of a __vector4 of floats.
   void Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
-               uint32_t dest_point);
+               uint32_t dest_point, uint32_t flags, uint32_t clear_color, float clear_z,
+               uint32_t clear_stencil);
 
   /// Resolve the guest's bound shaders, bind their SM3 translations, and upload
   /// their constants. Returns false on a cache miss -- the draw must be skipped.
   bool BindShadersAndConstants(const uint8_t* base, uint32_t guest_device);
 
  private:
-  /// Mirror the guest's vertex streams and bind them plus a host vertex
-  /// declaration. `vertex_count` receives the shortest stream's length.
-  bool BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t* vertex_count);
+  /// Mirror the guest's vertex streams and bind them plus a host vertex declaration.
+  /// `needed_vertices` bounds how much of each stream is mirrored (0 = all of it); see
+  /// ResourceTracker::GetVertexBuffer. `vertex_count` receives the shortest stream's length.
+  bool BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t needed_vertices,
+                   uint32_t* vertex_count);
   /// Untile + bind every bound texture and its sampler state.
-  void BindTextures(const uint8_t* base, uint32_t guest_device, bool bound_draw = false);
+  void BindTextures(const uint8_t* base, uint32_t guest_device);
+  /// The copy half of a resolve (EDRAM -> host texture). Caller holds render_mutex_.
+  void ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
+                   uint32_t dest_point);
+  /// The clear half of a resolve: wipe the bound colour target and/or depth-stencil,
+  /// as the Xbox 360 does when a resolve carries the D3DRESOLVE_CLEAR* flags. Caller
+  /// holds render_mutex_.
+  void ClearEdram(const uint8_t* base, uint32_t flags, uint32_t clear_color, float clear_z,
+                  uint32_t clear_stencil);
+
   /// Translate the guest's depth/blend/cull GPU-register shadows to D3D9.
-  void ApplyRenderStates(const uint8_t* base, uint32_t guest_device, bool bound_draw = false);
+  void ApplyRenderStates(const uint8_t* base, uint32_t guest_device);
   /// Resolve the guest viewport into a host D3D9 viewport + the NDC scale/offset
   /// the translated vertex shaders fold in. Sets the D3D9 viewport as a side
   /// effect and stashes ndc_scale_/ndc_offset_ for UploadVertexUniforms.
@@ -118,6 +138,7 @@ class Renderer {
   void UploadVertexUniforms(uint32_t base_reg);
   /// Upload the alpha-test uniforms a pixel shader expects at c[base_reg], c[base_reg+1].
   void UploadPixelUniforms(uint32_t base_reg, const uint8_t* base, uint32_t guest_device);
+
   Renderer() = default;
   ~Renderer() { Shutdown(); }
   Renderer(const Renderer&) = delete;
@@ -158,17 +179,7 @@ class Renderer {
   float ndc_scale_[3] = {1.0f, 1.0f, 1.0f};
   float ndc_offset_[3] = {0.0f, 0.0f, 0.0f};
 
-  // Last guest device seen by a draw/clear, so BeginFrame can read the EDRAM
-  // tiling clear values (the game clears through tiling, not D3DDevice_Clear).
-  const uint8_t* last_base_ = nullptr;
-  uint32_t last_guest_device_ = 0;
-
   uint64_t shader_cache_misses_ = 0;
-
-  // Set once the guest resolves the 1024x600 scene target, i.e. we are actually
-  // rendering the world. Frame-number gates are unreliable (they depend on how long
-  // the player sat in menus); this is a direct signal.
-  std::atomic<bool> saw_scene_target_{false};
 
   // The guest depth surface currently bound, so a depth resolve knows which host
   // (INTZ) texture to publish under the resolve's destination address.
@@ -181,33 +192,37 @@ class Renderer {
   // the window stays empty.
   uint32_t display_resolve_addr_ = 0;
 
-  // DIAG(d3d9): the 1024x600 scene colour resolve, presented directly (when
-  // nx1_d3d9_debug_clear is on) to see the raw world render without the composite.
-  uint32_t scene_resolve_addr_ = 0;
-
-  // Diagnostics, reported periodically from Present so a black window can be told
-  // apart from an idle one. draws_attempted_ counts every guest draw we saw;
-  // draws_submitted_ counts the ones that reached DrawIndexedPrimitive/DrawPrimitive.
+  // Reported periodically from Present so a black window can be told apart from an idle
+  // one. draws_attempted_ counts every guest draw we saw; draws_submitted_ counts the ones
+  // that reached DrawIndexedPrimitive/DrawPrimitive.
   uint64_t frames_presented_ = 0;
   uint64_t draws_attempted_ = 0;
   uint64_t draws_submitted_ = 0;
 
-  // DIAG(d3d9): with the worker command buffers suppressed the world went black even
-  // though the draw count per frame is unchanged, so the draws are landing on a target
-  // we never present. Tally each draw against the colour target bound at the time and
-  // dump the tally from Present. TODO(d3d9): drop.
+
+  // Shadow of what is actually bound to each sampler, so BindTextures can skip the D3D
+  // calls that would not change anything -- see BindTextures.
+  //
+  // Both shadows start at a value no real binding can take, so the first draw always writes
+  // through: 0 is a legal D3DSAMP_* value, and nullptr is a legal texture binding, so
+  // zeroing either would let a draw skip a call D3D never actually received.
+  //
+  // Anything that binds a texture or sampler state outside BindTextures MUST call
+  // InvalidateSamplerShadow() -- ResourceTracker's depth blit does exactly that on sampler
+  // 0, and silently desyncing the shadow against it corrupted every later draw that
+  // happened to want the texture the shadow still believed was bound.
+  static constexpr uint32_t kSamplerStates = 6;  ///< U, V, W address + mag, min, mip filter
+  static constexpr uint32_t kSamplerStateUnset = ~0u;
+  static inline IDirect3DBaseTexture9* const kSamplerTextureUnknown =
+      reinterpret_cast<IDirect3DBaseTexture9*>(~uintptr_t(0));
+  IDirect3DBaseTexture9* sampler_texture_[16];
+  uint32_t sampler_state_[16][kSamplerStates];
+
+  /// Forget what we think is bound to the samplers, so the next draw re-issues all of it.
+  void InvalidateSamplerShadow();
+
+  // The guest colour surface currently bound to MRT slot 0.
   uint32_t current_rt_surface_ = 0;
-  bool current_draw_writes_color_ = false;
-  struct RtTally {
-    uint32_t surface;
-    uint32_t width;
-    uint32_t height;
-    uint32_t draws;
-    uint32_t color_draws;
-  };
-  RtTally rt_tally_[12] = {};
-  uint32_t rt_tally_n_ = 0;
-  void TallyDraw();
 };
 
 /// Best-effort discovery of the game's top-level window.

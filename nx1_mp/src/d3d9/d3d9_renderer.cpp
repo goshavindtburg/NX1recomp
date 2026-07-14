@@ -11,9 +11,13 @@
 #include <rex/system/kernel_state.h>
 
 #include <algorithm>
+#include <mutex>
+#include <chrono>
 #include <vector>
 
 #include <xxhash.h>
+
+#include <d3dcompiler.h>
 
 #include "d3d9_renderer.h"
 #include "d3d9_constants.h"
@@ -27,12 +31,6 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
                     "device is never torn down, so this cannot be toggled mid-run -- set it before "
                     "starting the game.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_BOOL(nx1_d3d9_debug_clear, true, "GPU",
-                    "Diagnostic: clear the D3D9 window to a distinctive colour each frame instead "
-                    "of the guest's tiling clear. Lets you tell a live-but-empty window (solid teal "
-                    "= present works, draws aren't landing) from a broken one (black). Turn off once "
-                    "the renderer is producing real frames.");
 
 namespace nx1::d3d9 {
 
@@ -160,7 +158,11 @@ bool Renderer::Initialize(HWND reference_window) {
   D3DPRESENT_PARAMETERS pp{};
   pp.BackBufferWidth = width;
   pp.BackBufferHeight = height;
-  pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+  // A8, not X8: a guest surface the size of the display is rendered into the backbuffer
+  // directly, and the menus composite through *destination alpha*. With no alpha channel
+  // the destination reads as 1.0, so a DESTALPHA/INVDESTALPHA pass writes its source
+  // unmasked -- which is what painted the minimap and the menu map preview solid white.
+  pp.BackBufferFormat = D3DFMT_A8R8G8B8;
   pp.BackBufferCount = 1;
   pp.MultiSampleType = D3DMULTISAMPLE_NONE;
   pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
@@ -194,6 +196,8 @@ bool Renderer::Initialize(HWND reference_window) {
     return false;
   }
   ResourceTracker::Get().Initialize(device_);
+  InvalidateSamplerShadow();
+
   // A guest colour target the size of the display *is* the backbuffer, so the final
   // composite lands where Present can show it instead of in an orphaned texture.
   {
@@ -268,33 +272,11 @@ void Renderer::BeginFrame() {
   ResourceTracker::Get().AdvanceFrame();
   device_->BeginScene();
 
-  // D3D9's Clear is clipped to the current viewport, and the viewport still holds
-  // whatever the previous frame's last draw left behind (a 1024x600 scene or a
-  // 1024x2048 shadow-map viewport). Without resetting it, the clear only touches that
-  // sub-rectangle and the rest of the target is never cleared -- undefined content
-  // under SWAPEFFECT_DISCARD. Restore the full target before clearing.
-  const uint32_t cw = current_rt_width_ ? current_rt_width_ : backbuffer_width_;
-  const uint32_t ch = current_rt_height_ ? current_rt_height_ : backbuffer_height_;
-  const D3DVIEWPORT9 full = {0, 0, cw, ch, 0.0f, 1.0f};
-  device_->SetViewport(&full);
-
-  // NX1 clears the frame through the EDRAM predicated-tiling path, not
-  // D3DDevice_Clear, so nothing else clears our backbuffer. Reproduce it from the
-  // guest's stashed tiling clear values (set up before the previous frame's
-  // draws). This carries the reverse-Z depth clear (typically 0.0 = far).
-  // TODO(d3d9): fold into real render-target/resolve handling once that exists.
-  if (REXCVAR_GET(nx1_d3d9_debug_clear)) {
-    // Distinctive teal so an empty-but-live window is unmistakable from a black,
-    // never-presented one. Depth still clears to the reverse-Z far plane (0.0).
-    device_->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
-                   D3DCOLOR_ARGB(255, 0, 96, 96), 0.0f, 0);
-  } else if (last_guest_device_ && last_base_) {
-    const TilingClear clear = ReadTilingClear(last_base_, last_guest_device_);
-    auto to8 = [](float c) { return uint32_t(std::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f); };
-    const D3DCOLOR color = D3DCOLOR_ARGB(to8(clear.a), to8(clear.r), to8(clear.g), to8(clear.b));
-    device_->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, color,
-                   clear.z, clear.stencil);
-  }
+  // Nothing is cleared here. NX1 clears its colour and depth buffers through
+  // D3DDevice_ClearF (see Renderer::Clear) and, where the guest asks for it, on the way
+  // out of a resolve (Renderer::ClearEdram) -- always the target the guest names, at the
+  // point it names it. A blanket clear at frame start would instead wipe whichever target
+  // happened to be bound at swap time.
 }
 
 void Renderer::Present() {
@@ -307,14 +289,8 @@ void Renderer::Present() {
   // Copy the frame the guest resolved to its display buffer onto the backbuffer. The
   // guest renders into EDRAM surfaces and resolves out, so nothing it draws ever lands
   // on the backbuffer by itself.
-  // DIAG(d3d9): with nx1_d3d9_debug_clear on, show the raw 1024x600 scene resolve
-  // instead of the composited frame -- that says whether the world renders at all,
-  // independently of whether the composite pass picks it up. TODO(d3d9): drop.
-  const uint32_t present_addr =
-      (REXCVAR_GET(nx1_d3d9_debug_clear) && scene_resolve_addr_) ? scene_resolve_addr_
-                                                                 : display_resolve_addr_;
-  if (present_addr) {
-    IDirect3DTexture9* frame = ResourceTracker::Get().GetResolvedTexture(present_addr);
+  if (display_resolve_addr_) {
+    IDirect3DTexture9* frame = ResourceTracker::Get().GetResolvedTexture(display_resolve_addr_);
     IDirect3DSurface9* src = nullptr;
     IDirect3DSurface9* back = nullptr;
     if (frame && SUCCEEDED(frame->GetSurfaceLevel(0, &src)) && src &&
@@ -329,16 +305,10 @@ void Renderer::Present() {
 
   // Heartbeat so a black window is diagnosable from the log: is the guest even
   // issuing draws (draws_attempted), and are any landing (draws_submitted)?
-  if (++frames_presented_ % 120 == 0) {
+  if (++frames_presented_ % 600 == 0) {
     REXGPU_INFO("nx1_d3d9: frame {}, draws {}/{} submitted, {} shader-cache misses",
                 frames_presented_, draws_submitted_, draws_attempted_, shader_cache_misses_);
-    // DIAG(d3d9): which colour target did those draws actually land on? TODO(d3d9): drop.
-    for (uint32_t i = 0; i < rt_tally_n_; ++i) {
-      REXGPU_INFO("nx1_d3d9: [rtdiag] surface {:#010x} {}x{} -> {} draws ({} writing colour)",
-                  rt_tally_[i].surface, rt_tally_[i].width, rt_tally_[i].height,
-                  rt_tally_[i].draws, rt_tally_[i].color_draws);
-    }
-    rt_tally_n_ = 0;
+
   }
 
   // The window's messages are pumped on its own thread (see WindowThreadMain), so
@@ -346,31 +316,62 @@ void Renderer::Present() {
   // no-op anyway: Win32 delivers a window's messages only to its creator thread.
 }
 
-void Renderer::Clear(uint32_t flags, uint32_t color, float z, uint32_t stencil) {
+void Renderer::Clear(const uint8_t* base, uint32_t flags, uint32_t rect_addr, uint32_t color_addr,
+                     float z, uint32_t stencil) {
   std::lock_guard<std::mutex> lock(render_mutex_);
   if (shutting_down_.load(std::memory_order_acquire) || !device_) {
     return;
   }
-  // D3D9 Clear fails the whole call (clearing nothing) if any unknown flag bit is
-  // set, and the guest packs EDRAM-specific bits alongside the standard ones.
-  // Mask to what D3D9 accepts. The Xbox 360 D3DCLEAR_* values match desktop D3D9.
-  const DWORD host_flags = flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
+  // Xenos clear flags, not desktop ones: bits 0-3 select colour targets 0-3, 0x10 is
+  // depth, 0x20 is stencil. We bind a single colour target, so any of the four means
+  // "clear it". Passing the guest's bits to D3D9 unmasked would fail the whole call.
+  DWORD host_flags = 0;
+  if (flags & kClearTargetAny) {
+    host_flags |= D3DCLEAR_TARGET;
+  }
+  if (flags & kClearZBuffer) {
+    host_flags |= D3DCLEAR_ZBUFFER;
+  }
+  if (flags & kClearStencil) {
+    host_flags |= D3DCLEAR_STENCIL;
+  }
+  // D3D9 fails a depth or stencil clear outright when no depth-stencil is bound.
+  if (!current_depth_surface_) {
+    host_flags &= ~(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
+  }
   if (!host_flags) {
     return;
   }
-  // DIAG(d3d9): log the first clears to catch a mid-frame black clear (a post pass
-  // targeting a separate EDRAM RT that collapses onto our shared backbuffer). TODO: drop.
-  {
-    static int clr_diag = 0;
-    if (clr_diag < 40) {
-      REXGPU_INFO("nx1_d3d9: [cleardiag {}] flags=0x{:X} color=0x{:08X} z={:.3f} frame={}", clr_diag,
-                  host_flags, color, z, frames_presented_);
-      ++clr_diag;
-    }
+
+  // The guest hands the clear colour as a __vector4 of floats, and an optional _D3DRECT
+  // ({x1,y1,x2,y2}, the same layout D3D9 uses). Both the guest and D3D9 clip the clear
+  // to the current viewport, so leave the viewport alone -- it is already the guest's.
+  D3DCOLOR color = 0;
+  if ((host_flags & D3DCLEAR_TARGET) && color_addr) {
+    auto to8 = [](float c) { return uint32_t(std::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    color = D3DCOLOR_ARGB(to8(GuestReadF32(base, color_addr + 12)),  // a
+                          to8(GuestReadF32(base, color_addr + 0)),   // r
+                          to8(GuestReadF32(base, color_addr + 4)),   // g
+                          to8(GuestReadF32(base, color_addr + 8)));  // b
   }
+  D3DRECT rect = {};
+  if (rect_addr) {
+    rect.x1 = int32_t(GuestRead32(base, rect_addr + 0));
+    rect.y1 = int32_t(GuestRead32(base, rect_addr + 4));
+    rect.x2 = int32_t(GuestRead32(base, rect_addr + 8));
+    rect.y2 = int32_t(GuestRead32(base, rect_addr + 12));
+  }
+
   // z is the guest's clear value verbatim -- under NX1's reverse-Z that is 0.0 for
   // the far plane, which is exactly what the D3DCMP_GREATEREQUAL depth test wants.
-  device_->Clear(0, nullptr, host_flags, color, z, stencil);
+  if (FAILED(device_->Clear(rect_addr ? 1 : 0, rect_addr ? &rect : nullptr, host_flags, color, z,
+                            stencil)) &&
+      (host_flags & D3DCLEAR_STENCIL)) {
+    // A depth surface without stencil rejects D3DCLEAR_STENCIL, and D3D9 then fails the
+    // whole call -- clearing nothing. Drop back rather than lose the depth clear.
+    device_->Clear(rect_addr ? 1 : 0, rect_addr ? &rect : nullptr,
+                   host_flags & ~D3DCLEAR_STENCIL, color, z, 0);
+  }
 }
 
 void Renderer::SetRenderTarget(const uint8_t* base, uint32_t index, uint32_t guest_surface) {
@@ -384,35 +385,6 @@ void Renderer::SetRenderTarget(const uint8_t* base, uint32_t index, uint32_t gue
     }
     return;
   }
-  // DIAG(d3d9): a D3DSurface is not a D3DBaseTexture -- decoding its header as a fetch
-  // constant produced 441x4066 garbage. Dump the raw header for each distinct surface
-  // so we can find where the real width/height live. TODO(d3d9): drop once decoded.
-  {
-    static uint32_t seen[8] = {};
-    static uint32_t seen_n = 0;
-    bool known = false;
-    for (uint32_t i = 0; i < seen_n; ++i) {
-      if (seen[i] == guest_surface) { known = true; break; }
-    }
-    if (!known && seen_n < 8) {
-      seen[seen_n++] = guest_surface;
-      uint32_t d[16];
-      for (uint32_t i = 0; i < 16; ++i) {
-        d[i] = GuestRead32(base, guest_surface + i * 4);
-      }
-      REXGPU_INFO(
-          "nx1_d3d9: [surfdiag] rt idx={} obj=0x{:08X} "
-          "[0]{:08X} [1]{:08X} [2]{:08X} [3]{:08X} [4]{:08X} [5]{:08X} [6]{:08X} [7]{:08X} "
-          "[8]{:08X} [9]{:08X} [10]{:08X} [11]{:08X} [12]{:08X} [13]{:08X} [14]{:08X} [15]{:08X}",
-          index, guest_surface, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10],
-          d[11], d[12], d[13], d[14], d[15]);
-    }
-  }
-
-  // DIAG(d3d9): the real bind sequence, with thread ids. The depth targets keep getting
-  // grown/reallocated by a *stale* colour target from another pass, and the log shows
-  // guest D3D arriving on several host threads -- this says whether passes actually
-  // interleave across threads or whether the state tracking is simply wrong. TODO: drop.
   IDirect3DSurface9* surface =
       ResourceTracker::Get().GetRenderTargetSurface(base, guest_surface);
   if (surface) {
@@ -451,36 +423,27 @@ void Renderer::SetDepthStencil(const uint8_t* base, uint32_t guest_surface) {
 }
 
 void Renderer::Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
-                       uint32_t dest_point) {
+                       uint32_t dest_point, uint32_t flags, uint32_t clear_color, float clear_z,
+                       uint32_t clear_stencil) {
   std::lock_guard<std::mutex> lock(render_mutex_);
-  if (shutting_down_.load(std::memory_order_acquire) || !device_ || !dest_texture) {
+  if (shutting_down_.load(std::memory_order_acquire) || !device_) {
+    return;
+  }
+  ResolveCopy(base, dest_texture, src_rect, dest_point);
+  // A depth resolve blits through the pipeline, binding a texture and sampler state on
+  // sampler 0 and leaving it unbound afterwards. BindTextures' shadow cannot see that, so
+  // tell it to stop trusting itself. Resolves are a handful per frame; re-issuing the
+  // sampler state on the next draw costs nothing next to getting it wrong.
+  InvalidateSamplerShadow();
+  ClearEdram(base, flags, clear_color, clear_z, clear_stencil);
+}
+
+void Renderer::ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
+                           uint32_t dest_point) {
+  if (!dest_texture) {
     return;
   }
   const TextureFetchConstant dest = ReadBaseTextureFormat(base, dest_texture);
-  // The 1024x600 scene target only exists in-game; use it to gate the world diagnostics.
-  if (dest.width == 1024 && dest.height == 600) {
-    saw_scene_target_.store(true, std::memory_order_release);
-  }
-  // DIAG(d3d9): confirm resolves fire at all, and their dest format/dims. If these
-  // never appear, NX1 isn't resolving via D3DDevice_Resolve (PM4/other path). TODO: drop.
-  {
-    // Log each *distinct* resolve destination once, so in-game intermediate resolves
-    // (post/bloom scene textures) show up instead of the first frames eating the budget.
-    static uint32_t seen[32] = {};
-    static uint32_t seen_n = 0;
-    bool known = false;
-    for (uint32_t i = 0; i < seen_n; ++i) {
-      if (seen[i] == dest.base_address) { known = true; break; }
-    }
-    if (!known && seen_n < 32) {
-      seen[seen_n++] = dest.base_address;
-      REXGPU_INFO(
-          "nx1_d3d9: [resolvediag] dest=0x{:08X} fmt={} {}x{} frame={} <- rt surface {:#010x} "
-          "{}x{}",
-          dest.base_address, dest.format, dest.width, dest.height, frames_presented_,
-          current_rt_surface_, current_rt_width_, current_rt_height_);
-    }
-  }
   if (!dest.base_address || !dest.width || !dest.height) {
     return;
   }
@@ -505,26 +468,6 @@ void Renderer::Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_
 
   if (dest.format == 22 || dest.format == 23) {
     auto& tracker = ResourceTracker::Get();
-    // DIAG(d3d9): the shadow depth surfaces decode to 1024x1024 / 512x512 but resolve
-    // into 1024x2048 / 512x2048 destinations -- so the guest is stacking cascades into
-    // an atlas. Log the source rect and destination point to recover that layout, and
-    // how many distinct resolves each atlas takes. TODO: drop.
-    static uint32_t seen[24] = {};
-    static uint32_t seen_n = 0;
-    bool known = false;
-    for (uint32_t i = 0; i < seen_n; ++i) {
-      if (seen[i] == (dest.base_address ^ uint32_t(at.y))) { known = true; break; }
-    }
-    if (!known && seen_n < 24) {
-      seen[seen_n++] = dest.base_address ^ uint32_t(at.y);
-      uint32_t dw = 0, dh = 0;
-      ReadSurfaceSize(base, current_depth_surface_, &dw, &dh);
-      REXGPU_INFO(
-          "nx1_d3d9: [depthdiag] resolve dest=0x{:08X} {}x{} <- surface 0x{:08X} {}x{} "
-          "src=({},{})-({},{}) at=({},{})",
-          dest.base_address, dest.width, dest.height, current_depth_surface_, dw, dh, rect.left,
-          rect.top, rect.right, rect.bottom, at.x, at.y);
-    }
     if (IDirect3DTexture9* depth = tracker.GetDepthTexture(base, current_depth_surface_)) {
       tracker.ResolveDepth(dest.base_address, dest.width, dest.height, depth, rect, at);
     }
@@ -537,10 +480,54 @@ void Renderer::Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_
   if (dest.width == backbuffer_width_ && dest.height == backbuffer_height_) {
     display_resolve_addr_ = dest.base_address;
   }
-  // DIAG(d3d9): the 1024x600 scene colour resolve. Presenting this directly answers
-  // whether the world is being rendered at all, independent of the composite. TODO: drop.
-  if (dest.width == 1024 && dest.height == 600) {
-    scene_resolve_addr_ = dest.base_address;
+}
+
+void Renderer::ClearEdram(const uint8_t* base, uint32_t flags, uint32_t clear_color,
+                          float clear_z, uint32_t clear_stencil) {
+  // The Xbox 360 clears EDRAM on the way out of a resolve, and NX1 clears the frame no
+  // other way -- D3DDevice_Clear is never called once. Without this the scene's colour
+  // and depth buffers carry over frame to frame: under reverse-Z a stale depth buffer
+  // still passes GREATEREQUAL for a stationary camera (same fragments, same depths), so
+  // a static view looks right, but the moment the camera moves, geometry that lands
+  // behind last frame's depth is rejected and last frame's colour stays on screen.
+  DWORD host_flags = 0;
+  if (flags & kResolveClearRenderTarget) {
+    host_flags |= D3DCLEAR_TARGET;
+  }
+  if ((flags & kResolveClearDepthStencil) && current_depth_surface_) {
+    host_flags |= D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL;
+  }
+  if (!host_flags) {
+    return;
+  }
+
+  D3DCOLOR color = 0;
+  if ((host_flags & D3DCLEAR_TARGET) && clear_color) {
+    auto to8 = [](float c) { return uint32_t(std::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    color = D3DCOLOR_ARGB(to8(GuestReadF32(base, clear_color + 12)),  // a
+                          to8(GuestReadF32(base, clear_color + 0)),   // r
+                          to8(GuestReadF32(base, clear_color + 4)),   // g
+                          to8(GuestReadF32(base, clear_color + 8)));  // b
+  }
+
+  // D3D9 clips Clear to the viewport, and the viewport still holds whatever the last
+  // draw left (a 1024x600 scene or a 1024x2048 shadow band). Cover the whole target.
+  D3DVIEWPORT9 saved = {};
+  const bool have_saved = SUCCEEDED(device_->GetViewport(&saved));
+  if (current_rt_width_ && current_rt_height_) {
+    const D3DVIEWPORT9 full = {0, 0, current_rt_width_, current_rt_height_, 0.0f, 1.0f};
+    device_->SetViewport(&full);
+  }
+
+  // A depth surface without stencil rejects D3DCLEAR_STENCIL, and D3D9 then fails the
+  // whole call -- clearing nothing. Drop back to a depth-only clear rather than lose it.
+  if (FAILED(device_->Clear(0, nullptr, host_flags, color, clear_z, clear_stencil)) &&
+      (host_flags & D3DCLEAR_STENCIL)) {
+    device_->Clear(0, nullptr, host_flags & ~D3DCLEAR_STENCIL, color, clear_z, 0);
+  }
+
+  if (have_saved) {
+    device_->SetViewport(&saved);
   }
 }
 
@@ -582,25 +569,6 @@ void Renderer::UploadVertexUniforms(uint32_t base_reg) {
       ndc_offset_[0], ndc_offset_[1], ndc_offset_[2], 0.0f,
   };
   device_->SetVertexShaderConstantF(base_reg, params, 2);
-
-  // DIAG(d3d9): the last unverified step between correct constants and correct pixels.
-  // For a full-target render this fold should come out as scale (1, 1, 1) offset (0, 0, 0)
-  // -- anything else is distorting every vertex. TODO(d3d9): drop.
-  {
-    static uint32_t dumped = 0;
-    static float last[6] = {};
-    const float now[6] = {ndc_scale_[0],  ndc_scale_[1],  ndc_scale_[2],
-                          ndc_offset_[0], ndc_offset_[1], ndc_offset_[2]};
-    if (dumped < 12 && std::memcmp(last, now, sizeof(now)) != 0) {
-      std::memcpy(last, now, sizeof(now));
-      ++dumped;
-      REXGPU_INFO(
-          "nx1_d3d9: [ndcdiag] scale ({: .4f} {: .4f} {: .4f}) offset ({: .4f} {: .4f} {: .4f}) "
-          "at reg c{} | rt {}x{}",
-          now[0], now[1], now[2], now[3], now[4], now[5], base_reg, current_rt_width_,
-          current_rt_height_);
-    }
-  }
 }
 
 void Renderer::ResolveViewport(const uint8_t* base, uint32_t guest_device) {
@@ -712,33 +680,26 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   const Sm3Shader* ps = ps_hash ? cache.Lookup(ps_hash) : nullptr;
 
   if (!vs || (ps_object && !ps)) {
-    // 14 of 2923 shaders could not be lowered to SM3. Skipping the draw is wrong
-    // but bounded and visible; rendering with a stale shader would not be.
-    if ((shader_cache_misses_++ % 1000) == 0) {
-      REXGPU_WARN("nx1_d3d9: shader cache miss (vs=0x{:016X} ps=0x{:016X}), {} so far", vs_hash,
-                  ps_hash, shader_cache_misses_);
-    }
-    // One-time dump: is the ucode we hash even valid, and does the physical vs
-    // virtual translation of its address disagree (the 0xE0 page-offset again)?
-    static bool dumped = false;
-    if (!dumped) {
-      dumped = true;
-      auto* mem = rex::system::kernel_state()->memory();
-      auto dump = [&](const char* tag, const GuestUcode& u, bool present) {
-        if (!present) {
-          return;
-        }
-        const auto* w = mem->TranslatePhysical<const rex::be<uint32_t>*>(u.physical_address);
-        REXGPU_WARN("nx1_d3d9: {} ucode addr=0x{:08X} dwords={} [0..3]=0x{:08X},0x{:08X},0x{:08X},"
-                    "0x{:08X}",
-                    tag, u.physical_address, u.dword_count, uint32_t(w[0]), uint32_t(w[1]),
-                    uint32_t(w[2]), uint32_t(w[3]));
-      };
-      dump("vs", ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, vs_pass), vs == nullptr);
-      dump("ps", ReadGuestUcode(base, ps_object, /*pixel_shader=*/true), ps_object && !ps);
+    // A handful of shaders do not lower to SM3, and a draw that wants one is silently
+    // dropped. Name each distinct pair once so a missing draw can be traced back to the
+    // shader that has to be fixed.
+    ++shader_cache_misses_;
+    {
+      static std::mutex m;
+      static std::vector<uint64_t> seen;
+      std::lock_guard<std::mutex> lk(m);
+      const uint64_t key = vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull);
+      if (std::find(seen.begin(), seen.end(), key) == seen.end() && seen.size() < 32) {
+        seen.push_back(key);
+        REXGPU_WARN("nx1_d3d9: shader cache miss: vs=0x{:016X} ({}) ps=0x{:016X} ({}) -- draw dropped",
+                    vs_hash, vs ? "ok" : "MISSING", ps_hash,
+                    !ps_object ? "none" : (ps ? "ok" : "MISSING"));
+      }
     }
     return false;
   }
+
+
 
   device_->SetVertexShader(vs->vs);
   cache.UploadConstants(base, guest_device, *vs, /*pixel_stage=*/false);
@@ -747,79 +708,33 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   }
 
   device_->SetPixelShader(ps ? ps->ps : nullptr);
-  current_draw_writes_color_ = ps != nullptr;  // DIAG(d3d9): see rt_tally_. TODO: drop.
   // A draw with no pixel shader is a depth/shadow-only pass: the Xbox exports no
   // color, so nothing is written to the render target. On D3D9, SetPixelShader(null)
   // instead activates the fixed-function pixel pipeline, which *does* write color
   // (the surface's diffuse/texture as solid fill) and paints garbage over the frame.
   // Mask color writes off for those draws so they contribute depth only.
-  device_->SetRenderState(D3DRS_COLORWRITEENABLE, ps ? 0xF : 0);
+  //
+  // Otherwise honour the guest's own mask: it masks colour off to write destination alpha
+  // alone (see ReadColorWriteMask).
+  device_->SetRenderState(D3DRS_COLORWRITEENABLE, ps ? ReadColorWriteMask(base, guest_device) : 0);
   if (ps) {
     cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
     UploadPixelUniforms(HostConstantCount(*ps), base, guest_device);
-    // DIAG(d3d9): the world renders black while texture-only draws (UI/decals) look
-    // right -- dump the guest PS constant window for the first few draws to see if the
-    // lighting constants are actually populated (all-zero => black shading). TODO: drop.
-    // Only shaders that actually consume constants tell us anything -- the UI/text
-    // shaders use none. A world lighting PS uses several; if its constant window reads
-    // back all-zero, every light term is 0 and the surface shades black.
-    // Gate on being in-game (the guest has resolved the 1024x600 scene target),
-    // otherwise the budget gets eaten by menu/UI draws, which use no lighting constants.
-    static int pc_diag = 0;
-    const uint32_t ps_n = HostConstantCount(*ps);
-    if (pc_diag < 10 && ps_n >= 4 && saw_scene_target_.load(std::memory_order_acquire)) {
-      // Dump the guest PS constant window at the *remapped* registers the shader
-      // actually reads, not just c0 -- a compacted shader may reference c40, c60, ...
-      float c[16];
-      for (uint32_t i = 0; i < 16; ++i) {
-        c[i] = GuestReadF32(base, guest_device + guest_device::kPsConstants + i * 4);
-      }
-      // How many of the first 64 float4s in the PS window are non-zero? A populated
-      // lighting window should have plenty; an all-zero one is the smoking gun.
-      uint32_t nonzero = 0;
-      for (uint32_t r = 0; r < 64; ++r) {
-        for (uint32_t comp = 0; comp < 4; ++comp) {
-          if (GuestReadF32(base, guest_device + guest_device::kPsConstants + (r * 4 + comp) * 4) !=
-              0.0f) {
-            ++nonzero;
-            break;
-          }
-        }
-      }
-      REXGPU_INFO(
-          "nx1_d3d9: [constdiag {}] ps=0x{:016X} ps_n={} nonzero_of_64={} "
-          "psc0=({:.3f},{:.3f},{:.3f},{:.3f}) psc1=({:.3f},{:.3f},{:.3f},{:.3f}) "
-          "psc2=({:.3f},{:.3f},{:.3f},{:.3f}) psc3=({:.3f},{:.3f},{:.3f},{:.3f})",
-          pc_diag, ps_hash, ps_n, nonzero, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8],
-          c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
-      ++pc_diag;
-    }
   }
+
   return true;
 }
 
-bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t* vertex_count) {
+bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t needed_vertices,
+                           uint32_t* vertex_count) {
   auto& tracker = ResourceTracker::Get();
   // NX1 binds no CVertexDeclaration; for bound-buffer draws derive the multi-stream
   // layout from the vertex shader's vfetch (stream0_stride=0 selects bound mode).
-  // Diagnostic: which sub-stage of stream binding fails for in-game draws. TODO(d3d9): drop.
-  auto bail_once = [](const char* stage) {
-    static const char* seen[8] = {};
-    for (auto& s : seen) {
-      if (s == stage) return;
-      if (!s) {
-        s = stage;
-        REXGPU_INFO("nx1_d3d9: BindStreams bail at '{}'", stage);
-        return;
-      }
-    }
-  };
   const VertexLayout* layout = tracker.GetVertexLayout(base, guest_device);
   if (!layout) {
     layout = tracker.GetShaderVertexLayout(base, guest_device, /*stream0_stride=*/0);
   }
   if (!layout) {
-    bail_once("layout");
     return false;
   }
   device_->SetVertexDeclaration(layout->decl);
@@ -828,17 +743,13 @@ bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t*
   for (uint32_t stream = 0; stream < layout->stream_count; ++stream) {
     uint32_t count = 0;
     IDirect3DVertexBuffer9* vb =
-        tracker.GetVertexBuffer(base, guest_device, stream, *layout, &count);
+        tracker.GetVertexBuffer(base, guest_device, stream, *layout, needed_vertices, &count);
     if (!vb) {
-      bail_once("vertexbuffer");
       return false;
     }
     device_->SetStreamSource(stream, vb, 0, layout->host_stride[stream]);
     // The draw's vertex range has to fit inside every stream it reads.
     *vertex_count = *vertex_count ? std::min(*vertex_count, count) : count;
-  }
-  if (*vertex_count == 0) {
-    bail_once("vertexcount");
   }
   return *vertex_count != 0;
 }
@@ -863,6 +774,17 @@ D3DTEXTUREADDRESS HostAddressMode(uint32_t clamp_mode) {
 // Xenos TextureFilter: 0 = point, 1 = linear (2 = "keep"/base, treated as linear).
 D3DTEXTUREFILTERTYPE HostFilter(uint32_t xenos_filter) {
   return xenos_filter == 0 ? D3DTEXF_POINT : D3DTEXF_LINEAR;
+}
+
+// The mip filter has one more state than the mag/min ones: xenos::TextureFilter::kBaseMap
+// (2) means "sample the base level and no other", which on D3D9 is D3DTEXF_NONE rather
+// than a filter mode. Folding it into LINEAR would mip a texture the guest asked not to.
+D3DTEXTUREFILTERTYPE HostMipFilter(uint32_t xenos_filter) {
+  switch (xenos_filter) {
+    case 0:  return D3DTEXF_POINT;
+    case 2:  return D3DTEXF_NONE;
+    default: return D3DTEXF_LINEAR;
+  }
 }
 
 // xenos::CompareFunction (0..7) maps 1:1 onto D3DCMPFUNC shifted by one.
@@ -906,7 +828,7 @@ D3DBLENDOP HostBlendOp(uint32_t op) {
 
 }  // namespace
 
-void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device, bool bound_draw) {
+void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device) {
   // Depth. NX1 renders reverse-Z, so the guest's stored zfunc is GREATER_EQUAL --
   // we read it rather than hardcoding, so a draw that flips the test still works.
   const DepthState depth = ReadDepthState(base, guest_device);
@@ -934,67 +856,53 @@ void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device, boo
   } else if (cull.cull_front) {
     mode = cull.front_is_cw ? D3DCULL_CW : D3DCULL_CCW;
   }
-  // DIAG(d3d9): log the guest cull/winding for the first few UP (menu) and bound
-  // (world) draws so we can tell whether the Y-flip winding sense actually differs
-  // between them, instead of guessing. TODO: drop.
-  {
-    static int cull_diag_up = 0, cull_diag_bound = 0;
-    int& counter = bound_draw ? cull_diag_bound : cull_diag_up;
-    if (counter < 6) {
-      REXGPU_INFO(
-          "nx1_d3d9: [culldiag {}] path={} cull_back={} cull_front={} front_cw={} mode={} "
-          "ztest={} zwrite={} zfunc={}",
-          counter, bound_draw ? "bound" : "up", cull.cull_back, cull.cull_front, cull.front_is_cw,
-          int(mode), depth.test_enabled, depth.write_enabled, depth.compare_function);
-      ++counter;
-    }
-  }
   device_->SetRenderState(D3DRS_CULLMODE, mode);
 }
 
-void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, bool bound_draw) {
+void Renderer::InvalidateSamplerShadow() {
+  for (uint32_t s = 0; s < 16; ++s) {
+    sampler_texture_[s] = kSamplerTextureUnknown;
+    for (uint32_t i = 0; i < kSamplerStates; ++i) {
+      sampler_state_[s][i] = kSamplerStateUnset;
+    }
+  }
+}
+
+void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device) {
   auto& tracker = ResourceTracker::Get();
-  // DIAG(d3d9): one-shot dump of the first few bound-buffer (in-game world) draws'
-  // per-sampler texture format + bind status, to see what surfaces sample. TODO: drop.
-  static int tex_diag = 0;
-  const bool diag = bound_draw && tex_diag < 12;
-  bool diag_logged = false;
+  // A scene is ~5000 draws over 16 samplers, and consecutive draws overwhelmingly share
+  // their textures and filters -- so shadow the sampler state and only touch D3D when it
+  // actually changes. Issuing all of it unconditionally was 80k SetTexture and ~500k
+  // SetSamplerState calls a frame, nearly every one of them a no-op.
+  //
+  // Comparing texture *pointers* is sound: D3D9 holds its own reference to a bound texture,
+  // so an object we release cannot be freed (and its address reused) while still bound.
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, guest_device, sampler);
-    device_->SetTexture(sampler, tex);
-    if (diag) {
-      const TextureFetchConstant td = ReadTextureFetchConstant(base, guest_device, sampler);
-      if (td.valid && td.base_address) {
-        REXGPU_INFO("nx1_d3d9: [texdiag {}] sampler={} fmt={} {}x{} tiled={} bound={}", tex_diag,
-                    sampler, td.format, td.width, td.height, td.tiled, tex != nullptr);
-        diag_logged = true;
-      }
+    if (tex != sampler_texture_[sampler]) {
+      device_->SetTexture(sampler, tex);
+      sampler_texture_[sampler] = tex;
     }
     if (!tex) {
       continue;
     }
     const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, sampler);
     const SamplerClampModes clamp = ReadSamplerClampModes(base, guest_device, sampler);
-    device_->SetSamplerState(sampler, D3DSAMP_ADDRESSU, HostAddressMode(clamp.u));
-    device_->SetSamplerState(sampler, D3DSAMP_ADDRESSV, HostAddressMode(clamp.v));
-    device_->SetSamplerState(sampler, D3DSAMP_ADDRESSW, HostAddressMode(clamp.w));
-    device_->SetSamplerState(sampler, D3DSAMP_MAGFILTER, HostFilter(t.mag_filter));
-    device_->SetSamplerState(sampler, D3DSAMP_MINFILTER, HostFilter(t.min_filter));
-    device_->SetSamplerState(sampler, D3DSAMP_MIPFILTER, HostFilter(t.mip_filter));
-  }
-  if (diag && diag_logged) {
-    // Log the depth state for this *real* textured world draw. The culldiag in
-    // ApplyRenderStates burns its budget on early load draws; this fires on the
-    // same draws texdiag captured, so it reflects in-game geometry. TODO: drop.
-    const DepthState depth = ReadDepthState(base, guest_device);
-    const ViewportState vp = ReadViewportState(base, guest_device);
-    const TilingClear tc = ReadTilingClear(base, guest_device);
-    REXGPU_INFO(
-        "nx1_d3d9: [texdiag {}] depth ztest={} zwrite={} zfunc={} | vp offz={:.4f} scalez={:.4f} "
-        "clipdis={} | clear.z={:.4f}",
-        tex_diag, depth.test_enabled, depth.write_enabled, depth.compare_function, vp.offset_z,
-        vp.scale_z, vp.clip_disable, tc.z);
-    ++tex_diag;
+    const uint32_t states[kSamplerStates] = {
+        uint32_t(HostAddressMode(clamp.u)), uint32_t(HostAddressMode(clamp.v)),
+        uint32_t(HostAddressMode(clamp.w)), uint32_t(HostFilter(t.mag_filter)),
+        uint32_t(HostFilter(t.min_filter)), uint32_t(HostMipFilter(t.mip_filter)),
+    };
+    static constexpr D3DSAMPLERSTATETYPE kTypes[kSamplerStates] = {
+        D3DSAMP_ADDRESSU,  D3DSAMP_ADDRESSV,  D3DSAMP_ADDRESSW,
+        D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    };
+    for (uint32_t i = 0; i < kSamplerStates; ++i) {
+      if (states[i] != sampler_state_[sampler][i]) {
+        device_->SetSamplerState(sampler, kTypes[i], states[i]);
+        sampler_state_[sampler][i] = states[i];
+      }
+    }
   }
 }
 
@@ -1008,131 +916,61 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   const D3DPRIMITIVETYPE host_prim = HostPrimitiveType(prim_type);
   const uint32_t prim_count = HostPrimitiveCount(prim_type, index_count);
   if (!device_ || !host_prim || !prim_count) {
+    // An unsupported primitive type (rectangle/quad lists) has no D3D9 equivalent, so the
+    // draw is dropped. Say so once per type: silently losing a whole class of draws is the
+    // kind of thing that costs days to find.
+    if (device_ && !host_prim) {
+      static uint32_t seen_mask = 0;
+      if (prim_type < 32 && !(seen_mask & (1u << prim_type))) {
+        seen_mask |= 1u << prim_type;
+        REXGPU_WARN("nx1_d3d9: DrawIndexed SKIPPED: unsupported Xenos primitive type {} "
+                    "({} indices) -- these draws never render",
+                    prim_type, index_count);
+      }
+    }
     return;
   }
   ++draws_attempted_;
-  last_base_ = base;
-  last_guest_device_ = guest_device;
-  // Diagnostic: which stage walls the bound-buffer (in-game) draws. TODO(d3d9): drop.
-  auto bail_once = [](const char* stage) {
-    static const char* seen[8] = {};
-    for (auto& s : seen) {
-      if (s == stage) return;
-      if (!s) {
-        s = stage;
-        REXGPU_INFO("nx1_d3d9: DrawIndexed bail at '{}'", stage);
-        return;
-      }
-    }
-  };
-  // DIAG(d3d9): guest D3D is still arriving on several host threads even with the draw
-  // command buffers suppressed. If an off-thread draw uses a *different* guest device, it is
-  // a worker recording into its own dx.cmdBufDevice[] and racing our one host device.
-  // TODO(d3d9): drop.
-  {
-    static std::mutex m;
-    static std::vector<std::pair<uint32_t, uint32_t>> seen;
-    const uint32_t tid = uint32_t(::GetCurrentThreadId());
-    std::lock_guard<std::mutex> lk(m);
-    if (std::find(seen.begin(), seen.end(), std::make_pair(tid, guest_device)) == seen.end() &&
-        seen.size() < 16) {
-      seen.emplace_back(tid, guest_device);
-      REXGPU_INFO("nx1_d3d9: [devdiag] draw on thread {} with guest device {:#010x}", tid,
-                  guest_device);
-    }
-  }
+
   ResolveViewport(base, guest_device);
   if (!BindShadersAndConstants(base, guest_device)) {
-    bail_once("shaders");
-    return;
-  }
-  uint32_t vertex_count = 0;
-  if (!BindStreams(base, guest_device, &vertex_count)) {
-    bail_once("streams");
     return;
   }
 
+  // Indices first: how far into the vertex buffer this draw actually reaches decides how
+  // much of it we have to mirror. The guest's fetch constant would have us mirror the whole
+  // pool the model happens to live in.
   uint32_t index_size = 0;
   IDirect3DIndexBuffer9* ib = ResourceTracker::Get().GetIndexBuffer(base, guest_device, &index_size);
   if (!ib) {
-    bail_once("indexbuffer");
     return;
   }
-  // DIAG(d3d9): does the draw's index range actually fit inside the vertex buffer we
-  // mirrored? `vertex_count` comes from the fetch constant's size field, which for the
-  // skinned-vertex cache means "bytes to the end of the 4.5 MB pool" -- not this model's
-  // vertex count.
-  //
-  // The ring-path (rigid model) draws all came back exactly sized and in range, so aim
-  // this at the draws bound to a *large* stream instead: that is the shared skinned pool,
-  // whose models are CPU-skinned into world space and therefore never write a world matrix
-  // through the ring. TODO(d3d9): drop.
-  if (ReadVertexFetchConstant(base, guest_device, 0).size_bytes > 65536) {
-    static std::atomic<uint32_t> budget{3};
-    if (budget.load(std::memory_order_relaxed) > 0 &&
-        budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
-      const IndexBufferState ibs = ReadIndexBuffer(base, guest_device);
-      const VertexFetchConstant vf = ReadVertexFetchConstant(base, guest_device, 0);
-      uint32_t lo = 0xFFFFFFFFu, hi = 0;
-      for (uint32_t i = 0; i < index_count; ++i) {
-        const uint32_t at = start_index + i;
-        uint32_t idx = 0;
-        if (ibs.index_size == 4) {
-          idx = GuestRead32(base, ibs.base_address + at * 4);
-        } else {
-          const uint32_t w = GuestRead32(base, ibs.base_address + (at & ~1u) * 2);
-          idx = (at & 1u) ? (w & 0xFFFFu) : (w >> 16);
-        }
-        lo = std::min(lo, idx);
-        hi = std::max(hi, idx);
-      }
-      REXGPU_INFO(
-          "nx1_d3d9: [rangediag] prim={} base_vtx={} start={} n={} | idx {}..{} | vbuf "
-          "count={} (base=0x{:08X} size={} stride={}) | ib size={} isz={} {}",
-          prim_type, base_vertex_index, start_index, index_count, lo, hi, vertex_count,
-          vf.base_address, vf.size_bytes, vf.size_bytes / (vertex_count ? vertex_count : 1),
-          ibs.size_bytes, ibs.index_size,
-          (hi + base_vertex_index) >= vertex_count ? "*** OUT OF RANGE ***" : "ok");
+  const uint32_t max_index =
+      ResourceTracker::Get().GetDrawMaxIndex(base, guest_device, start_index, index_count);
+  const uint32_t needed_vertices = max_index ? base_vertex_index + max_index + 1 : 0;
 
-      // DIAG(d3d9): the rigid (stride 32) models decode correctly, so dump how we decode
-      // *this* layout -- the stride-44 world vertex -- plus the position we actually
-      // produce for the first index. A garbage position here is the smear. TODO: drop.
-      const VertexLayout* vl = ResourceTracker::Get().GetVertexLayout(base, guest_device);
-      if (!vl) {
-        vl = ResourceTracker::Get().GetShaderVertexLayout(base, guest_device, 0);
-      }
-      if (vl) {
-        for (const ConvertOp& op : vl->ops) {
-          REXGPU_INFO(
-              "nx1_d3d9: [vfmtdiag] stream={} src+{} -> dst+{} fmt={} src_size={} dst_size={} "
-              "signed={} norm={} expand={}",
-              op.stream, op.src_offset, op.dst_offset, op.format, op.src_size, op.dst_size,
-              op.is_signed, op.is_normalized, op.expand);
-        }
-        REXGPU_INFO("nx1_d3d9: [vfmtdiag] guest_stride={} host_stride={} bulk_swap={} ops={}",
-                    vl->guest_stride[0], vl->host_stride[0], vl->bulk_swap[0], vl->ops.size());
-      }
-    }
+  uint32_t vertex_count = 0;
+  if (!BindStreams(base, guest_device, needed_vertices, &vertex_count)) {
+    return;
   }
 
   device_->SetIndices(ib);
-  BindTextures(base, guest_device, /*bound_draw=*/true);
-  ApplyRenderStates(base, guest_device, /*bound_draw=*/true);
+  BindTextures(base, guest_device);
+  ApplyRenderStates(base, guest_device);
 
   const HRESULT dhr = device_->DrawIndexedPrimitive(host_prim, int(base_vertex_index), 0,
                                                     vertex_count, start_index, prim_count);
-  // DIAG(d3d9): a draw can be *submitted* and still be rejected by D3D9 (a depth buffer
-  // smaller than the render target does exactly that, silently). TODO(d3d9): drop.
+  // A draw can be *submitted* and still be rejected by D3D9 -- a depth buffer smaller than
+  // the render target does exactly that, silently.
   if (FAILED(dhr)) {
     static uint64_t fails = 0;
     if ((fails++ % 2000) == 0) {
-      REXGPU_WARN("nx1_d3d9: DrawIndexedPrimitive failed ({:#x}) rt={}x{} prim={} verts={} — {} so far",
+      REXGPU_WARN("nx1_d3d9: DrawIndexedPrimitive failed ({:#x}) rt={}x{} prim={} verts={} -- {} so far",
                   uint32_t(dhr), current_rt_width_, current_rt_height_, prim_count, vertex_count,
                   fails);
     }
   }
   ++draws_submitted_;
-  TallyDraw();
 }
 
 void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
@@ -1144,24 +982,32 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
   const D3DPRIMITIVETYPE host_prim = HostPrimitiveType(prim_type);
   const uint32_t prim_count = HostPrimitiveCount(prim_type, vertex_count);
   if (!device_ || !host_prim || !prim_count) {
+    if (device_ && !host_prim) {  // see DrawIndexed
+      static uint32_t seen_mask = 0;
+      if (prim_type < 32 && !(seen_mask & (1u << prim_type))) {
+        seen_mask |= 1u << prim_type;
+        REXGPU_WARN("nx1_d3d9: Draw SKIPPED: unsupported Xenos primitive type {} ({} vertices) "
+                    "-- these draws never render",
+                    prim_type, vertex_count);
+      }
+    }
     return;
   }
   ++draws_attempted_;
-  last_base_ = base;
-  last_guest_device_ = guest_device;
   ResolveViewport(base, guest_device);
   if (!BindShadersAndConstants(base, guest_device)) {
     return;
   }
+  // A non-indexed draw reads exactly [start_vertex, start_vertex + vertex_count), so its
+  // reach into the (possibly pooled) buffer is known without consulting any indices.
   uint32_t stream_vertices = 0;
-  if (!BindStreams(base, guest_device, &stream_vertices)) {
+  if (!BindStreams(base, guest_device, start_vertex + vertex_count, &stream_vertices)) {
     return;
   }
-  BindTextures(base, guest_device, /*bound_draw=*/true);
-  ApplyRenderStates(base, guest_device, /*bound_draw=*/true);
+  BindTextures(base, guest_device);
+  ApplyRenderStates(base, guest_device);
   device_->DrawPrimitive(host_prim, start_vertex, prim_count);
   ++draws_submitted_;
-  TallyDraw();
 }
 
 void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
@@ -1178,32 +1024,9 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
     return;
   }
   ++draws_attempted_;
-  last_base_ = base;
-  last_guest_device_ = guest_device;
   ResolveViewport(base, guest_device);
 
-  // Diagnostic: report the first time each stage rejects a UP draw so a stuck
-  // "0/N submitted" tells us exactly which stage is the wall. TODO(d3d9): drop.
-  auto bail_once = [](const char* stage) -> bool {
-    static const char* seen[8] = {};
-    for (auto& s : seen) {
-      if (s == stage) return false;
-      if (!s) {
-        s = stage;
-        REXGPU_INFO("nx1_d3d9: UP draw bail at '{}'", stage);
-        return true;
-      }
-    }
-    return false;
-  };
-
   if (!BindShadersAndConstants(base, guest_device)) {
-    if (bail_once("shaders")) {
-      REXGPU_INFO("nx1_d3d9: UP shaders bail: device=0x{:08X} vs=0x{:08X} ps=0x{:08X} "
-                  "dev[0]=0x{:08X}",
-                  guest_device, BoundVertexShader(base, guest_device),
-                  BoundPixelShader(base, guest_device), GuestRead32(base, guest_device));
-    }
     return;
   }
 
@@ -1216,12 +1039,6 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
     layout = tracker.GetShaderVertexLayout(base, guest_device, vertex_stride);
   }
   if (!layout) {
-    if (bail_once("layout")) {
-      const uint32_t decl = BoundVertexDeclaration(base, guest_device);
-      REXGPU_INFO("nx1_d3d9: UP layout bail: device=0x{:08X} decl=0x{:08X} vs=0x{:08X} "
-                  "stride={}",
-                  guest_device, decl, BoundVertexShader(base, guest_device), vertex_stride);
-    }
     return;
   }
   device_->SetVertexDeclaration(layout->decl);
@@ -1233,19 +1050,11 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
   const uint32_t host_stride =
       tracker.ConvertInlineVertices(guest_vertex_addr, num_vertices, vertex_stride, *layout, &verts);
   if (!host_stride) {
-    if (bail_once("verts")) {
-      REXGPU_INFO("nx1_d3d9: UP verts bail: addr=0x{:08X} count={} stride={} host_stride[0]={}",
-                  guest_vertex_addr, num_vertices, vertex_stride, layout->host_stride[0]);
-    }
     return;
   }
   const uint32_t index_size = (index_format & 0x4) ? 4 : 2;
   std::vector<uint8_t> indices;
   if (!tracker.ConvertInlineIndices(guest_index_addr, index_count, index_size, &indices)) {
-    if (bail_once("indices")) {
-      REXGPU_INFO("nx1_d3d9: UP indices bail: addr=0x{:08X} count={} size={}", guest_index_addr,
-                  index_count, index_size);
-    }
     return;
   }
 
@@ -1256,9 +1065,6 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
       index_size == 4 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, verts.data(), host_stride);
   if (SUCCEEDED(hr)) {
     ++draws_submitted_;
-    TallyDraw();
-  } else {
-    bail_once("drawcall");
   }
 }
 
@@ -1285,8 +1091,6 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
     }
     return;
   }
-  last_base_ = base;
-  last_guest_device_ = guest_device;
   ResolveViewport(base, guest_device);
   if (!BindShadersAndConstants(base, guest_device)) {
     return;
@@ -1315,23 +1119,6 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
   ApplyRenderStates(base, guest_device);
   if (SUCCEEDED(device_->DrawPrimitiveUP(host_prim, prim_count, verts.data(), host_stride))) {
     ++draws_submitted_;
-    TallyDraw();
-  }
-}
-
-// DIAG(d3d9): see rt_tally_ in the header. TODO(d3d9): drop.
-void Renderer::TallyDraw() {
-  const uint32_t color = current_draw_writes_color_ ? 1u : 0u;
-  for (uint32_t i = 0; i < rt_tally_n_; ++i) {
-    if (rt_tally_[i].surface == current_rt_surface_) {
-      ++rt_tally_[i].draws;
-      rt_tally_[i].color_draws += color;
-      return;
-    }
-  }
-  if (rt_tally_n_ < 12) {
-    rt_tally_[rt_tally_n_++] = {current_rt_surface_, current_rt_width_, current_rt_height_, 1,
-                                color};
   }
 }
 

@@ -73,10 +73,6 @@ class ConstantRing {
   /// the guest is about to flush from the shadow drops its ring record.
   void Retire(bool pixel_stage, uint64_t mask);
 
-  /// DIAG(d3d9): true once any device has taken a ring record, i.e. we are in-game and
-  /// past the menu. Lets a diagnostic skip the menu draws. TODO(d3d9): drop.
-  static bool EverRecorded();
-
   /// Guest EA holding register `reg`, or 0 when the shadow is authoritative.
   uint32_t Lookup(bool pixel_stage, uint32_t reg) const {
     return reg < kAluRegisters ? addr_[pixel_stage ? 1 : 0][reg] : 0;
