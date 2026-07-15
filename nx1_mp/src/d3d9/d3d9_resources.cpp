@@ -290,32 +290,38 @@ HostTextureFormat PickHostTextureFormat(uint32_t xenos_format) {
 
 inline uint32_t Log2Exact(uint32_t v) { return v ? __builtin_ctz(v) : 0; }
 
-/// Can the driver filter a mip chain down from level 0 for this format? Block-compressed
-/// formats often cannot (and an unrecognised FourCC like ATI2 almost never can), and asking
-/// for it anyway fails the CreateTexture outright -- so ask first, once per format, and fall
-/// back to a single level for the ones that say no.
+/// Can the driver filter a mip chain down from level 0 for this format?
+///
+/// This must be tested against D3D_OK exactly, *not* with SUCCEEDED(). When a format is usable
+/// but the driver will not auto-generate its mips, CheckDeviceFormat returns D3DOK_NOAUTOGEN
+/// (0x0008652B) -- which is a **success** code, so SUCCEEDED() is true for it. Reading that as
+/// "supported" is how every format in the game came back supported while not one of them
+/// actually got a chain: we created the textures with D3DUSAGE_AUTOGENMIPMAP, called
+/// GenerateMipSubLevels(), and were silently handed a single level. The whole mip path was
+/// inert, and every minified surface aliased into coloured speckle.
 bool SupportsAutoMips(IDirect3DDevice9Ex* device, D3DFORMAT format) {
   static std::unordered_map<uint32_t, bool> cache;
   const auto it = cache.find(uint32_t(format));
   if (it != cache.end()) {
     return it->second;
   }
-  bool supported = false;
+  HRESULT hr = E_FAIL;
   IDirect3D9* d3d = nullptr;
   D3DDEVICE_CREATION_PARAMETERS params{};
   D3DDISPLAYMODE mode{};
   if (SUCCEEDED(device->GetDirect3D(&d3d)) && d3d) {
     if (SUCCEEDED(device->GetCreationParameters(&params)) &&
         SUCCEEDED(d3d->GetAdapterDisplayMode(params.AdapterOrdinal, &mode))) {
-      supported = SUCCEEDED(d3d->CheckDeviceFormat(params.AdapterOrdinal, params.DeviceType,
-                                                   mode.Format, D3DUSAGE_AUTOGENMIPMAP,
-                                                   D3DRTYPE_TEXTURE, format));
+      hr = d3d->CheckDeviceFormat(params.AdapterOrdinal, params.DeviceType, mode.Format,
+                                  D3DUSAGE_AUTOGENMIPMAP, D3DRTYPE_TEXTURE, format);
     }
     d3d->Release();
   }
+  const bool supported = hr == D3D_OK;
   cache.emplace(uint32_t(format), supported);
-  REXGPU_INFO("nx1_d3d9: auto mip generation for host format 0x{:08X}: {}", uint32_t(format),
-              supported ? "supported" : "NOT supported (single level)");
+  REXGPU_INFO("nx1_d3d9: auto mip generation for host format 0x{:08X}: {} (hr {:#010x})",
+              uint32_t(format), supported ? "supported" : "NOT supported (single level)",
+              static_cast<uint32_t>(hr));
   return supported;
 }
 
@@ -492,8 +498,23 @@ struct TextureEntry {
   /// Cube maps (environment/reflection), a third D3D9 type again.
   IDirect3DCubeTexture9* cube = nullptr;
   uint64_t layout_key = 0;  ///< base address + format + dims + mips; a change rebuilds it
-  uint64_t content_hash = 0;
   uint64_t last_frame = 0;
+  /// Content hash for the cube/volume paths, which still re-read on a content change. The 2D path
+  /// decodes from the CPU mirror (MirrorSnapshot) and re-reads only when the write-watch fires.
+  uint64_t content_hash = 0;
+  /// Write-watch state. We snapshot a texture once and re-read its guest memory only when the guest
+  /// actually writes it (dirty set by DrainMemoryWrites from the invalidation callback). watch_addr/
+  /// size record the physical range so an invalidation can be matched back to this entry.
+  bool dirty = false;
+  uint32_t watch_addr = 0;
+  uint32_t watch_size = 0;
+  /// Commit-and-freeze. While a texture is on screen its slot holds valid bytes, and the write-watch
+  /// keeps the decode tracking them (clean up close). But when it goes non-resident the streaming
+  /// pool recycles its slot, dribbling high-noise garbage into the exact bytes -- and re-reading that
+  /// is the confetti-on-backup. A texture drawn cleanly for kCommitFrames is settled, so we commit
+  /// it: stop honouring writes and hold the good decode. good_frames counts frames it has been drawn.
+  uint32_t good_frames = 0;
+  bool committed = false;
 };
 
 struct ResolvedTarget {
@@ -668,6 +689,290 @@ void DecodeBCAlphaToArgb(uint8_t* dst, uint32_t dst_pitch, const uint8_t* src, u
   }
 }
 
+//=============================================================================
+// Mip-chain generation for the block-compressed formats
+//
+// The driver will not do it. CheckDeviceFormat answers D3DOK_NOAUTOGEN for DXT1, DXT3, DXT5
+// and ATI2 -- only the uncompressed formats get a chain out of D3DUSAGE_AUTOGENMIPMAP. Since
+// block compression covers every world albedo, normal and specular map in the game, that left
+// the entire world sampling level 0 at any distance: undersampled, aliasing into the coloured
+// speckle that no amount of sampler state could fix, because there was no second level to
+// select. (D3DOK_NOAUTOGEN is a *success* code, so a SUCCEEDED() probe reports every format as
+// supported -- see SupportsAutoMips.)
+//
+// So decode level 0, box-filter it down, and re-encode each level. The re-encode is a plain
+// min/max endpoint fit rather than a rate-distortion search: these are the minified levels,
+// each already an average of four texels, and level 0 is passed through untouched -- so the
+// error lands where nothing can see it.
+//=============================================================================
+
+struct Rgba8 {
+  uint8_t r, g, b, a;
+};
+
+const D3DFORMAT kFmtAti2 = D3DFORMAT(MAKEFOURCC('A', 'T', 'I', '2'));
+
+bool IsBlockCompressed(D3DFORMAT f) {
+  return f == D3DFMT_DXT1 || f == D3DFMT_DXT3 || f == D3DFMT_DXT5 || f == kFmtAti2;
+}
+
+uint32_t BcBlockBytes(D3DFORMAT f) { return f == D3DFMT_DXT1 ? 8u : 16u; }
+
+/// How many levels to build. The chain stops at 4x4 rather than 1x1: a BC level smaller than
+/// one block is where the ATI2 pitch trap bites (the runtime sizes an unrecognised FourCC at a
+/// byte per texel, so a 2x2 level gets 4 bytes to hold a 16-byte block, and writing it corrupts
+/// the heap). Nothing is lost -- a 4x4 mip is already a single flat colour.
+uint32_t BcMipLevels(uint32_t width, uint32_t height) {
+  uint32_t levels = 1;
+  uint32_t w = width, h = height;
+  while (w > 4 && h > 4) {
+    w /= 2;
+    h /= 2;
+    ++levels;
+  }
+  return levels;
+}
+
+/// The 4-colour palette of a BC1 colour block. `punchthrough` is only true for DXT1, where
+/// c0 <= c1 selects a 3-colour block plus transparent black; the colour block embedded in
+/// DXT3/DXT5 is always 4-colour.
+void Bc1Palette(const uint8_t* blk, bool punchthrough, Rgba8 pal[4]) {
+  const uint32_t c0 = uint32_t(blk[0]) | (uint32_t(blk[1]) << 8);
+  const uint32_t c1 = uint32_t(blk[2]) | (uint32_t(blk[3]) << 8);
+  auto expand = [](uint32_t c) {
+    Rgba8 o;
+    o.r = uint8_t((((c >> 11) & 0x1F) * 255 + 15) / 31);
+    o.g = uint8_t((((c >> 5) & 0x3F) * 255 + 31) / 63);
+    o.b = uint8_t(((c & 0x1F) * 255 + 15) / 31);
+    o.a = 255;
+    return o;
+  };
+  pal[0] = expand(c0);
+  pal[1] = expand(c1);
+  if (c0 > c1 || !punchthrough) {
+    pal[2] = {uint8_t((2 * pal[0].r + pal[1].r) / 3), uint8_t((2 * pal[0].g + pal[1].g) / 3),
+              uint8_t((2 * pal[0].b + pal[1].b) / 3), 255};
+    pal[3] = {uint8_t((pal[0].r + 2 * pal[1].r) / 3), uint8_t((pal[0].g + 2 * pal[1].g) / 3),
+              uint8_t((pal[0].b + 2 * pal[1].b) / 3), 255};
+  } else {
+    pal[2] = {uint8_t((pal[0].r + pal[1].r) / 2), uint8_t((pal[0].g + pal[1].g) / 2),
+              uint8_t((pal[0].b + pal[1].b) / 2), 255};
+    pal[3] = {0, 0, 0, 0};
+  }
+}
+
+/// The 8-entry palette of a BC4 block (DXT5's alpha half, and each half of ATI2).
+void Bc4Palette(const uint8_t* blk, uint8_t pal[8]) {
+  const uint32_t a0 = blk[0], a1 = blk[1];
+  pal[0] = uint8_t(a0);
+  pal[1] = uint8_t(a1);
+  if (a0 > a1) {
+    for (uint32_t i = 1; i <= 6; ++i) pal[i + 1] = uint8_t(((7 - i) * a0 + i * a1) / 7);
+  } else {
+    for (uint32_t i = 1; i <= 4; ++i) pal[i + 1] = uint8_t(((5 - i) * a0 + i * a1) / 5);
+    pal[6] = 0;
+    pal[7] = 255;
+  }
+}
+
+void DecodeBc4Block(const uint8_t* blk, uint8_t out[16]) {
+  uint8_t pal[8];
+  Bc4Palette(blk, pal);
+  uint64_t bits = 0;
+  for (uint32_t i = 0; i < 6; ++i) bits |= uint64_t(blk[2 + i]) << (8 * i);
+  for (uint32_t i = 0; i < 16; ++i) out[i] = pal[(bits >> (3 * i)) & 0x7];
+}
+
+/// Decode one 4x4 block of any of the four BC formats into RGBA. ATI2 carries two channels
+/// (X in red, Y in green); the encoder below only reads those back, so the rest is filler.
+void DecodeBcBlock(D3DFORMAT fmt, const uint8_t* blk, Rgba8 out[16]) {
+  if (fmt == kFmtAti2) {
+    uint8_t x[16], y[16];
+    DecodeBc4Block(blk, x);
+    DecodeBc4Block(blk + 8, y);
+    for (uint32_t i = 0; i < 16; ++i) out[i] = {x[i], y[i], 0, 255};
+    return;
+  }
+  const uint8_t* color = fmt == D3DFMT_DXT1 ? blk : blk + 8;
+  Rgba8 pal[4];
+  Bc1Palette(color, /*punchthrough=*/fmt == D3DFMT_DXT1, pal);
+  uint32_t bits = 0;
+  for (uint32_t i = 0; i < 4; ++i) bits |= uint32_t(color[4 + i]) << (8 * i);
+  for (uint32_t i = 0; i < 16; ++i) out[i] = pal[(bits >> (2 * i)) & 0x3];
+
+  if (fmt == D3DFMT_DXT3) {
+    for (uint32_t i = 0; i < 8; ++i) {
+      out[i * 2 + 0].a = uint8_t((blk[i] & 0x0F) * 17);
+      out[i * 2 + 1].a = uint8_t((blk[i] >> 4) * 17);
+    }
+  } else if (fmt == D3DFMT_DXT5) {
+    uint8_t a[16];
+    DecodeBc4Block(blk, a);
+    for (uint32_t i = 0; i < 16; ++i) out[i].a = a[i];
+  }
+}
+
+/// Decode a whole BC image into RGBA. `row_bytes` is the stride of a *block* row.
+void DecodeBcImage(D3DFORMAT fmt, const uint8_t* src, uint32_t row_bytes, uint32_t width,
+                   uint32_t height, std::vector<Rgba8>& out) {
+  const uint32_t bpb = BcBlockBytes(fmt);
+  const uint32_t bw = (width + 3) / 4;
+  const uint32_t bh = (height + 3) / 4;
+  out.assign(size_t(width) * height, Rgba8{0, 0, 0, 255});
+  Rgba8 texels[16];
+  for (uint32_t by = 0; by < bh; ++by) {
+    for (uint32_t bx = 0; bx < bw; ++bx) {
+      DecodeBcBlock(fmt, src + size_t(by) * row_bytes + size_t(bx) * bpb, texels);
+      for (uint32_t ty = 0; ty < 4; ++ty) {
+        const uint32_t py = by * 4 + ty;
+        if (py >= height) break;
+        for (uint32_t tx = 0; tx < 4; ++tx) {
+          const uint32_t px = bx * 4 + tx;
+          if (px >= width) break;
+          out[size_t(py) * width + px] = texels[ty * 4 + tx];
+        }
+      }
+    }
+  }
+}
+
+uint16_t Pack565(Rgba8 c) {
+  return uint16_t(((c.r >> 3) << 11) | ((c.g >> 2) << 5) | (c.b >> 3));
+}
+
+/// Fit a BC1 colour block: the endpoints are the per-channel min and max of the 16 texels,
+/// and each texel takes the nearest of the four palette entries. Endpoints are forced into
+/// c0 >= c1 so the block always decodes in 4-colour mode -- a 3-colour block would introduce
+/// transparent texels that were never in the source.
+void EncodeBc1Color(const Rgba8 in[16], uint8_t* dst) {
+  Rgba8 lo = in[0], hi = in[0];
+  for (uint32_t i = 1; i < 16; ++i) {
+    lo.r = std::min(lo.r, in[i].r); hi.r = std::max(hi.r, in[i].r);
+    lo.g = std::min(lo.g, in[i].g); hi.g = std::max(hi.g, in[i].g);
+    lo.b = std::min(lo.b, in[i].b); hi.b = std::max(hi.b, in[i].b);
+  }
+  uint16_t c0 = Pack565(hi);
+  uint16_t c1 = Pack565(lo);
+  if (c0 < c1) std::swap(c0, c1);
+  dst[0] = uint8_t(c0 & 0xFF);
+  dst[1] = uint8_t(c0 >> 8);
+  dst[2] = uint8_t(c1 & 0xFF);
+  dst[3] = uint8_t(c1 >> 8);
+
+  Rgba8 pal[4];
+  Bc1Palette(dst, /*punchthrough=*/false, pal);
+  uint32_t bits = 0;
+  for (uint32_t i = 0; i < 16; ++i) {
+    uint32_t best = 0, best_err = ~0u;
+    for (uint32_t p = 0; p < 4; ++p) {
+      const int dr = int(in[i].r) - int(pal[p].r);
+      const int dg = int(in[i].g) - int(pal[p].g);
+      const int db = int(in[i].b) - int(pal[p].b);
+      const uint32_t err = uint32_t(dr * dr + dg * dg + db * db);
+      if (err < best_err) {
+        best_err = err;
+        best = p;
+      }
+    }
+    bits |= best << (2 * i);
+  }
+  for (uint32_t i = 0; i < 4; ++i) dst[4 + i] = uint8_t((bits >> (8 * i)) & 0xFF);
+}
+
+/// Fit a BC4 block over one channel, selected by `channel` (0 = R, 1 = G, 3 = A).
+void EncodeBc4(const Rgba8 in[16], uint32_t channel, uint8_t* dst) {
+  uint8_t v[16];
+  for (uint32_t i = 0; i < 16; ++i) {
+    const uint8_t* c = &in[i].r;
+    v[i] = c[channel];
+  }
+  uint8_t lo = v[0], hi = v[0];
+  for (uint32_t i = 1; i < 16; ++i) {
+    lo = std::min(lo, v[i]);
+    hi = std::max(hi, v[i]);
+  }
+  dst[0] = hi;  // a0 > a1 selects the 8-value interpolated mode
+  dst[1] = lo;
+  uint8_t pal[8];
+  Bc4Palette(dst, pal);
+  uint64_t bits = 0;
+  for (uint32_t i = 0; i < 16; ++i) {
+    uint32_t best = 0, best_err = ~0u;
+    for (uint32_t p = 0; p < 8; ++p) {
+      const int d = int(v[i]) - int(pal[p]);
+      const uint32_t err = uint32_t(d * d);
+      if (err < best_err) {
+        best_err = err;
+        best = p;
+      }
+    }
+    bits |= uint64_t(best) << (3 * i);
+  }
+  for (uint32_t i = 0; i < 6; ++i) dst[2 + i] = uint8_t((bits >> (8 * i)) & 0xFF);
+}
+
+void EncodeBcBlock(D3DFORMAT fmt, const Rgba8 in[16], uint8_t* dst) {
+  if (fmt == kFmtAti2) {
+    EncodeBc4(in, 0, dst);      // X
+    EncodeBc4(in, 1, dst + 8);  // Y
+    return;
+  }
+  if (fmt == D3DFMT_DXT3) {
+    for (uint32_t i = 0; i < 8; ++i) {
+      dst[i] = uint8_t((in[i * 2 + 0].a >> 4) | (in[i * 2 + 1].a & 0xF0));
+    }
+  } else if (fmt == D3DFMT_DXT5) {
+    EncodeBc4(in, 3, dst);
+  }
+  EncodeBc1Color(in, fmt == D3DFMT_DXT1 ? dst : dst + 8);
+}
+
+/// Encode an RGBA image back to BC. Texels past the edge of a partial block repeat the last
+/// real one, so the fit is never dragged towards whatever the padding held.
+void EncodeBcImage(D3DFORMAT fmt, const std::vector<Rgba8>& src, uint32_t width, uint32_t height,
+                   uint8_t* dst, uint32_t row_bytes) {
+  const uint32_t bpb = BcBlockBytes(fmt);
+  const uint32_t bw = (width + 3) / 4;
+  const uint32_t bh = (height + 3) / 4;
+  Rgba8 texels[16];
+  for (uint32_t by = 0; by < bh; ++by) {
+    for (uint32_t bx = 0; bx < bw; ++bx) {
+      for (uint32_t ty = 0; ty < 4; ++ty) {
+        const uint32_t py = std::min(by * 4 + ty, height - 1);
+        for (uint32_t tx = 0; tx < 4; ++tx) {
+          const uint32_t px = std::min(bx * 4 + tx, width - 1);
+          texels[ty * 4 + tx] = src[size_t(py) * width + px];
+        }
+      }
+      EncodeBcBlock(fmt, texels, dst + size_t(by) * row_bytes + size_t(bx) * bpb);
+    }
+  }
+}
+
+/// Halve an RGBA image with a 2x2 box filter (odd dimensions repeat the last row/column).
+void BoxFilterHalf(const std::vector<Rgba8>& src, uint32_t sw, uint32_t sh,
+                   std::vector<Rgba8>& dst, uint32_t dw, uint32_t dh) {
+  dst.resize(size_t(dw) * dh);
+  for (uint32_t y = 0; y < dh; ++y) {
+    const uint32_t y0 = std::min(y * 2, sh - 1);
+    const uint32_t y1 = std::min(y * 2 + 1, sh - 1);
+    for (uint32_t x = 0; x < dw; ++x) {
+      const uint32_t x0 = std::min(x * 2, sw - 1);
+      const uint32_t x1 = std::min(x * 2 + 1, sw - 1);
+      const Rgba8& a = src[size_t(y0) * sw + x0];
+      const Rgba8& b = src[size_t(y0) * sw + x1];
+      const Rgba8& c = src[size_t(y1) * sw + x0];
+      const Rgba8& d = src[size_t(y1) * sw + x1];
+      dst[size_t(y) * dw + x] = {
+          uint8_t((uint32_t(a.r) + b.r + c.r + d.r + 2) / 4),
+          uint8_t((uint32_t(a.g) + b.g + c.g + d.g + 2) / 4),
+          uint8_t((uint32_t(a.b) + b.b + c.b + d.b + 2) / 4),
+          uint8_t((uint32_t(a.a) + b.a + c.a + d.a + 2) / 4),
+      };
+    }
+  }
+}
+
 /// The per-texel byte permutation a fetch constant's channel swizzle implies, for a
 /// 32-bit format landing in D3DFMT_A8R8G8B8.
 ///
@@ -799,9 +1104,45 @@ void ResourceTracker::Initialize(IDirect3DDevice9Ex* device) {
   if (!white_) {
     REXGPU_WARN("nx1_d3d9: could not create the white fallback texture");
   }
+
+  // Register the physical-memory write-watch. It invalidates mirror pages (below) only when the
+  // guest rewrites their bytes -- the streaming pool leaves a non-resident texture's memory as
+  // transient garbage, so we snapshot-and-hold rather than re-read per draw. Mirrors the reference.
+  if (auto* mem = rex::system::kernel_state()->memory(); mem && !mem_watch_handle_) {
+    mem_watch_handle_ = mem->RegisterPhysicalMemoryInvalidationCallback(&MemWatchThunk, this);
+  }
+  // Allocate the CPU snapshot mirror of guest physical memory (lazily committed) and record the
+  // host pointer for guest physical 0, so MirrorSnapshot can copy pages out of live RAM.
+  phys_base_ = TranslatePhysical(0);
+  if (!mirror_) {
+    mirror_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, size_t(kMirrorPages) << 12,
+                                                 MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    mirror_valid_.assign((kMirrorPages + 63) / 64, 0);
+    mirror_sweep_page_ = 0;
+  }
+  REXGPU_INFO("nx1_d3d9: texture write-watch {}, mirror {}",
+              mem_watch_handle_ ? "registered" : "FAILED",
+              (mirror_ && phys_base_) ? "allocated" : "FAILED");
 }
 
 void ResourceTracker::Shutdown() {
+  if (mem_watch_handle_) {
+    if (auto* mem = rex::system::kernel_state()->memory()) {
+      mem->UnregisterPhysicalMemoryInvalidationCallback(mem_watch_handle_);
+    }
+    mem_watch_handle_ = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lk(dirty_mu_);
+    writes_pending_.clear();
+  }
+  if (mirror_) {
+    VirtualFree(mirror_, 0, MEM_RELEASE);
+    mirror_ = nullptr;
+  }
+  mirror_valid_.clear();
+  mirror_sweep_page_ = 0;
+  phys_base_ = nullptr;
   if (depth_blit_ps_) {
     depth_blit_ps_->Release();
     depth_blit_ps_ = nullptr;
@@ -1224,8 +1565,121 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   return entry.vb;
 }
 
+void ResourceTracker::LogCacheStats() {
+  if (!device_) {
+    return;
+  }
+  const size_t textures = textures_ ? static_cast<TextureMap*>(textures_)->size() : 0;
+  const size_t vbs = vertex_buffers_
+                         ? static_cast<std::unordered_map<uint64_t, VertexBufferEntry>*>(
+                               vertex_buffers_)->size()
+                         : 0;
+  const size_t ibs = index_buffers_ ? static_cast<IndexBufferMap*>(index_buffers_)->size() : 0;
+  const size_t resolves = resolves_ ? static_cast<ResolveMap*>(resolves_)->size() : 0;
+  REXGPU_INFO(
+      "nx1_d3d9: cache frame={} textures={} vb={} ib={} resolves={} | uploads={} rebuilds={} "
+      "evicted={} failures={} unsupported={} | driver texmem={} MiB",
+      frame_, textures, vbs, ibs, resolves, tex_uploads_, tex_rebuilds_, tex_evicted_,
+      tex_failures_, unsupported_texture_formats_,
+      device_->GetAvailableTextureMem() / (1024 * 1024));
+  REXGPU_INFO("nx1_d3d9: mipgen built={} auto={} skipped(no chain declared)={} skipped(fmt)={}",
+              mips_built_, mips_auto_, mips_skip_nochain_, mips_skip_unsupported_);
+}
+
+// Physical-memory write-watch callback. Runs on whatever guest thread wrote the memory, under the
+// memory system's global lock -- so it must not touch the texture cache or take the render lock.
+// It only queues the written range; DrainMemoryWrites() applies it on the render thread. The
+// returned pair is the (page-aligned) range the memory system may safely unprotect so the write
+// proceeds; returning just the touched pages is correct (other pages stay watched).
+std::pair<uint32_t, uint32_t> ResourceTracker::MemWatchThunk(void* ctx, uint32_t addr, uint32_t len,
+                                                             bool exact) {
+  return static_cast<ResourceTracker*>(ctx)->OnMemoryWrite(addr, len, exact);
+}
+
+std::pair<uint32_t, uint32_t> ResourceTracker::OnMemoryWrite(uint32_t addr, uint32_t len, bool) {
+  {
+    std::lock_guard<std::mutex> lk(dirty_mu_);
+    writes_pending_.emplace_back(addr, len);
+  }
+  const uint32_t p0 = addr & ~0xFFFu;
+  const uint32_t p1 = (addr + len + 0xFFFu) & ~0xFFFu;
+  return std::make_pair(p0, p1 - p0);
+}
+
+// Ensure [phys_addr, phys_addr+len) is captured in the mirror; return a pointer into the mirror.
+// A page is copied out of live guest RAM the first time it is requested while invalid, then held
+// (and its write-watch armed) until the guest writes it. Textures decode through this so
+// streaming-pool churn never reaches them between writes.
+const uint8_t* ResourceTracker::MirrorSnapshot(uint32_t phys_addr, uint32_t len) {
+  if (!mirror_ || !phys_base_ || uint64_t(phys_addr) + len > (uint64_t(kMirrorPages) << 12)) {
+    return TranslatePhysical(phys_addr);
+  }
+  const uint32_t p0 = phys_addr >> 12;
+  const uint32_t p1 = (phys_addr + len - 1) >> 12;
+  for (uint32_t p = p0; p <= p1; ++p) {
+    if (!(mirror_valid_[p >> 6] & (uint64_t(1) << (p & 63)))) {
+      std::memcpy(mirror_ + (size_t(p) << 12), phys_base_ + (size_t(p) << 12), 4096);
+      mirror_valid_[p >> 6] |= (uint64_t(1) << (p & 63));
+      if (auto* mem = rex::system::kernel_state()->memory()) {
+        mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
+      }
+    }
+  }
+  return mirror_ + phys_addr;
+}
+
+// Apply queued guest writes on the render thread: invalidate the mirror pages they touched so the
+// next MirrorSnapshot re-copies fresh bytes, and dirty any texture entry whose watched range
+// overlaps so it re-decodes. This is how a texture that legitimately reloads (or whose slot is
+// repurposed) picks up its new bytes, while an untouched texture is held from the churn.
+void ResourceTracker::DrainMemoryWrites() {
+  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  {
+    std::lock_guard<std::mutex> lk(dirty_mu_);
+    writes.swap(writes_pending_);
+  }
+  if (writes.empty()) return;
+  for (const auto& [addr, len] : writes) {
+    if (uint64_t(addr) + len > (uint64_t(kMirrorPages) << 12)) continue;
+    const uint32_t p0 = addr >> 12;
+    const uint32_t p1 = (addr + len - 1) >> 12;
+    for (uint32_t p = p0; p <= p1; ++p) {
+      mirror_valid_[p >> 6] &= ~(uint64_t(1) << (p & 63));  // invalidate: re-copy on next request
+    }
+  }
+  auto* textures = static_cast<TextureMap*>(textures_);
+  if (!textures) return;
+  for (auto& [key, entry] : *textures) {
+    if (!entry.watch_size) continue;
+    const uint32_t a0 = entry.watch_addr;
+    const uint32_t a1 = entry.watch_addr + entry.watch_size;
+    if (entry.committed) continue;  // settled texture: frozen against the pool's later garbage
+    for (const auto& [addr, len] : writes) {
+      if (addr < a1 && addr + len > a0) { entry.dirty = true; break; }
+    }
+  }
+}
+
 void ResourceTracker::AdvanceFrame() {
   ++frame_;
+  DrainMemoryWrites();
+
+  // Proactive early snapshot: capture physical memory into the mirror a chunk at a time over the
+  // first frames, mirroring the reference's full-buffer memexport request that snapshots memory
+  // early while textures are resident. On-demand MirrorSnapshot captures the rest; the write-watch
+  // re-captures pages as the real image streams in. ~16 MB/frame -> full 512 MB in ~2s.
+  if (mirror_ && phys_base_ && mirror_sweep_page_ < kMirrorPages) {
+    const uint32_t end = std::min(mirror_sweep_page_ + 4096, kMirrorPages);  // 4096 pages = 16 MB
+    auto* mem = rex::system::kernel_state()->memory();
+    for (uint32_t p = mirror_sweep_page_; p < end; ++p) {
+      if (!(mirror_valid_[p >> 6] & (uint64_t(1) << (p & 63)))) {
+        std::memcpy(mirror_ + (size_t(p) << 12), phys_base_ + (size_t(p) << 12), 4096);
+        mirror_valid_[p >> 6] |= (uint64_t(1) << (p & 63));
+        if (mem) mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
+      }
+    }
+    mirror_sweep_page_ = end;
+  }
 
   // Sweep periodically rather than every frame: walking the maps is O(entries), and an
   // entry only has to survive long enough that a resource used every few frames is not
@@ -1265,6 +1719,7 @@ void ResourceTracker::AdvanceFrame() {
         if (it->second.tex) it->second.tex->Release();
         if (it->second.vol) it->second.vol->Release();
         if (it->second.cube) it->second.cube->Release();
+        ++tex_evicted_;
         it = map->erase(it);
       } else {
         ++it;
@@ -1496,18 +1951,33 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // ~5000 draws x 16 samplers, so this early-out runs ~80k times a frame and everything it
   // skips is multiplied by that.
   //
-  // When the key changes, the texture object is rebuilt; the content hash further down
-  // catches in-place edits to the same layout. The swizzle is part of the key: the same
-  // memory bound with a different channel swizzle is a different texture. So is the mip
-  // chain -- it decides the host texture's level count.
+  // When the key changes, the texture object is rebuilt. The swizzle is part of the key: the
+  // same memory bound with a different channel swizzle is a different texture. mip_max_level and
+  // packed_mips are in too -- they decide our host chain's level count.
+  //
+  // mip_address is deliberately NOT in the key. The texture-streaming pool relocates a texture's
+  // mip tail as it pages memory around, so mip_address churns through many values for one and the
+  // same image (measured: a single 512x512 surface cycled its mip_address every few frames). We
+  // build our own mip chain from level 0 and never read the guest's, so mip_address describes
+  // nothing about the host texture -- folding it into the key only forced a re-decode every time
+  // the pool moved, and re-reading base_address mid-stream is what dissolved the surface into
+  // rainbow static. base_address (also the cache-map key) already identifies the texel data.
   const uint64_t layout_key = MixKey(
       MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
              MixKey((uint64_t(height) << 1) | (t.tiled ? 1 : 0), t.swizzle)),
-      MixKey(t.mip_address, (uint64_t(t.mip_max_level) << 1) | (t.packed_mips ? 1 : 0)));
+      (uint64_t(t.mip_max_level) << 1) | (t.packed_mips ? 1 : 0));
 
   const uint64_t key = MixKey(t.base_address, sampler);
   auto* map = static_cast<TextureMap*>(textures_);
   auto& entry = (*map)[key];
+  // Count clean frames toward commit (once per new frame for a stable, already-decoded texture).
+  // After kCommitFrames it is settled: DrainMemoryWrites stops honouring writes to it, so the
+  // streaming pool's later garbage-recycle can't re-poison the decode (the confetti-on-backup).
+  constexpr uint32_t kCommitFrames = 32;
+  if (entry.tex && entry.last_frame != frame_ && entry.layout_key == layout_key &&
+      !entry.committed && ++entry.good_frames >= kCommitFrames) {
+    entry.committed = true;
+  }
   // Frame-coherent reuse: same texture already uploaded/validated this frame ->
   // reuse it without re-hashing megabytes of guest memory (the dominant per-draw cost).
   if (entry.tex && entry.last_frame == frame_ && entry.layout_key == layout_key) {
@@ -1562,25 +2032,57 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // are exactly that: a DXT5A grain map, tiled hard and heavily minified. With no mips it
   // aliased its own noise, which is what filled the scope lens with coloured static. They
   // decode to A8R8G8B8, which mips like anything else.
-  const bool want_mips =
-      REXCVAR_GET(nx1_d3d9_mips) && t.mip_max_level > 0 && SupportsAutoMips(device_, host.d3d);
+  // Two ways to get a chain: let the driver filter one (uncompressed formats only), or build
+  // it here (the block-compressed ones, which the driver refuses -- see the mip-gen section).
+  //
+  // Deliberately *not* gated on the guest's mip_max_level. A texture whose fetch constant
+  // declares no chain is not a texture that must not be filtered -- it is one whose mips never
+  // arrived, because this build has no imagefile to stream them from. On the console those same
+  // surfaces have mips and are filtered; honouring the declaration reproduced a statement the
+  // guest only makes because its data is missing, and left ~10% of the world aliasing. We
+  // filter from level 0 regardless, so the guest's chain is not something we need.
+  const bool auto_mips = SupportsAutoMips(device_, host.d3d);
+  const bool bc_mips = IsBlockCompressed(host.d3d);
+  const bool want_mips = REXCVAR_GET(nx1_d3d9_mips) && (auto_mips || bc_mips);
+  const bool build_mips = want_mips && !auto_mips;
+  const uint32_t levels = build_mips ? BcMipLevels(t.width, height) : 1;
 
-  const uint8_t* src = TranslatePhysical(t.base_address);
+  // Track how each texture's mip chain is provided (built here / driver auto-gen / skipped), so the
+  // periodic "mipgen" stats line can show the split across the whole run.
+  if (build_mips) {
+    ++mips_built_;
+  } else if (want_mips) {
+    ++mips_auto_;
+  } else if (t.mip_max_level == 0) {
+    ++mips_skip_nochain_;
+  } else {
+    ++mips_skip_unsupported_;
+  }
+
   const size_t guest_bytes = size_t(extent.block_pitch_h) * extent.block_pitch_v * bpb;
-  const uint64_t content_hash = XXH3_64bits(src, guest_bytes);
-  if (entry.tex && entry.layout_key == layout_key && entry.content_hash == content_hash) {
+  // Decode from the CPU snapshot mirror, NOT live guest RAM. The mirror captured these bytes while
+  // the texture was resident (early sweep / first touch) and holds them; live RAM would have the
+  // streaming pool's transient fill by now, which is the confetti. entry.dirty (set by the write-
+  // watch, via DrainMemoryWrites, when the guest rewrites this texture) is what forces a fresh
+  // decode from the re-snapshotted mirror.
+  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
+  if (entry.tex && entry.layout_key == layout_key && !entry.dirty) {
     return entry.tex;
   }
   if (entry.tex && entry.layout_key != layout_key) {
     entry.tex->Release();
     entry.tex = nullptr;
+    ++tex_rebuilds_;
+    // A different texture now occupies this key -- restart its warm-up before it re-commits.
+    entry.good_frames = 0;
+    entry.committed = false;
   }
 
   // IDirect3DDevice9Ex has no D3DPOOL_MANAGED. Fill a lockable SYSTEMMEM staging
   // texture with level 0 and UpdateTexture it into a DEFAULT texture that can be sampled.
   IDirect3DTexture9* staging = nullptr;
-  if (FAILED(device_->CreateTexture(t.width, height, 1, 0, host.d3d, D3DPOOL_SYSTEMMEM, &staging,
-                                    nullptr))) {
+  if (FAILED(device_->CreateTexture(t.width, height, levels, 0, host.d3d, D3DPOOL_SYSTEMMEM,
+                                    &staging, nullptr))) {
     REXGPU_ERROR("nx1_d3d9: staging CreateTexture({}x{}, fmt {}) failed", t.width, height,
                  t.format);
     return nullptr;
@@ -1616,32 +2118,64 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       }
     }
   }
+
+  // Filter the chain down from the level 0 we just wrote, while it is still mapped: decode it
+  // once, then halve-and-re-encode into each level below. UpdateTexture carries the whole
+  // staging chain across, so the levels have to be in place before the unlock.
+  if (build_mips && dst) {
+    std::vector<Rgba8> cur, next;
+    DecodeBcImage(host.d3d, dst, dst_row_bytes, t.width, height, cur);
+    for (uint32_t level = 1; level < levels; ++level) {
+      const uint32_t lw = std::max(1u, t.width >> level);
+      const uint32_t lh = std::max(1u, height >> level);
+      BoxFilterHalf(cur, std::max(1u, t.width >> (level - 1)),
+                    std::max(1u, height >> (level - 1)), next, lw, lh);
+
+      D3DLOCKED_RECT mip;
+      if (SUCCEEDED(staging->LockRect(level, &mip, nullptr, 0)) && mip.pBits) {
+        const uint32_t mip_row_bytes = host.opaque_block
+                                           ? ((lw + 3) / 4) * BcBlockBytes(host.d3d)
+                                           : uint32_t(mip.Pitch);
+        EncodeBcImage(host.d3d, next, lw, lh, static_cast<uint8_t*>(mip.pBits), mip_row_bytes);
+        staging->UnlockRect(level);
+      }
+      cur.swap(next);
+    }
+  }
   staging->UnlockRect(0);
 
-  // A D3DUSAGE_AUTOGENMIPMAP texture reports a single level and keeps its sub-levels to
-  // itself: UpdateTexture writes level 0 and the driver filters the rest down from it.
+  // D3DUSAGE_AUTOGENMIPMAP reports a single level and keeps its sub-levels to itself: the
+  // driver filters them down from the level 0 UpdateTexture writes. A chain we built ourselves
+  // is the ordinary case instead -- real levels on both textures, copied across as they are.
   if (!entry.tex &&
-      FAILED(device_->CreateTexture(t.width, height, want_mips ? 0 : 1,
-                                    want_mips ? D3DUSAGE_AUTOGENMIPMAP : 0, host.d3d,
+      FAILED(device_->CreateTexture(t.width, height, auto_mips && want_mips ? 0 : levels,
+                                    auto_mips && want_mips ? D3DUSAGE_AUTOGENMIPMAP : 0, host.d3d,
                                     D3DPOOL_DEFAULT, &entry.tex, nullptr))) {
     REXGPU_ERROR("nx1_d3d9: CreateTexture({}x{}, fmt {}) failed", t.width, height, t.format);
     staging->Release();
     entry.tex = nullptr;
+    ++tex_failures_;
     return nullptr;
   }
   if (FAILED(device_->UpdateTexture(staging, entry.tex))) {
     REXGPU_ERROR("nx1_d3d9: UpdateTexture({}x{}, fmt {}) failed", t.width, height, t.format);
     staging->Release();
+    ++tex_failures_;
     return nullptr;
   }
   staging->Release();
-  if (want_mips) {
+  ++tex_uploads_;
+  if (want_mips && auto_mips) {
     entry.tex->SetAutoGenFilterType(D3DTEXF_LINEAR);
     entry.tex->GenerateMipSubLevels();
   }
 
   entry.layout_key = layout_key;
-  entry.content_hash = content_hash;
+  entry.dirty = false;
+  // Record the guest byte range so DrainMemoryWrites can dirty this entry when the guest rewrites
+  // it. The mirror itself armed the write-watch when it captured these pages in MirrorSnapshot.
+  entry.watch_addr = t.base_address;
+  entry.watch_size = uint32_t(guest_bytes);
   return entry.tex;
 }
 
@@ -1806,9 +2340,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
   }
   entry.last_frame = frame_;
 
-  const uint8_t* src = TranslatePhysical(t.base_address);
   const size_t guest_bytes =
       size_t(extent.block_pitch_h) * extent.block_pitch_v * std::max(1u, t.depth) * bpb;
+  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
   const uint64_t content_hash = XXH3_64bits(src, guest_bytes);
   if (entry.vol && entry.layout_key == layout_key && entry.content_hash == content_hash) {
     return entry.vol;
@@ -1901,7 +2435,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetCubeTexture(const TextureFetchConstan
   }
   entry.last_frame = frame_;
 
-  const uint8_t* src = TranslatePhysical(t.base_address);
+  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(size_t(face_stride) * 6));
   const uint64_t content_hash = XXH3_64bits(src, size_t(face_stride) * 6);
   if (entry.cube && entry.layout_key == layout_key && entry.content_hash == content_hash) {
     return entry.cube;
@@ -1911,8 +2445,17 @@ IDirect3DBaseTexture9* ResourceTracker::GetCubeTexture(const TextureFetchConstan
     entry.cube = nullptr;
   }
 
+  // A cube map needs its chain as much as any 2D texture -- more, in fact. These are the
+  // environment reflections: the vector into them swings across most of a face from one pixel
+  // to the next on a surface seen at a distance, so an unfiltered cube map returns a different
+  // corner of the sky per pixel. That is the coloured sparkle, and no 2D mip chain touches it.
+  const bool auto_mips = SupportsAutoMips(device_, host.d3d);
+  const bool build_mips = REXCVAR_GET(nx1_d3d9_mips) && !auto_mips && IsBlockCompressed(host.d3d);
+  const bool want_mips = REXCVAR_GET(nx1_d3d9_mips) && (auto_mips || build_mips);
+  const uint32_t levels = build_mips ? BcMipLevels(t.width, t.width) : 1;
+
   IDirect3DCubeTexture9* staging = nullptr;
-  if (FAILED(device_->CreateCubeTexture(t.width, 1, 0, host.d3d, D3DPOOL_SYSTEMMEM, &staging,
+  if (FAILED(device_->CreateCubeTexture(t.width, levels, 0, host.d3d, D3DPOOL_SYSTEMMEM, &staging,
                                         nullptr))) {
     REXGPU_ERROR("nx1_d3d9: staging CreateCubeTexture({}, fmt {}) failed", t.width, t.format);
     return nullptr;
@@ -1920,26 +2463,51 @@ IDirect3DBaseTexture9* ResourceTracker::GetCubeTexture(const TextureFetchConstan
   // Xenos face order is D3D's: +X, -X, +Y, -Y, +Z, -Z. Each face is an ordinary tiled 2D
   // image, so the 2D detiler handles it -- only the base pointer moves.
   for (uint32_t face = 0; face < 6; ++face) {
+    const D3DCUBEMAP_FACES d3d_face = D3DCUBEMAP_FACES(D3DCUBEMAP_FACE_POSITIVE_X + face);
     D3DLOCKED_RECT locked;
-    if (FAILED(staging->LockRect(D3DCUBEMAP_FACES(D3DCUBEMAP_FACE_POSITIVE_X + face), 0, &locked,
-                                 nullptr, 0))) {
+    if (FAILED(staging->LockRect(d3d_face, 0, &locked, nullptr, 0))) {
       staging->Release();
       return nullptr;
     }
     auto* dst = static_cast<uint8_t*>(locked.pBits);
-    DetileMip2D(dst, uint32_t(locked.Pitch), src + size_t(face) * face_stride, extent, bpb,
-                t.endian, t.tiled);
+    // As in the 2D path, an unrecognised block FourCC (DXN) reports a pitch of one byte per
+    // texel rather than the block row it has to hold.
+    const uint32_t dst_row_bytes =
+        host.opaque_block ? extent.block_width * bpb : uint32_t(locked.Pitch);
+    DetileMip2D(dst, dst_row_bytes, src + size_t(face) * face_stride, extent, bpb, t.endian,
+                t.tiled);
     const Swizzle32 swz = MakeSwizzle32(t.swizzle);
     if (host.swizzle32 && !swz.identity) {
       for (uint32_t by = 0; by < extent.block_height; ++by) {
-        SwizzleRow32(dst + size_t(by) * locked.Pitch, extent.block_width, swz);
+        SwizzleRow32(dst + size_t(by) * dst_row_bytes, extent.block_width, swz);
       }
     }
-    staging->UnlockRect(D3DCUBEMAP_FACES(D3DCUBEMAP_FACE_POSITIVE_X + face), 0);
+
+    if (build_mips) {
+      std::vector<Rgba8> cur, next;
+      DecodeBcImage(host.d3d, dst, dst_row_bytes, t.width, t.width, cur);
+      for (uint32_t level = 1; level < levels; ++level) {
+        const uint32_t ls = std::max(1u, t.width >> level);
+        BoxFilterHalf(cur, std::max(1u, t.width >> (level - 1)),
+                      std::max(1u, t.width >> (level - 1)), next, ls, ls);
+        D3DLOCKED_RECT mip;
+        if (SUCCEEDED(staging->LockRect(d3d_face, level, &mip, nullptr, 0)) && mip.pBits) {
+          const uint32_t mip_row_bytes = host.opaque_block
+                                             ? ((ls + 3) / 4) * BcBlockBytes(host.d3d)
+                                             : uint32_t(mip.Pitch);
+          EncodeBcImage(host.d3d, next, ls, ls, static_cast<uint8_t*>(mip.pBits), mip_row_bytes);
+          staging->UnlockRect(d3d_face, level);
+        }
+        cur.swap(next);
+      }
+    }
+    staging->UnlockRect(d3d_face, 0);
   }
 
-  if (!entry.cube && FAILED(device_->CreateCubeTexture(t.width, 1, 0, host.d3d, D3DPOOL_DEFAULT,
-                                                       &entry.cube, nullptr))) {
+  if (!entry.cube &&
+      FAILED(device_->CreateCubeTexture(t.width, auto_mips && want_mips ? 0 : levels,
+                                        auto_mips && want_mips ? D3DUSAGE_AUTOGENMIPMAP : 0,
+                                        host.d3d, D3DPOOL_DEFAULT, &entry.cube, nullptr))) {
     REXGPU_ERROR("nx1_d3d9: CreateCubeTexture({}, fmt {}) failed", t.width, t.format);
     staging->Release();
     entry.cube = nullptr;
@@ -1950,6 +2518,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetCubeTexture(const TextureFetchConstan
   if (FAILED(hr)) {
     REXGPU_ERROR("nx1_d3d9: UpdateTexture(cube {}, fmt {}) failed", t.width, t.format);
     return nullptr;
+  }
+  if (want_mips && auto_mips) {
+    entry.cube->SetAutoGenFilterType(D3DTEXF_LINEAR);
+    entry.cube->GenerateMipSubLevels();
   }
   entry.layout_key = layout_key;
   entry.content_hash = content_hash;

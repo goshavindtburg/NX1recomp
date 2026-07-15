@@ -296,6 +296,11 @@ struct TextureFetchConstant {
   uint32_t mag_filter;
   uint32_t min_filter;
   uint32_t mip_filter;
+  /// xenos::AnisoFilter: 0 = off, 1..5 = max 1:1, 2:1, 4:1, 8:1, 16:1. NX1 leans on this --
+  /// half its binds ask for a *point* mip filter, which on Xenos is not the crude choice it
+  /// looks like: aniso is what keeps a grazing surface from shimmering, and the mip step is
+  /// only there to bound the work. Ignoring the field left plain bilinear behind it.
+  uint32_t aniso_filter;
   /// The mip chain the guest declares. Note the renderer does NOT read the guest's mip
   /// levels: for most textures the memory at mip_address holds a different image entirely
   /// (a streaming pool this build never fills), so the host filters its own chain down from
@@ -330,6 +335,7 @@ inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint
   t.mag_filter = (d3 >> 19) & 0x3;
   t.min_filter = (d3 >> 21) & 0x3;
   t.mip_filter = (d3 >> 23) & 0x3;
+  t.aniso_filter = (d3 >> 25) & 0x7;
   t.mip_min_level = (d4 >> 2) & 0xF;
   t.mip_max_level = (d4 >> 6) & 0xF;
   t.packed_mips = ((d5 >> 11) & 0x1) != 0;

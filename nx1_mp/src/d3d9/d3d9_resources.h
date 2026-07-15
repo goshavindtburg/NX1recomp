@@ -20,6 +20,8 @@
 #include <cstdint>
 
 #ifdef _WIN32
+#include <mutex>
+#include <utility>
 #include <vector>
 
 #include <d3d9.h>
@@ -200,6 +202,13 @@ class ResourceTracker {
 
   void SetBackbuffer(IDirect3DSurface9* surface, uint32_t width, uint32_t height);
 
+  /// Size, churn and remaining driver texture memory, for the frame heartbeat. Textures are
+  /// the only resource the renderer both allocates unboundedly and evicts, so when the image
+  /// looks wrong it is worth being able to see the cache's trend rather than infer one from
+  /// screenshots -- an entry count that oscillates with the scene is healthy; one that only
+  /// grows, or a nonzero failure count, is not.
+  void LogCacheStats();
+
  private:
   ResourceTracker() = default;
   ~ResourceTracker() { Shutdown(); }
@@ -219,6 +228,38 @@ class ResourceTracker {
   /// "fully occluded / fully shadowed" and shades the whole world black; white reads
   /// as "far / nothing occluding", so lighting resolves to unshadowed instead.
   IDirect3DTexture9* white_ = nullptr;
+
+  // Physical-memory write-watch. We snapshot a texture's guest bytes into the mirror once and
+  // re-read them only when the guest actually writes them, mirroring the reference backend. The
+  // callback fires on whatever guest thread wrote the memory (not the render thread) and under the
+  // memory global lock, so it must NOT touch the texture cache -- it only queues the written range,
+  // which DrainMemoryWrites() applies from AdvanceFrame on the render thread.
+  void* mem_watch_handle_ = nullptr;  ///< RegisterPhysicalMemoryInvalidationCallback handle
+  std::mutex dirty_mu_;               ///< guards writes_pending_
+  std::vector<std::pair<uint32_t, uint32_t>> writes_pending_;  ///< (phys_addr, len) queued by callback
+  void DrainMemoryWrites();  ///< apply queued guest writes: invalidate mirror pages, dirty entries
+  static std::pair<uint32_t, uint32_t> MemWatchThunk(void* ctx, uint32_t addr, uint32_t len,
+                                                     bool exact);
+  std::pair<uint32_t, uint32_t> OnMemoryWrite(uint32_t addr, uint32_t len, bool exact);
+
+  // CPU snapshot mirror of guest physical memory. Textures decode from THIS, not from live guest
+  // RAM. On this build the streaming pool leaves a texture's bytes valid only transiently (streamed
+  // in early, overwritten with fill later), so reading live memory at first-draw gets garbage. We
+  // capture each page the first time it is touched -- and proactively via an early sweep, mirroring
+  // the reference SharedMemory's full-buffer memexport request -- then HOLD it, refreshing a page
+  // only when the guest actually writes it. Snapshot-and-hold is the only thing that renders these
+  // streamed textures cleanly; it is exactly what the reference backend does.
+  uint8_t* mirror_ = nullptr;         ///< 512 MB VirtualAlloc, lazily committed
+  const uint8_t* phys_base_ = nullptr;///< host pointer for guest physical 0
+  std::vector<uint64_t> mirror_valid_;///< 1 bit per 4 KB page: captured and held
+  uint32_t mirror_sweep_page_ = 0;    ///< proactive early-sweep cursor
+  static constexpr uint32_t kMirrorPages = 0x20000000u >> 12;  ///< 512 MB / 4 KB
+  /// Ensure [phys_addr, phys_addr+len) is captured in the mirror and return a pointer into it. A
+  /// page is copied out of live guest RAM the first time it is requested while invalid, then held
+  /// (and its write-watch armed) until the guest writes it. Falls back to live memory if out of
+  /// range or the mirror is unavailable.
+  const uint8_t* MirrorSnapshot(uint32_t phys_addr, uint32_t len);
+
   void* layouts_ = nullptr;        ///< std::unordered_map<uint64_t, VertexLayout>*
   void* vertex_buffers_ = nullptr; ///< std::unordered_map<uint64_t, VertexBufferEntry>*
   void* vertex_hashes_ = nullptr;  ///< std::unordered_map<uint64_t, VertexHash>*
@@ -234,6 +275,14 @@ class ResourceTracker {
   uint64_t unsupported_formats_ = 0;
   uint64_t unsupported_texture_formats_ = 0;
   uint64_t frame_ = 0;  ///< bumped by AdvanceFrame; gates frame-coherent resource reuse
+  uint64_t tex_uploads_ = 0;    ///< level-0 uploads (new texture or content changed)
+  uint64_t tex_rebuilds_ = 0;   ///< layout changed -> host texture recreated
+  uint64_t tex_failures_ = 0;   ///< CreateTexture/UpdateTexture failed
+  uint64_t tex_evicted_ = 0;    ///< released by the age sweep
+  uint64_t mips_built_ = 0;            ///< chain generated here (block-compressed)
+  uint64_t mips_auto_ = 0;             ///< chain left to the driver (uncompressed)
+  uint64_t mips_skip_nochain_ = 0;     ///< guest declares mip_max_level == 0
+  uint64_t mips_skip_unsupported_ = 0; ///< no autogen and not block-compressed
 };
 
 /// D3DPT_* on the Xbox 360 is the raw Xenos PrimitiveType, which agrees with the

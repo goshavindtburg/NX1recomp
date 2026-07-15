@@ -211,8 +211,10 @@ class Renderer {
   // InvalidateSamplerShadow() -- ResourceTracker's depth blit does exactly that on sampler
   // 0, and silently desyncing the shadow against it corrupted every later draw that
   // happened to want the texture the shadow still believed was bound.
-  static constexpr uint32_t kSamplerStates = 6;  ///< U, V, W address + mag, min, mip filter
+  static constexpr uint32_t kSamplerStates = 7;  ///< U, V, W address + mag, min, mip filter, aniso
   static constexpr uint32_t kSamplerStateUnset = ~0u;
+  /// Clamped to the adapter's D3DCAPS9::MaxAnisotropy at device creation; 1 = no aniso.
+  uint32_t max_anisotropy_ = 1;
   static inline IDirect3DBaseTexture9* const kSamplerTextureUnknown =
       reinterpret_cast<IDirect3DBaseTexture9*>(~uintptr_t(0));
   IDirect3DBaseTexture9* sampler_texture_[16];

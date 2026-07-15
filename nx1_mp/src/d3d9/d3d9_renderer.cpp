@@ -190,6 +190,15 @@ bool Renderer::Initialize(HWND reference_window) {
   current_rt_height_ = pp.BackBufferHeight;
   REXGPU_INFO("nx1_d3d9: device created ({}x{})", pp.BackBufferWidth, pp.BackBufferHeight);
 
+  // The guest asks for anisotropy per sampler, but the Xenos ratios go to 16:1 and a host
+  // adapter is free to cap lower -- MAXANISOTROPY above MaxAnisotropy is an invalid state.
+  D3DCAPS9 caps = {};
+  if (SUCCEEDED(device_->GetDeviceCaps(&caps)) &&
+      (caps.TextureFilterCaps & D3DPTFILTERCAPS_MINFANISOTROPIC)) {
+    max_anisotropy_ = caps.MaxAnisotropy < 1 ? 1 : caps.MaxAnisotropy;
+  }
+  REXGPU_INFO("nx1_d3d9: max anisotropy {}", max_anisotropy_);
+
   if (!ShaderCache::Get().Initialize(device_)) {
     REXGPU_ERROR("nx1_d3d9: shader cache unavailable; every draw would miss");
     Shutdown();
@@ -308,7 +317,7 @@ void Renderer::Present() {
   if (++frames_presented_ % 600 == 0) {
     REXGPU_INFO("nx1_d3d9: frame {}, draws {}/{} submitted, {} shader-cache misses",
                 frames_presented_, draws_submitted_, draws_attempted_, shader_cache_misses_);
-
+    ResourceTracker::Get().LogCacheStats();
   }
 
   // The window's messages are pumped on its own thread (see WindowThreadMain), so
@@ -707,6 +716,58 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     UploadVertexUniforms(HostConstantCount(*vs));
   }
 
+  // EXPERIMENT: replace every colour pixel shader with a flat mid-grey output. This keeps the
+  // geometry, depth and vertex path exactly as-is but removes all texture sampling and lighting
+  // math. If the speckle vanishes it lives in the pixel shader (texture/lighting); if it
+  // survives a flat-shaded world it is geometry/edge aliasing and only MSAA will touch it.
+  static IDirect3DPixelShader9* debug_ps = nullptr;
+  static bool debug_ps_tried = false;
+  if (!debug_ps_tried) {
+    debug_ps_tried = true;
+    // Solid colour keyed to sampler 0's Xenos texture format (set as c0 per draw), so the
+    // garbage surface reveals which format it uses.
+    const char* kSrc =
+        "float4 g : register(c0);\n"
+        "float4 main() : COLOR { return g; }";
+    ID3DBlob* code = nullptr;
+    if (SUCCEEDED(D3DCompile(kSrc, strlen(kSrc), nullptr, nullptr, nullptr, "main", "ps_3_0", 0, 0,
+                             &code, nullptr)) &&
+        code) {
+      device_->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &debug_ps);
+      code->Release();
+    }
+  }
+  // Only flatten the offscreen world passes, not the fullscreen composite/tonemap that samples
+  // them: the composite renders to the display-sized target, the world to a smaller one.
+  const bool offscreen = current_rt_width_ != backbuffer_width_ ||
+                         current_rt_height_ != backbuffer_height_;
+  if (false && ps && debug_ps && offscreen) {
+    // Legend (Xenos format -> colour): 18 DXT1 red, 20 DXT5 green, 49 DXN blue, 58 DXT3A yellow,
+    // 59 DXT5A orange, 6 8888 magenta, 10 A8L8 cyan, 2 L8 white, anything else grey.
+    const uint32_t fmt = ReadTextureFetchConstant(base, guest_device, 0).format;
+    static uint32_t legend_logged = 0;
+    float c[4] = {0.5f, 0.5f, 0.5f, 1.0f};
+    switch (fmt) {
+      case 18: c[0] = 1; c[1] = 0; c[2] = 0; break;      // DXT1 red
+      case 20: c[0] = 0; c[1] = 1; c[2] = 0; break;      // DXT5 green
+      case 49: c[0] = 0; c[1] = 0; c[2] = 1; break;      // DXN blue
+      case 58: c[0] = 1; c[1] = 1; c[2] = 0; break;      // DXT3A yellow
+      case 59: c[0] = 1; c[1] = 0.5f; c[2] = 0; break;   // DXT5A orange
+      case 6:  c[0] = 1; c[1] = 0; c[2] = 1; break;      // 8888 magenta
+      case 10: c[0] = 0; c[1] = 1; c[2] = 1; break;      // A8L8 cyan
+      case 2:  c[0] = 1; c[1] = 1; c[2] = 1; break;      // L8 white
+      default:
+        if (legend_logged++ < 40) {
+          REXGPU_INFO("nx1_d3d9: debug fmt {} -> grey (unlisted)", fmt);
+        }
+        break;
+    }
+    device_->SetPixelShader(debug_ps);
+    device_->SetPixelShaderConstantF(0, c, 1);
+    device_->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    return true;
+  }
+
   device_->SetPixelShader(ps ? ps->ps : nullptr);
   // A draw with no pixel shader is a depth/shadow-only pass: the Xbox exports no
   // color, so nothing is written to the render target. On D3D9, SetPixelShader(null)
@@ -776,15 +837,28 @@ D3DTEXTUREFILTERTYPE HostFilter(uint32_t xenos_filter) {
   return xenos_filter == 0 ? D3DTEXF_POINT : D3DTEXF_LINEAR;
 }
 
-// The mip filter has one more state than the mag/min ones: xenos::TextureFilter::kBaseMap
-// (2) means "sample the base level and no other", which on D3D9 is D3DTEXF_NONE rather
-// than a filter mode. Folding it into LINEAR would mip a texture the guest asked not to.
+// The mip filter has one more state than the mag/min ones: xenos::TextureFilter::kBaseMap (2)
+// means "sample the base level and no other", which on D3D9 is D3DTEXF_NONE rather than a
+// filter mode.
+//
+// We do not honour it. The guest asks for base-map-only on exactly the textures whose mips
+// never streamed in -- this build has no imagefile to stream them from -- so pairing it with
+// the chains we generate ourselves left those surfaces reading level 0 at any distance,
+// aliasing into coloured speckle. On the console they have mips and are filtered, which is what
+// the scene was authored for. For a texture that genuinely has one level this is a no-op.
 D3DTEXTUREFILTERTYPE HostMipFilter(uint32_t xenos_filter) {
-  switch (xenos_filter) {
-    case 0:  return D3DTEXF_POINT;
-    case 2:  return D3DTEXF_NONE;
-    default: return D3DTEXF_LINEAR;
+  return xenos_filter == 0 ? D3DTEXF_POINT : D3DTEXF_LINEAR;
+}
+
+/// The maximum anisotropy the guest is asking for: xenos::AnisoFilter counts ratios, not
+/// samples -- 0 = disabled, then 1:1, 2:1, 4:1, 8:1, 16:1. Anything above the adapter's cap
+/// is an invalid sampler state, so clamp.
+uint32_t HostMaxAnisotropy(uint32_t xenos_aniso, uint32_t device_max) {
+  if (xenos_aniso == 0 || xenos_aniso > 5) {
+    return 1;  // disabled, or kUseFetchConst (7) leaking out of a shader-side field
   }
+  const uint32_t ratio = 1u << (xenos_aniso - 1);
+  return ratio > device_max ? device_max : ratio;
 }
 
 // xenos::CompareFunction (0..7) maps 1:1 onto D3DCMPFUNC shifted by one.
@@ -888,14 +962,23 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device) {
     }
     const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, sampler);
     const SamplerClampModes clamp = ReadSamplerClampModes(base, guest_device, sampler);
+    // Anisotropy is minification-only, so it replaces the min filter and nothing else. Half of
+    // NX1's binds ask for a point *mip* filter, which is only sane on hardware that filters
+    // anisotropically underneath it: without aniso that is bilinear plus a hard mip step, and
+    // every grazing surface -- floors, walls, foliage at distance -- shimmers.
+    const uint32_t aniso = HostMaxAnisotropy(t.aniso_filter, max_anisotropy_);
+    const D3DTEXTUREFILTERTYPE min_filter =
+        aniso > 1 ? D3DTEXF_ANISOTROPIC : HostFilter(t.min_filter);
     const uint32_t states[kSamplerStates] = {
         uint32_t(HostAddressMode(clamp.u)), uint32_t(HostAddressMode(clamp.v)),
         uint32_t(HostAddressMode(clamp.w)), uint32_t(HostFilter(t.mag_filter)),
-        uint32_t(HostFilter(t.min_filter)), uint32_t(HostMipFilter(t.mip_filter)),
+        uint32_t(min_filter),               uint32_t(HostMipFilter(t.mip_filter)),
+        aniso,
     };
     static constexpr D3DSAMPLERSTATETYPE kTypes[kSamplerStates] = {
         D3DSAMP_ADDRESSU,  D3DSAMP_ADDRESSV,  D3DSAMP_ADDRESSW,
         D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+        D3DSAMP_MAXANISOTROPY,
     };
     for (uint32_t i = 0; i < kSamplerStates; ++i) {
       if (states[i] != sampler_state_[sampler][i]) {
