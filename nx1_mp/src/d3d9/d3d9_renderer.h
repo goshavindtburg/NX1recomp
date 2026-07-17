@@ -35,6 +35,8 @@
 
 namespace nx1::d3d9 {
 
+struct Sm3Shader;
+
 /// True when the native D3D9 renderer should service guest D3D calls.
 /// Backed by the `nx1_d3d9` cvar; read once at startup.
 bool IsEnabled();
@@ -137,12 +139,14 @@ class Renderer {
   /// effect and stashes ndc_scale_/ndc_offset_ for UploadVertexUniforms.
   void ResolveViewport(const uint8_t* base, uint32_t guest_device);
   /// Upload the packed NDC/half-pixel params a vertex shader expects at c[base_reg].
-  void UploadVertexUniforms(uint32_t base_reg);
+  /// Skips registers in the shader's def mask (see Sm3Shader::def_mask).
+  void UploadVertexUniforms(const Sm3Shader& shader, uint32_t base_reg);
   /// Upload the alpha-test uniforms a pixel shader expects at c[base_reg], c[base_reg+1].
-  /// `needs_inv_tex_dim` gates the g_InvTexDim[16] block: uploading it to a shader that never
-  /// declared it overwrites the shader's own `def` literals (see ReadsUndefinedConstRange).
-  void UploadPixelUniforms(uint32_t base_reg, bool needs_inv_tex_dim, const uint8_t* base,
-                           uint32_t guest_device);
+  /// `needs_inv_tex_dim` gates the g_InvTexDim[16] block. Every write skips registers in the
+  /// shader's def mask: fxc parks `def` literals in ANY declared register whose uses were
+  /// optimized away -- writing over one poisons every flattened cmp in the shader.
+  void UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg, bool needs_inv_tex_dim,
+                           const uint8_t* base, uint32_t guest_device);
 
   Renderer() = default;
   ~Renderer() { Shutdown(); }

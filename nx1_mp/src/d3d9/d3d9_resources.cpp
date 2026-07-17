@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
+#include <mutex>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -35,17 +37,24 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // TEMP DIAGNOSTIC (no shadows)
-// Mind the polarity -- the obvious reading is backwards and cost a long detour. A tap is
-// consumed as `sge r14, r4.zzzz, r14` => `(frag_z >= atlas_z) ? 1 : 0`, where 1 means OCCLUDED,
-// and fragment light-space depths are ~0.45. So:
-//     100 (atlas = 1.0) => 0.45 >= 1.0 is false => nothing occluded => fully LIT (looks
-//                          identical to a broken shadow path -- useless as a test)
-//       0 (atlas = 0.0) => 0.45 >= 0.0 is true  => everything occluded => world goes DARK
-// 0 is the test that tells you whether the shadow path is live.
+// Polarity, anchored EMPIRICALLY this time (nx1_d3d9_dbg_shadow=16 screenshot, 2026-07-17):
+// a tap is `sge r14, r4.zzzz, r14` => (frag_z >= atlas_z) ? 1 : 0, and on screen 1 renders as
+// LIT (white dominates open ground; the black shapes are where geometry casts). Fragment
+// depths are ~0.48 and the atlas background clears to 0, so a lookup that misses everything
+// lands on 0 => z >= 0 => lit, a sensible default. Therefore:
+//       0 (atlas = 0.0) => every tap 1 => fully lit  => looks like the status quo (null test)
+//     100 (atlas = 1.0) => every tap 0 => fully SHADOWED => the world must DARKEN by exactly
+//                          the sun term's visible contribution
+//     200 => flicker 0.0 <-> 1.0 every 500 ms. The two constants bracket every fragment
+//            depth, so all taps flip lit<->shadowed together: if the sun-shadow term reaches
+//            the frame at all, the whole world pulses. Separate 0-vs-100 runs (different
+//            scene, eyeballed stills) can hide a uniform dim; a pulse cannot be missed.
+// This note has been rewritten twice with opposite conclusions derived from the microcode --
+// trust the mode-16 screenshot, not re-derivation.
 REXCVAR_DEFINE_INT32(nx1_d3d9_shadow_test, -1, "GPU",
                      "Debug: replace shadow-atlas depth with a constant (value/100). -1 = off, "
-                     "0 = everything occluded (world must go fully shadowed if the shadow path "
-                     "is live), 100 = nothing occluded.");
+                     "0 = fully lit (null test), 100 = fully shadowed (world must darken), "
+                     "200 = flicker between the two every 500 ms.");
 
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dump_shadow, false, "GPU",
                     "Debug: dump each shadow-atlas resolve to texdump/shadow_atlas_*.bmp.");
@@ -1632,6 +1641,57 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   }
   entry.vb->Unlock();
 
+  // TEMP DIAGNOSTIC (no sun shadows): check the packed-normal decode CONTRACT.
+  //
+  // XenosRecomp deletes the decode from the shader -- `tfetchR11G11B10(x)` -> `x`, commented
+  // "Normal decode moves to the vertex-upload path" -- and trusts THIS code to hand the shader a
+  // decoded, unit-length normal. Nothing verifies that, and the world lighting does
+  //     sun = saturate(dot(normal, sunDir)) * sunColour;  oC0 = sun * shadow + ambient
+  // so a bad normal reads as "lit but flat, no sun shadows" -- precisely the open bug. A mean
+  // length of ~1.0 clears the decode; ~0 or wildly off is the answer.
+  {
+    static std::mutex nm;
+    static std::vector<uint64_t> nseen;
+    for (const ConvertOp& op : layout.ops) {
+      if (op.stream != stream || !op.expand) {
+        continue;
+      }
+      if (op.format != kFmt_11_11_10 && op.format != kFmt_10_11_11 &&
+          op.format != kFmt_2_10_10_10) {
+        continue;  // the three packed formats the renderer maps to NORMAL/TANGENT/BINORMAL
+      }
+      const uint64_t key = (uint64_t(op.format) << 40) ^ (uint64_t(op.src_offset) << 16) ^
+                           uint64_t(guest_stride);
+      std::lock_guard<std::mutex> lk(nm);
+      if (std::find(nseen.begin(), nseen.end(), key) != nseen.end() || nseen.size() >= 8) {
+        continue;
+      }
+      nseen.push_back(key);
+      char b[512];
+      int n = std::snprintf(b, sizeof(b),
+                            "nx1_d3d9: VTXNORMAL fmt=%u off=%u signed=%u norm=%u stride=%u |",
+                            op.format, op.src_offset, op.is_signed ? 1u : 0u,
+                            op.is_normalized ? 1u : 0u, guest_stride);
+      double sum_len = 0.0;
+      uint32_t taken = 0;
+      const uint32_t step = count > 6 ? count / 6 : 1;
+      for (uint32_t v = 0; v < count && taken < 6; v += step, ++taken) {
+        float d[4];
+        Expand(src + size_t(v) * guest_stride + op.src_offset, op, d);
+        const double len =
+            std::sqrt(double(d[0]) * d[0] + double(d[1]) * d[1] + double(d[2]) * d[2]);
+        sum_len += len;
+        if (taken < 3 && n < 380) {
+          n += std::snprintf(b + n, sizeof(b) - n, " (%.3f,%.3f,%.3f)len=%.3f", d[0], d[1], d[2],
+                             len);
+        }
+      }
+      std::snprintf(b + n, sizeof(b) - n, " | meanlen=%.4f over %u verts", sum_len / double(taken),
+                    taken);
+      REXGPU_INFO("{}", b);
+    }
+  }
+
   entry.bytes = host_bytes;
   entry.vertex_count = count;
   entry.content_hash = content_hash;
@@ -2854,7 +2914,11 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   // depth with that constant. 1.0 = "nearest occluder everywhere": if the lighting
   // shaders' shadow path is live, the world must go fully shadowed.
   const int32_t shadow_test = REXCVAR_GET(nx1_d3d9_shadow_test);
-  const float dbg[4] = {shadow_test < 0 ? -1.0f : float(shadow_test) / 100.0f, 0.0f, 0.0f, 0.0f};
+  float forced = shadow_test < 0 ? -1.0f : float(shadow_test) / 100.0f;
+  if (shadow_test == 200) {
+    forced = (GetTickCount64() / 500) & 1 ? 1.0f : 0.0f;
+  }
+  const float dbg[4] = {forced, 0.0f, 0.0f, 0.0f};
   device_->SetPixelShaderConstantF(0, dbg, 1);
   device_->SetTexture(0, src_depth);
   device_->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);

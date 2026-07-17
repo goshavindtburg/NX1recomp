@@ -36,6 +36,30 @@ struct Sm3Shader {
   /// Uploading that block to a shader that does not overwrites the `def` literals fxc parked
   /// in the same registers -- see ReadsUndefinedConstRange.
   bool needs_inv_tex_dim = false;
+
+  /// One bit per float constant register the compiled shader `def`s. fxc parks defs in ANY
+  /// register whose declared uniform the optimizer proved dead -- INCLUDING registers inside
+  /// the remap window -- so every host-side constant write must skip these or it poisons the
+  /// 0/1 literals feeding fxc's flattened cmp selects (measured: c19 def=(0,1,-1,-0) LIVE=
+  /// pool garbage on every sun-shadow shader; the whole shadow path computed nonsense).
+  uint32_t def_mask[8] = {};
+
+  bool IsDefRegister(uint32_t reg) const {
+    return reg < 256 && ((def_mask[reg >> 5] >> (reg & 31)) & 1u) != 0;
+  }
+
+  /// The shader's own `def cN, x, y, z, w` literals, captured from its bytecode. These must be
+  /// RE-ASSERTED by the host after every constant upload: measured on this D3D9Ex device, the
+  /// runtime does NOT reapply defs on SetPixelShader, so whatever a *previous* shader's window
+  /// upload legitimately wrote there persists into this shader's draw (observed: another
+  /// shader's literal-pool float4s sitting in this shader's def registers -- masking our own
+  /// writes was necessary but not sufficient).
+  struct DefLiteral {
+    uint16_t reg;
+    float v[4];
+  };
+  uint16_t def_count = 0;
+  DefLiteral defs[16];
 };
 
 class ShaderCache {

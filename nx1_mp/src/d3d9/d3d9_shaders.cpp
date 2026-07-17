@@ -110,7 +110,10 @@ void ShaderCache::Shutdown() {
 bool ReadsUndefinedConstRange(const DWORD* code, uint32_t dword_count, uint32_t lo, uint32_t hi) {
   constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51, kDcl = 0x1F;
   constexpr uint32_t kRegNumMask = 0x7FF;
-  constexpr uint32_t kConstRegType = 1;  // D3DSPR_CONST
+  // D3DSPR_CONST is 2, not 1 (TEMP=0, INPUT=1, CONST=2). This was 1 for a day: both passes
+  // matched nothing, so every shader classified as "reads no undefined constants" and the
+  // "0 of 384 read g_InvTexDim" measurement built on it was VOID.
+  constexpr uint32_t kConstRegType = 2;  // D3DSPR_CONST
   bool self_defined[512] = {};
 
   // Pass 1: the registers the shader supplies itself.
@@ -158,6 +161,36 @@ bool ReadsUndefinedConstRange(const DWORD* code, uint32_t dword_count, uint32_t 
   }
   return false;
 }
+
+/// Collect the shader's `def` registers AND values -- see Sm3Shader::def_mask / defs.
+/// (D3DSIO_DEF's destination is always a float const register, so no type check is needed;
+/// integer/bool defs are different opcodes.)
+void CollectDefs(const DWORD* code, uint32_t dword_count, Sm3Shader& out) {
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51;
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (op == kDef && len == 5 && i + 5 < dword_count) {
+      const uint32_t reg = code[i + 1] & 0x7FF;
+      if (reg < 256) {
+        out.def_mask[reg >> 5] |= 1u << (reg & 31);
+        if (out.def_count < 16) {
+          Sm3Shader::DefLiteral& d = out.defs[out.def_count++];
+          d.reg = uint16_t(reg);
+          std::memcpy(d.v, &code[i + 2], 16);
+        }
+      }
+    }
+    i += 1 + len;
+  }
+}
 #endif
 
 const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
@@ -197,6 +230,11 @@ const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
   Sm3Shader shader{};
   shader.entry = found;
   const auto* code = reinterpret_cast<const DWORD*>(bytecode_ + found->bytecodeOffset);
+  // fxc parks its `def` literals in any declared register whose uploads the optimizer proved
+  // dead -- including registers INSIDE the remap window -- so every constant write must go
+  // around them AND re-assert the values (the runtime does not reapply defs on SetShader).
+  // Collected once per shader, consulted by every upload path.
+  CollectDefs(code, found->bytecodeSize / 4, shader);
   // Does this pixel shader actually read g_InvTexDim[16]? It is bound at a fixed offset above
   // the constant window, but only declared for shaders with an offset tfetch -- and uploading it
   // to a shader that never declared it overwrites the `def` literals fxc put there.
@@ -352,6 +390,14 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
   }
 
   if (count == 0) {
+    // No window to upload, but the defs still need asserting (see below).
+    for (uint32_t d = 0; d < shader.def_count; ++d) {
+      if (pixel_stage) {
+        device_->SetPixelShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+      } else {
+        device_->SetVertexShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+      }
+    }
     return;
   }
 
@@ -459,10 +505,40 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
     }
   }
 
-  if (pixel_stage) {
-    device_->SetPixelShaderConstantF(0, staging, count);
-  } else {
-    device_->SetVertexShaderConstantF(0, staging, count);
+  // Upload in runs that go AROUND the shader's own `def` registers. A def is applied when the
+  // shader is set, lives in this same constant file, and fxc places one wherever a declared
+  // uniform's uses were optimized away -- including inside [0, count). Writing over one feeds
+  // garbage to every cmp fxc flattened: measured live, c19 def=(0,1,-1,-0) held literal-pool
+  // garbage on every sun-shadow shader, which is what actually killed the sun shadows.
+  uint32_t run = 0;
+  while (run < count) {
+    while (run < count && shader.IsDefRegister(run)) {
+      ++run;
+    }
+    uint32_t end = run;
+    while (end < count && !shader.IsDefRegister(end)) {
+      ++end;
+    }
+    if (end > run) {
+      if (pixel_stage) {
+        device_->SetPixelShaderConstantF(run, &staging[run * 4], end - run);
+      } else {
+        device_->SetVertexShaderConstantF(run, &staging[run * 4], end - run);
+      }
+    }
+    run = end;
+  }
+
+  // Re-assert the shader's own `def` literals. Skipping them above is necessary but NOT
+  // sufficient: the runtime does not reapply defs on SetShader (measured -- see
+  // Sm3Shader::defs), so a previous shader's window upload that legitimately covered these
+  // registers would otherwise still be sitting in them for this shader's draw.
+  for (uint32_t d = 0; d < shader.def_count; ++d) {
+    if (pixel_stage) {
+      device_->SetPixelShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+    } else {
+      device_->SetVertexShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+    }
   }
 #endif
 }
