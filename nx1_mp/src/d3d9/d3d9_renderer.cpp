@@ -786,6 +786,7 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   const uint64_t ps_hash =
       ps_object ? HashGuestUcode(ReadGuestUcode(base, ps_object, /*pixel_shader=*/true)) : 0;
   const Sm3Shader* ps = ps_hash ? cache.Lookup(ps_hash) : nullptr;
+  last_ps_hash_ = ps_hash;
 
   if (!vs || (ps_object && !ps)) {
     // A handful of shaders do not lower to SM3, and a draw that wants one is silently
@@ -892,6 +893,9 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     fade_ps_tried = true;
     const char* kFadeSrc =
         "sampler2D shadowMap : register(s5);\n"
+        "samplerCUBE envCube : register(s1);\n"
+        "sampler3D volLight : register(s4);\n"
+        "sampler2D albedo : register(s0);\n"
         // Fed by the host from each shader's own remap (guest g2/g4/g38), not by register
         // number: the same engine constant lands in a different host register in every shader.
         "float4 g38 : register(c28);\n"
@@ -899,7 +903,8 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
         "float4 c3 : register(c26);\n"
         "float4 c16 : register(c27);\n"
         "float4 mode : register(c24);\n"
-        "float4 main(float4 t4 : TEXCOORD4) : COLOR {\n"
+        "float4 main(float4 t4 : TEXCOORD4, float4 t0 : TEXCOORD0, float4 t5 : TEXCOORD5,\n"
+        "            float4 t7 : TEXCOORD7) : COLOR {\n"
         "  float u = t4.x, v = t4.y;\n"
         // cascade 0: the coords used directly (r8.z = 16u-8, r8.w = 32v-8)
         "  float d0 = max(abs(c3.x * u + c3.z), abs(c3.y * v + c3.z));\n"
@@ -962,13 +967,35 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
         // mode 16 but with the +/-g38 sub-texel offsets and the 0.25 average, transcribed from
         // the emitted HLSL. If mode 16 shows a shadow and this does not, the offsets are the
         // difference; if both show it, the real shader's tap MATH is clean end-to-end.
-        "  float4 cmp;\n"
-        "  cmp.x = (t4.z >= tex2D(shadowMap, uv1 + g38.xy).x) ? 1.0 : 0.0;\n"
-        "  cmp.y = (t4.z >= tex2D(shadowMap, uv1 - g38.xy).x) ? 1.0 : 0.0;\n"
-        "  cmp.z = (t4.z >= tex2D(shadowMap, uv1 + g38.zw).x) ? 1.0 : 0.0;\n"
-        "  cmp.w = (t4.z >= tex2D(shadowMap, uv1 - g38.zw).x) ? 1.0 : 0.0;\n"
-        "  float pcf = dot(cmp, float4(0.25, 0.25, 0.25, 0.25));\n"
-        "  return float4(pcf, pcf, pcf, 1);\n"
+        "  if (mode.x < 20.5) {\n"
+        "    float4 cmp;\n"
+        "    cmp.x = (t4.z >= tex2D(shadowMap, uv1 + g38.xy).x) ? 1.0 : 0.0;\n"
+        "    cmp.y = (t4.z >= tex2D(shadowMap, uv1 - g38.xy).x) ? 1.0 : 0.0;\n"
+        "    cmp.z = (t4.z >= tex2D(shadowMap, uv1 + g38.zw).x) ? 1.0 : 0.0;\n"
+        "    cmp.w = (t4.z >= tex2D(shadowMap, uv1 - g38.zw).x) ? 1.0 : 0.0;\n"
+        "    float pcf = dot(cmp, float4(0.25, 0.25, 0.25, 0.25));\n"
+        "    return float4(pcf, pcf, pcf, 1);\n"
+        "  }\n"
+        // 21/22: what the p0 block's OTHER samplers return -- these paths were dead code until
+        // the def fix and have never been exercised. The volume light (s4) multiplies the sun
+        // term: if it samples black, the sun -- and every shadow -- is multiplied to zero AFTER
+        // a perfectly correct tap. Sample a few fixed coords so the answer does not depend on
+        // replicating each shader's coordinate math.
+        "  if (mode.x < 21.5) {\n"  // 21: volume light at 3 depths, as R/G/B
+        "    float a = tex3D(volLight, float3(u, v, 0.25)).x;\n"
+        "    float b = tex3D(volLight, float3(u, v, 0.5)).x;\n"
+        "    float c = tex3D(volLight, float3(u, v, 0.75)).x;\n"
+        "    return float4(a, b, c, 1);\n"
+        "  }\n"
+        "  if (mode.x < 22.5) return texCUBE(envCube, float3(u * 2 - 1, 0.5, v * 2 - 1));\n"
+        // 23: the two INPUTS of p0 = (albedo.a * vertexColour.a != 0) -- every CONSTANT in the
+        // predicate is now verified correct, so if p0 still fails it is these. red = albedo
+        // alpha (s0 at the diffuse uv), green = TEXCOORD7.w, blue = TEXCOORD5.w (the
+        // vertex-colour alpha lands in different interpolators per shader). A black red
+        // channel on world surfaces = our texture decode/swizzle kills the alpha; black
+        // green+blue = the vertex declaration loses the colour alpha.
+        "  float4 alb = tex2D(albedo, t0.xy);\n"
+        "  return float4(alb.w, t7.w, t5.w, 1);\n"
         "}";
     ID3DBlob* code = nullptr;
     ID3DBlob* err = nullptr;
@@ -1064,7 +1091,8 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     }
     return true;
   }
-  if (((dbg_shadow >= 10 && dbg_shadow <= 18) || dbg_shadow == 20) && ps && fade_ps) {
+  if (((dbg_shadow >= 10 && dbg_shadow <= 18) || (dbg_shadow >= 20 && dbg_shadow <= 23)) && ps &&
+      fade_ps) {
     // Every draw that binds the depth atlas on s5 -- the signature of a sun-shadow draw. Gating
     // on one shader hash covered too few pixels to see (it drew, but nothing changed on screen).
     const TextureFetchConstant s5 = ReadTextureFetchConstant(base, guest_device, 5);
@@ -1360,7 +1388,8 @@ void Renderer::ProbeWorldDraw(const uint8_t* base, uint32_t guest_device) {
         UINT sz2 = sz;
         if (SUCCEEDED(cur->GetFunction(code.data(), &sz2))) {
           char db[760];
-          int dn = std::snprintf(db, sizeof(db), "nx1_d3d9: DEFCHECK ps=%p", (void*)cur);
+          int dn = std::snprintf(db, sizeof(db), "nx1_d3d9: DEFCHECK ps=%016llX",
+                                 (unsigned long long)last_ps_hash_);
           uint32_t defs = 0, smashed = 0;
           bool readback_ok = true;
           for (size_t i = 1; i + 1 < code.size();) {
@@ -1418,15 +1447,23 @@ void Renderer::ProbeWorldDraw(const uint8_t* base, uint32_t guest_device) {
           }
           // Also dump the compiled asm of one real shadow PS: if the defs are clean, what the
           // GPU executes is the last unread piece -- diff it against the emitted HLSL trace.
-          static bool asm_dumped = false;
-          if (!asm_dumped) {
-            asm_dumped = true;
+          // Dump the compiled asm of the first few DISTINCT shadow shaders, NAMED BY HASH --
+          // a single pointer-tagged shadow_ps.asm forced guessing which shader it was, and
+          // the guess drove a wrong off-by-one theory.
+          static std::vector<uint64_t> asm_dumped;
+          if (std::find(asm_dumped.begin(), asm_dumped.end(), last_ps_hash_) ==
+                  asm_dumped.end() &&
+              asm_dumped.size() < 6) {
+            asm_dumped.push_back(last_ps_hash_);
             ID3DBlob* dis = nullptr;
             if (SUCCEEDED(D3DDisassemble(code.data(), sz, 0, nullptr, &dis)) && dis) {
-              if (std::FILE* f = std::fopen("texdump/shadow_ps.asm", "wb")) {
+              char path[128];
+              std::snprintf(path, sizeof(path), "texdump/shadow_ps_%016llX.asm",
+                            (unsigned long long)last_ps_hash_);
+              if (std::FILE* f = std::fopen(path, "wb")) {
                 std::fwrite(dis->GetBufferPointer(), 1, dis->GetBufferSize(), f);
                 std::fclose(f);
-                REXGPU_INFO("nx1_d3d9: DEFCHECK dumped texdump/shadow_ps.asm ({} bytes)",
+                REXGPU_INFO("nx1_d3d9: DEFCHECK dumped {} ({} bytes)", path,
                             dis->GetBufferSize());
               }
               dis->Release();

@@ -46,10 +46,12 @@ static bool nx1VerboseShaderCacheLog()
     return std::getenv("NX1_XENOSRECOMP_VERBOSE") != nullptr;
 }
 
-static std::mutex& nx1DxcCompileMutex()
+// NX1_SM3_ONLY=1 skips the DXIL/SPIR-V (DXC) compiles and emits only the SM3 cache. The native
+// D3D9 renderer consumes nothing else, and the DXC path is where the parallel build currently
+// dies (0xC0000409 within seconds of going wide; the SM3/fxc path runs clean in parallel).
+static bool nx1Sm3Only()
 {
-    static std::mutex mutex;
-    return mutex;
+    return std::getenv("NX1_SM3_ONLY") != nullptr;
 }
 
 static bool tryGetNx1RawShaderInfo(const std::filesystem::path& path, bool& isPixelShader,
@@ -973,7 +975,17 @@ int main(int argc, char** argv)
         std::atomic<uint32_t> progress = 0;
         std::atomic<uint32_t> compileFailures = 0;
 
-        std::for_each(std::execution::seq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
+        // Parallelism is OPT-IN (NX1_PARALLEL=1) because it still crashes -- and the failure
+        // taught us what the bug is NOT. Measured 2026-07-17: parallel dies within ~15 s as
+        // 0xC0000409/0xC0000005 (a) with DXC compiles skipped entirely (NX1_SM3_ONLY), (b) with
+        // 16 MB thread stacks (/STACK is inherited by pool threads), and (c) it also fired,
+        // rarely, fully SERIALIZED with every compile mutexed. So: not a d3dcompiler race (we
+        // link thread-safe d3dcompiler_47), not DXC, not stack exhaustion -- a real shared-state
+        // corruption in the recompile/transform path that upstream (which runs this loop
+        // par_unseq in under a minute) does not have. Hunt it with TSan/ASan, not more mutexes:
+        // the old global compile locks never protected the real culprit and cost 10+ minutes
+        // per cache build. Serial remains the correct-by-default path.
+        const auto processShader = [&](auto& hashShaderPair)
             {
                 auto& shader = hashShaderPair.second;
 
@@ -1035,15 +1047,16 @@ int main(int argc, char** argv)
                         uint64_t(hashShaderPair.first), shader.nx1RawShaderPath.string());
                 }
 
-                DxcCompiler dxcCompiler;
+                if (nx1Sm3Only())
+                    return;
+
+                // One compiler per worker thread (upstream's pattern): DXC instantiation is
+                // expensive, and separate instances need no locking.
+                thread_local DxcCompiler dxcCompiler;
 
 #ifdef XENOS_RECOMP_DXIL
-                IDxcBlob* dxilBlob = nullptr;
-                {
-                    std::lock_guard lock(nx1DxcCompileMutex());
-                    dxilBlob = dxcCompiler.compile(hlsl, recompiler.isPixelShader,
-                        false, false);
-                }
+                IDxcBlob* dxilBlob =
+                    dxcCompiler.compile(hlsl, recompiler.isPixelShader, false, false);
                 if (verboseShaderCacheLog)
                 {
                     fmt::println(stderr, "Compiled shader 0x{:016X} ({})",
@@ -1074,11 +1087,7 @@ int main(int argc, char** argv)
 
                 if (!nx1RawDirectoryMode)
                 {
-                    IDxcBlob* spirv = nullptr;
-                    {
-                        std::lock_guard lock(nx1DxcCompileMutex());
-                        spirv = dxcCompiler.compile(hlsl, recompiler.isPixelShader, false, true);
-                    }
+                    IDxcBlob* spirv = dxcCompiler.compile(hlsl, recompiler.isPixelShader, false, true);
                     if (spirv == nullptr)
                     {
                         fmt::println(stderr, "SPIR-V compile failed for shader 0x{:016X}",
@@ -1103,7 +1112,12 @@ int main(int argc, char** argv)
                 size_t currentProgress = ++progress;
                 if ((currentProgress % 10) == 0 || (currentProgress == shaders.size() - 1))
                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
-            });
+            };
+
+        if (std::getenv("NX1_PARALLEL") != nullptr)
+            std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), processShader);
+        else
+            std::for_each(std::execution::seq, shaders.begin(), shaders.end(), processShader);
 
         if (compileFailures != 0)
         {

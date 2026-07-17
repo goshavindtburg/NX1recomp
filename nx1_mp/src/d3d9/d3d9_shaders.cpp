@@ -437,7 +437,7 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
     static std::vector<const void*> seen_ps, seen_vs;  // per stage: one list starved the other
     std::lock_guard<std::mutex> lk(m);
     std::vector<const void*>& seen = pixel_stage ? seen_ps : seen_vs;
-    if (std::find(seen.begin(), seen.end(), (const void*)&e) == seen.end() && seen.size() < 12) {
+    if (std::find(seen.begin(), seen.end(), (const void*)&e) == seen.end() && seen.size() < 32) {
       seen.push_back((const void*)&e);
       const char* stage = pixel_stage ? "PS" : "VS";
       const void* obj = pixel_stage ? (const void*)shader.ps : (const void*)shader.vs;

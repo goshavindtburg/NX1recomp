@@ -309,6 +309,43 @@ bool transformToSm3(const std::string& source, bool isPixelShader, uint32_t spec
         body = std::move(rebuilt);
     }
 
+    // Unwritten interpolator COMPONENTS must reach the pixel shader as (0, 0, 0, 1) -- the
+    // hardware default. NX1's world VS exports only oTexCoord5.xyz, and its lighting PS gates
+    // the entire sun/shadow path on `albedo.a * v5.w != 0`: a zero default makes that predicate
+    // false on every pixel, silently swapping dynamic lighting for the baked fallback (world
+    // lit but flat, no sun shadows). Upgrade the zero init to float4(0,0,0,1) ONLY for
+    // interpolators the shader actually writes: fully-unwritten ones keep `= 0.0;` so fxc still
+    // eliminates them (vs_3_0 has 12 output registers against our 18 declared outputs).
+    {
+        std::regex initRe(R"((oTexCoord\d+|oColor\d+) = 0\.0;)");
+        std::string rebuilt;
+        rebuilt.reserve(body.size() + 256);
+        auto begin = std::sregex_iterator(body.begin(), body.end(), initRe);
+        size_t last = 0;
+        for (auto it = begin; it != std::sregex_iterator(); ++it)
+        {
+            const std::string name = (*it)[1];
+            // The init itself is one occurrence; any second occurrence in the body is a write.
+            size_t occurrences = 0;
+            for (size_t pos = body.find(name); pos != std::string::npos && occurrences < 2;
+                 pos = body.find(name, pos + name.size()))
+            {
+                // Whole-name match only: oTexCoord1 must not count oTexCoord10..15.
+                const size_t end = pos + name.size();
+                if (end >= body.size() || !std::isdigit(static_cast<unsigned char>(body[end])))
+                    ++occurrences;
+            }
+            rebuilt.append(body, last, it->position() - last);
+            if (occurrences >= 2)
+                rebuilt.append(name + " = float4(0.0, 0.0, 0.0, 1.0);");
+            else
+                rebuilt.append(it->str());
+            last = it->position() + it->length();
+        }
+        rebuilt.append(body, last, std::string::npos);
+        body = std::move(rebuilt);
+    }
+
     // Sampler usage must be collected before the tfetch rewrite erases the names.
     std::map<uint8_t, std::string> samplerType;
     {

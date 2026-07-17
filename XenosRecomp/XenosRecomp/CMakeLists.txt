@@ -47,6 +47,12 @@ if (WIN32)
     # SM3 (vs_3_0/ps_3_0) lowering for the native D3D9 renderer.
     target_link_libraries(XenosRecomp PRIVATE d3dcompiler)
     target_compile_definitions(XenosRecomp PRIVATE _CRT_SECURE_NO_WARNINGS)
+    # 16 MB default stack for EVERY thread (the PE-header reserve is inherited by parallel-STL
+    # pool threads too). MSVC's std::regex recurses proportionally to the shader body it walks,
+    # and the corpus's biggest shaders blow the default 1 MB -- as random-looking 0xC0000409 /
+    # 0xC0000005 deaths that move with the thread schedule. They predate the parallel loop:
+    # the rare serial-build crashes were the same overflow on the main thread.
+    target_link_options(XenosRecomp PRIVATE "LINKER:/STACK:16777216")
     add_custom_command(TARGET XenosRecomp POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_RUNTIME_DLLS:XenosRecomp> $<TARGET_FILE_DIR:XenosRecomp>
         COMMAND_EXPAND_LISTS

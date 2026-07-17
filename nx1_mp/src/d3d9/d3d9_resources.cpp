@@ -2914,8 +2914,12 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   // depth with that constant. 1.0 = "nearest occluder everywhere": if the lighting
   // shaders' shadow path is live, the world must go fully shadowed.
   const int32_t shadow_test = REXCVAR_GET(nx1_d3d9_shadow_test);
-  float forced = shadow_test < 0 ? -1.0f : float(shadow_test) / 100.0f;
-  if (shadow_test == 200) {
+  // Scope the forcing to the shadow cascades. ResolveDepth also serves the 1024x600 SCENE
+  // depth, and forcing that too sent the DOF chain "everything is far" -- a full-screen blur
+  // that masqueraded as a shadow-term pulse in the 200 flicker and contaminated every earlier
+  // A/B. Cascade atlases are >= 1024 tall; the scene depth is 600.
+  float forced = shadow_test < 0 || height < 1024 ? -1.0f : float(shadow_test) / 100.0f;
+  if (shadow_test == 200 && height >= 1024) {
     forced = (GetTickCount64() / 500) & 1 ? 1.0f : 0.0f;
   }
   const float dbg[4] = {forced, 0.0f, 0.0f, 0.0f};

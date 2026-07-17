@@ -1,24 +1,15 @@
 #include "fxc_compiler.h"
 
-#include <mutex>
-
 #ifdef _WIN32
 #include <Windows.h>
 #include <d3dcompiler.h>
 #endif
 
-#ifdef _WIN32
-// d3dcompiler is not safe to call concurrently. The shader corpus is compiled from a parallel
-// for_each, and an unsynchronized D3DCompile corrupts memory: the tool died with an access
-// violation or a blown stack cookie (0xC0000409) at a point that moved with the thread
-// schedule -- which is why it appeared to depend on the input set and on unrelated flags.
-// The DXC path next door is serialized for the same reason (nx1DxcCompileMutex in main.cpp).
-static std::mutex& sm3CompileMutex()
-{
-    static std::mutex mutex;
-    return mutex;
-}
-#endif
+// NOTE: D3DCompile runs UNLOCKED from the parallel shader loop, deliberately. d3dcompiler_47
+// is documented thread-safe, and the serialization that used to live here was a misdiagnosis:
+// the intermittent 0xC0000409 crash it was meant to cure reproduced with the whole corpus
+// loop forced to std::execution::seq and every compile mutexed -- fully serial -- so whatever
+// causes it, it is not a compiler data race. Serializing cost 10+ minutes per cache build.
 
 std::vector<uint8_t> compileSm3(const std::string& hlsl, bool isPixelShader, std::string& error)
 {
@@ -42,12 +33,9 @@ std::vector<uint8_t> compileSm3(const std::string& hlsl, bool isPixelShader, std
         ID3DBlob* code = nullptr;
         ID3DBlob* errors = nullptr;
 
-        HRESULT hr;
-        {
-            std::lock_guard lock(sm3CompileMutex());
-            hr = D3DCompile(hlsl.data(), hlsl.size(), nullptr, nullptr, nullptr, "main",
-                            isPixelShader ? "ps_3_0" : "vs_3_0", flags, 0, &code, &errors);
-        }
+        const HRESULT hr =
+            D3DCompile(hlsl.data(), hlsl.size(), nullptr, nullptr, nullptr, "main",
+                       isPixelShader ? "ps_3_0" : "vs_3_0", flags, 0, &code, &errors);
 
         std::vector<uint8_t> out;
         if (SUCCEEDED(hr) && code != nullptr)

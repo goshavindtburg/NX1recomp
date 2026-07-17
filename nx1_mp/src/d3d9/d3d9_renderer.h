@@ -189,6 +189,11 @@ class Renderer {
   float ndc_offset_[3] = {0.0f, 0.0f, 0.0f};
 
   uint64_t shader_cache_misses_ = 0;
+  /// TEMP DIAGNOSTIC: the ucode hash of the most recently bound pixel shader, so probes that
+  /// run at draw time (ProbeWorldDraw/DEFCHECK) can tie their output to a shader identity.
+  /// A pointer-only dump forced guessing which shader an asm listing belonged to -- and the
+  /// guess was unprovable. Never infer identity; log it.
+  uint64_t last_ps_hash_ = 0;
 
   // The guest depth surface currently bound, so a depth resolve knows which host
   // (INTZ) texture to publish under the resolve's destination address.
