@@ -1071,7 +1071,56 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
                 REXCVAR_GET(nx1_d3d9_dbg_shadow));
   }
 
+  // TEMP DIAGNOSTIC, mode 24: the MAGNITUDE of the volume-light sample. The world PS's ambient
+  // is literally `(2*V)^2` (traced: `r0 = r0 + r0` then `r0.y *= r0.y`), so V is squared into
+  // the frame against a sun of NdotL*g18 ~= 1.06. V <= 1 caps ambient at 4 -- a ~50% sun share
+  // -- yet the measured shadow swing is 3-8%, which is only arithmetically possible if V > 1.
+  //   blue <0.5 | green 0.5-1 (normal) | YELLOW >1 | RED >2 | WHITE >4  (yellow+ = the bug)
+  //
+  // Kept as its OWN shader, deliberately: folding it into the mode 10-23 shader made fxc hang
+  // for minutes and balloon to 6 GB flattening one ps_3_0 with that many branches+samples --
+  // it took out the whole run before the menu. Do not merge probes into that shader.
+  static IDirect3DPixelShader9* vol_ps = nullptr;
+  static bool vol_ps_tried = false;
+  if (!vol_ps_tried) {
+    vol_ps_tried = true;
+    const char* kVolSrc =
+        "sampler3D volLight : register(s4);\n"
+        "float4 main(float4 t4 : TEXCOORD4) : COLOR {\n"
+        "  float m = 0;\n"
+        "  m = max(m, tex3D(volLight, float3(frac(t4.x), frac(t4.y), 0.25)).x);\n"
+        "  m = max(m, tex3D(volLight, float3(frac(t4.x), frac(t4.y), 0.75)).x);\n"
+        "  m = max(m, tex3D(volLight, float3(0.5, 0.5, 0.5)).x);\n"
+        "  if (m > 4.0) return float4(1, 1, 1, 1);\n"
+        "  if (m > 2.0) return float4(1, 0, 0, 1);\n"
+        "  if (m > 1.0) return float4(1, 1, 0, 1);\n"
+        "  if (m > 0.5) return float4(0, 1, 0, 1);\n"
+        "  return float4(0, 0, 1, 1);\n"
+        "}";
+    ID3DBlob* code = nullptr;
+    ID3DBlob* err = nullptr;
+    if (SUCCEEDED(D3DCompile(kVolSrc, strlen(kVolSrc), nullptr, nullptr, nullptr, "main",
+                             "ps_3_0", 0, 0, &code, &err)) &&
+        code) {
+      device_->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &vol_ps);
+      code->Release();
+    } else if (err) {
+      REXGPU_ERROR("nx1_d3d9: volume debug PS failed: {}",
+                   static_cast<const char*>(err->GetBufferPointer()));
+    }
+    if (err) err->Release();
+    REXGPU_INFO("nx1_d3d9: VOLPROBE shader built={}", vol_ps != nullptr);
+  }
+
   const int32_t dbg_shadow = REXCVAR_GET(nx1_d3d9_dbg_shadow);
+  if (dbg_shadow == 24 && ps && vol_ps) {
+    const TextureFetchConstant s5v = ReadTextureFetchConstant(base, guest_device, 5);
+    if (s5v.valid && (s5v.format == 22 || s5v.format == 23)) {
+      device_->SetPixelShader(vol_ps);
+      device_->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+      return true;
+    }
+  }
   if (dbg_shadow == 19 && ps && nl_ps && ps_hash == 0x4E127BDFABD81721ull) {
     cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
     float sun[4] = {0, 0, 0, 0}, uvs[4] = {1, 1, 0, 0};
@@ -1336,6 +1385,78 @@ void Renderer::InvalidateSamplerShadow() {
 // whole world drops to ambient), and dump the first few distinct world pixel shaders with their
 // constants to identify the lightmap sampler and any sun/exposure uniforms.
 void Renderer::ProbeWorldDraw(const uint8_t* base, uint32_t guest_device) {
+  // COMPOSITE probe (colour grading): RB_ApplyMergedPostEffects draws a fullscreen quad to the
+  // 1920x1080 FRAME_BUFFER sampling the graded chain (s0=scene, s7=3D LUT, s8=tonemap ramp).
+  // If the LUT/ramp do not resolve to real host textures, tex3D/tex1D read black/identity and
+  // the frame is the ungraded scene -- exactly the cool/flat look vs the warm reference. Fire
+  // on backbuffer-sized draws that sample a 3D (dimension==2) texture; log the full table so we
+  // see whether every grading input binds.
+  {
+    static uint32_t ctick = 0;
+    // The colour-grading LUT is a small cubic 3D texture (VOLTEX logged s7 = 16x16x16); the
+    // volume LIGHT is 512x256x4, so "small + roughly cubic" isolates the grading draw without
+    // depending on RT-size tracking (RESOLVED_SCENE/FRAME_BUFFER share surfaces).
+    bool has_lut = false;
+    for (uint32_t s = 0; s < 16; ++s) {
+      const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, s);
+      if (t.valid && t.base_address && t.dimension == 2 && t.width <= 64 && t.depth >= 8) {
+        has_lut = true;
+        break;
+      }
+    }
+    if (has_lut && (ctick++ % 191) == 0) {
+      auto& tr = ResourceTracker::Get();
+      char cb[900];
+      int cn = std::snprintf(cb, sizeof(cb), "nx1_d3d9: POSTTEX rt=%ux%u", current_rt_width_,
+                             current_rt_height_);
+      for (uint32_t s = 0; s < 16 && cn < 850; ++s) {
+        const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, s);
+        if (!t.valid || !t.base_address) {
+          continue;
+        }
+        IDirect3DBaseTexture9* tex = tr.GetTexture(base, guest_device, s);
+        cn += std::snprintf(cb + cn, sizeof(cb) - cn, " s%u:%ux%ux%u d%u f%u %s", s, t.width,
+                            t.height, t.depth, t.dimension, t.format, tex ? "ok" : "NULL");
+      }
+      cn += std::snprintf(cb + cn, sizeof(cb) - cn, " | rt=%ux%u", current_rt_width_,
+                          current_rt_height_);
+      REXGPU_INFO("{}", cb);
+
+      // Dump the composite PS once: the LUT reads all-zero, but before chasing WHY, confirm the
+      // shader even depends on it -- a zero LUT could be passthrough (additive) or black
+      // (replacement), and the warm grade might live in the tonemap ramp (s8) instead. The asm
+      // is the ground truth for what the composite actually computes.
+      static bool comp_dumped = false;
+      if (!comp_dumped) {
+        comp_dumped = true;
+        IDirect3DPixelShader9* cur = nullptr;
+        device_->GetPixelShader(&cur);
+        if (cur) {
+          UINT sz = 0;
+          if (SUCCEEDED(cur->GetFunction(nullptr, &sz)) && sz >= 8) {
+            std::vector<DWORD> code(sz / 4);
+            UINT sz2 = sz;
+            if (SUCCEEDED(cur->GetFunction(code.data(), &sz2))) {
+              ID3DBlob* dis = nullptr;
+              if (SUCCEEDED(D3DDisassemble(code.data(), sz, 0, nullptr, &dis)) && dis) {
+                if (std::FILE* f = std::fopen("texdump/composite_ps.asm", "wb")) {
+                  std::fwrite(dis->GetBufferPointer(), 1, dis->GetBufferSize(), f);
+                  std::fclose(f);
+                  REXGPU_INFO("nx1_d3d9: POSTTEX dumped texdump/composite_ps.asm ({} bytes)",
+                              dis->GetBufferSize());
+                }
+                dis->Release();
+              }
+            }
+          }
+          cur->Release();
+        }
+      }
+    }
+  }
+  if (current_rt_width_ == backbuffer_width_ && current_rt_height_ == backbuffer_height_) {
+    return;
+  }
   if (current_rt_width_ == backbuffer_width_ || current_rt_height_ < 400) {
     return;  // scene pass only: offscreen, world-sized
   }
@@ -1784,6 +1905,7 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
   if (!BindShadersAndConstants(base, guest_device)) {
     return;
   }
+  ProbeWorldDraw(base, guest_device);  // TEMP: the composite quad is a non-indexed draw
   // A non-indexed draw reads exactly [start_vertex, start_vertex + vertex_count), so its
   // reach into the (possibly pooled) buffer is known without consulting any indices.
   uint32_t stream_vertices = 0;
@@ -1815,6 +1937,7 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
   if (!BindShadersAndConstants(base, guest_device)) {
     return;
   }
+  ProbeWorldDraw(base, guest_device);  // TEMP: the composite quad may be an indexed-UP draw
 
   auto& tracker = ResourceTracker::Get();
   // NX1 UP draws bind no CVertexDeclaration -- the vertex layout is baked into the
@@ -1881,6 +2004,7 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
   if (!BindShadersAndConstants(base, guest_device)) {
     return;
   }
+  ProbeWorldDraw(base, guest_device);  // TEMP: the composite quad may be a non-indexed UP draw
 
   auto& tracker = ResourceTracker::Get();
   // Same as DrawIndexedUP: NX1 binds no CVertexDeclaration, so derive the layout

@@ -2609,6 +2609,25 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
     entry.vol = nullptr;
   }
 
+  // TEMP DIAGNOSTIC (sun ~10x too weak): identify the volume light. The world PS turns this
+  // sample into ambient as `(2*V)^2`, so V is squared straight into the frame and competes
+  // with a sun of NdotL*g18 ~= 1.06. Log what we actually build: a gamma flag we honour with
+  // SRGBTEXTURE (D3D9 sRGB reads are a FORMAT CAP -- drivers commonly do not support them for
+  // VOLUME textures, so setting it may be silently ignored, leaving V gamma-encoded and the
+  // ambient ~5x hot), and the host format (a float format could legitimately exceed 1).
+  {
+    static std::mutex vm;
+    static std::vector<uint64_t> vseen;
+    std::lock_guard<std::mutex> lk(vm);
+    if (std::find(vseen.begin(), vseen.end(), layout_key) == vseen.end() && vseen.size() < 8) {
+      vseen.push_back(layout_key);
+      REXGPU_INFO(
+          "nx1_d3d9: VOLTEX s{} {}x{}x{} guestfmt={} hostfmt=0x{:X} gamma={} tiled={} swizzle={:03X}",
+          sampler, t.width, t.height, t.depth, t.format, uint32_t(host.d3d), t.gamma, t.tiled,
+          t.swizzle & 0xFFF);
+    }
+  }
+
   IDirect3DVolumeTexture9* staging = nullptr;
   if (FAILED(device_->CreateVolumeTexture(t.width, t.height, t.depth, 1, 0, host.d3d,
                                           D3DPOOL_SYSTEMMEM, &staging, nullptr))) {
@@ -2632,6 +2651,50 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
       }
     }
   }
+  // TEMP DIAGNOSTIC (colour grading): dump the corners of the small cubic LUT AS THE SHADER
+  // WILL SEE IT (post-detile, post-swizzle). The composite binds it `ok`, so the grade is
+  // applied -- the question is whether the content is a real warm grade or has been flattened
+  // / channel-swapped in our path. Identity LUT: cell(i,i,i) ~= (i/(N-1)) grey. A real grade
+  // deviates (warm = R>B at the top). BGRA in memory: byte order is [B][G][R][A].
+  if (t.width <= 64 && t.depth >= 8 && t.width == t.depth) {
+    static std::mutex lm;
+    static std::vector<uint64_t> lseen;
+    std::lock_guard<std::mutex> lk(lm);
+    if (std::find(lseen.begin(), lseen.end(), layout_key) == lseen.end() && lseen.size() < 24) {
+      lseen.push_back(layout_key);
+      const uint32_t N = t.width;
+      auto cell = [&](uint32_t x, uint32_t y, uint32_t z, char* out, size_t cap) {
+        const uint8_t* px = static_cast<const uint8_t*>(box.pBits) + size_t(z) * box.SlicePitch +
+                            size_t(y) * box.RowPitch + size_t(x) * 4;
+        std::snprintf(out, cap, "(B%u G%u R%u A%u)", px[0], px[1], px[2], px[3]);
+      };
+      char c0[32], c1[32], c2[32], c3[32], c4[32];
+      cell(0, 0, 0, c0, sizeof(c0));
+      cell(N / 4, N / 4, N / 4, c1, sizeof(c1));
+      cell(N / 2, N / 2, N / 2, c2, sizeof(c2));
+      cell(3 * N / 4, 3 * N / 4, 3 * N / 4, c3, sizeof(c3));
+      cell(N - 1, N - 1, N - 1, c4, sizeof(c4));
+      REXGPU_INFO("nx1_d3d9: LUTDIAG {}^3 fmt={} swizzle={:03X} diag: {} {} {} {} {}", N, t.format,
+                  t.swizzle & 0xFFF, c0, c1, c2, c3, c4);
+      // Separate "we read the wrong/empty memory" from "detile zeroed good data": hash + first
+      // dwords of the RAW guest bytes, and the address/tiling we resolved from.
+      uint32_t nz = 0;
+      for (size_t bi = 0; bi < guest_bytes; ++bi) nz += src[bi] != 0 ? 1 : 0;
+      // Is this a GPU-produced texture? GetTexture (2D) serves resolve destinations from the
+      // rendered image; GetVolumeTexture does NOT. If the LUT address is a resolve dest, that
+      // gap is the bug -- we read empty CPU RAM where the GPU wrote the grade.
+      bool is_resolve = false;
+      if (resolves_) {
+        auto* rm = static_cast<ResolveMap*>(resolves_);
+        is_resolve = rm->find(PhysicalAddress(t.base_address)) != rm->end();
+      }
+      REXGPU_INFO("nx1_d3d9: LUTRAW @{:08X} bytes={} nonzero={} resolvedest={} tiled={} bpb={} "
+                  "mip@{:08X} hash={:016X} raw0={:08X}",
+                  t.base_address, uint32_t(guest_bytes), nz, is_resolve, t.tiled, bpb,
+                  t.mip_address, content_hash, *reinterpret_cast<const uint32_t*>(src));
+    }
+  }
+
   staging->UnlockBox(0);
 
   if (!entry.vol &&

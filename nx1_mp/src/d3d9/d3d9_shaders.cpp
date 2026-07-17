@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/logging/macros.h>
 
 #include "d3d9_constants.h"
@@ -25,6 +26,17 @@
 
 #include "nx1_sm3_shader_cache.h"
 #endif
+
+// TEMP DIAGNOSTIC (sun term too weak): override one component of one guest PIXEL shader
+// constant, resolved through each shader's own remap. Selector is guestReg*100 + component
+// (0=x..3=w); value is hundredths. e.g. force g35.w = 1.0:
+//   nx1_d3d9_force_ps_const = 3503
+//   nx1_d3d9_force_ps_value = 100
+REXCVAR_DEFINE_INT32(nx1_d3d9_force_ps_const, -1, "GPU",
+                     "Debug: override a guest PS constant component. guestReg*100 + component "
+                     "(0=x,1=y,2=z,3=w). -1 = off.");
+REXCVAR_DEFINE_INT32(nx1_d3d9_force_ps_value, 100, "GPU",
+                     "Debug: the value for nx1_d3d9_force_ps_const, in hundredths (100 = 1.0).");
 
 namespace nx1::d3d9 {
 
@@ -386,6 +398,47 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
     count = e.remapCount;
     for (uint32_t i = 0; i < count; ++i) {
       read_register(g_nx1Sm3ConstantRemap[e.remapOffset + i], &staging[i * 4]);
+    }
+  }
+
+  // TEMP DIAGNOSTIC (sun term ~10x too weak): override one component of one guest PS constant.
+  // The world PS ends in `mad r6.xyz, r0.xzy, c35.wwww, r5.xyz` -- i.e. lerp(r5, r7*r0, c35.w)
+  // -- and we read g35 = (1,1,1,0), so `.w = 0` multiplies the ENTIRE lit path out and leaves
+  // r6 = r5. The shadow only survives via r5's own lerp, which is exactly the measured 3-8%
+  // residue. Whether (1,1,1,0) is faithful guest data or a stale/short write on our side is the
+  // question; forcing .w answers it in one run instead of another trace.
+  //   nx1_d3d9_force_ps_const = <guestReg>*100 + <component>, value from nx1_d3d9_force_ps_value
+  const int32_t force_sel = REXCVAR_GET(nx1_d3d9_force_ps_const);
+  if (pixel_stage && force_sel >= 0 && !(e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS)) {
+    const uint32_t want_reg = uint32_t(force_sel / 100);
+    const uint32_t want_c = uint32_t(force_sel % 100);  // 0..3 = x..w, 4 = xyz together
+    if (want_c < 5) {
+      const float v = float(REXCVAR_GET(nx1_d3d9_force_ps_value)) / 100.0f;
+      for (uint32_t i = 0; i < count; ++i) {
+        if (g_nx1Sm3ConstantRemap[e.remapOffset + i] == want_reg) {
+          // Log the HASH, not just a host index: this override hits EVERY shader that reads
+          // the register, and a hash-less line already caused one wrong read (the value was
+          // reported against host c2 while the shader under investigation used c8).
+          static std::mutex fm;
+          static std::vector<uint64_t> ftold;
+          {
+            std::lock_guard<std::mutex> lk(fm);
+            if (std::find(ftold.begin(), ftold.end(), e.hash) == ftold.end() &&
+                ftold.size() < 12) {
+              ftold.push_back(e.hash);
+              REXGPU_WARN("nx1_d3d9: FORCECONST {:016X} g{}.{} was ({:.4g},{:.4g},{:.4g},{:.4g})"
+                          " -> {:.4g} (host c{})",
+                          e.hash, want_reg, want_c == 4 ? '*' : "xyzw"[want_c], staging[i * 4],
+                          staging[i * 4 + 1], staging[i * 4 + 2], staging[i * 4 + 3], v, i);
+            }
+          }
+          if (want_c == 4) {
+            staging[i * 4 + 0] = staging[i * 4 + 1] = staging[i * 4 + 2] = v;
+          } else {
+            staging[i * 4 + want_c] = v;
+          }
+        }
+      }
     }
   }
 
