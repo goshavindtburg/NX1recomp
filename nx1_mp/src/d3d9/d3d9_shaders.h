@@ -32,6 +32,10 @@ struct Sm3Shader {
   IDirect3DVertexShader9* vs = nullptr;
   IDirect3DPixelShader9* ps = nullptr;
   const Nx1Sm3CacheEntry* entry = nullptr;
+  /// True when this pixel shader really declares g_InvTexDim[16] (it has an offset tfetch).
+  /// Uploading that block to a shader that does not overwrites the `def` literals fxc parked
+  /// in the same registers -- see ReadsUndefinedConstRange.
+  bool needs_inv_tex_dim = false;
 };
 
 class ShaderCache {
@@ -54,6 +58,11 @@ class ShaderCache {
   /// guest_d3d.h) unless the device's ConstantRing says the ring owns them.
   void UploadConstants(const uint8_t* base, uint32_t guest_device, const Sm3Shader& shader,
                        bool pixel_stage);
+
+  /// TEMP DIAGNOSTIC: the host register a given GUEST register was uploaded into, or -1.
+  /// The remap is per-shader, so a probe that wants a specific engine constant (the cascade
+  /// scale/offset, say) cannot hardcode a host index -- it has to ask for the guest one.
+  int HostRegisterForGuest(const Sm3Shader& shader, uint32_t guest_register) const;
 
  private:
   ShaderCache() = default;

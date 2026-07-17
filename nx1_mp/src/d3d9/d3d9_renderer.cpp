@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file    d3d9_renderer.cpp
  * @brief   Host D3D9 device management for the native NX1 renderer.
  */
@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <mutex>
 #include <chrono>
+#include <cstdio>
+#include <unordered_set>
 #include <vector>
 
 #include <xxhash.h>
@@ -31,6 +33,28 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
                     "device is never torn down, so this cannot be toggled mid-run -- set it before "
                     "starting the game.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// TEMP DIAGNOSTIC: the gamma work turned on D3DSAMP_SRGBTEXTURE for TextureSign::kGamma
+// fetches, but many NX1 shaders linearize themselves (`mul r0.xyz, r0, r0`). If both happen the
+// sample is decoded twice. Off = raw fetch, shaders' own decode only.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_srgb_tex, true, "GPU",
+                    "Debug: honour TextureSign::kGamma with D3DSAMP_SRGBTEXTURE.");
+
+// TEMP DIAGNOSTIC (no shadows): show the sun shadow lookup on the world, bypassing the guest
+// pixel shader's p0 predication. Only applies to draws with the depth atlas on s5.
+//   1 = stored atlas depth at the fragment's shadow UV   2 = same, x2 for visibility
+//   3 = the fragment's own light-space depth             4 = frac(shadow UV) as red/green
+//   5 = shadow UV unwrapped (>1 or <0 saturates => out of range)  6 = the lit/shadowed compare
+//   7 = compare with wrapped u (tests "the sampler should REPEAT")
+//   8 = compare with u halved  (tests "the u row's scale is 2x wrong")
+//   9 = half-u UV as red/green (range check for 8)
+// 10+ hijack only shader 4E127BDFABD81721 and show the CASCADE FADE -- the term that multiplies
+// the shadow result to zero, and the reason forcing the atlas can never change the image:
+//  10 = red = cascade 0 fade, green = cascade 1 fade (black => coords out of range => the bug)
+//  11 = the raw shadow UV      12 = the shadow UV halved
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_shadow, 0, "GPU",
+                     "Debug: replace the world pixel shader with the sun shadow lookup (1-9), or "
+                     "show the cascade fade on one known shader (10-12).");
 
 namespace nx1::d3d9 {
 
@@ -400,6 +424,13 @@ void Renderer::SetRenderTarget(const uint8_t* base, uint32_t index, uint32_t gue
     device_->SetRenderTarget(index, surface);
     if (index == 0) {
       current_rt_surface_ = guest_surface;
+      // Honour the surface's colour format: NX1 draws the world through a
+      // k_8_8_8_8_GAMMA view (the hardware gamma-encodes on write) and its shaders,
+      // post chain and scanout are all balanced around that. Writing linear instead
+      // leaves the whole frame a gamma curve darker -- a permanent dusk.
+      const uint32_t color_fmt =
+          (GuestRead32(base, guest_surface + kSurfaceColorInfoOffset) >> 16) & 0xF;
+      device_->SetRenderState(D3DRS_SRGBWRITEENABLE, color_fmt == 1 ? TRUE : FALSE);
       uint32_t w = 0, h = 0;
       if (ReadSurfaceSize(base, guest_surface, &w, &h)) {
         current_rt_width_ = w;
@@ -643,6 +674,19 @@ void Renderer::ResolveViewport(const uint8_t* base, uint32_t guest_device) {
   const float z_min = std::clamp(v.offset_z, 0.0f, 1.0f);
   const float z_max = std::clamp(v.offset_z + v.scale_z, 0.0f, 1.0f);
 
+  // TEMP DIAGNOSTIC (no shadows): the shadow-cascade passes render into tall (1024x2048)
+  // targets; log their guest viewport, especially the Z mapping, to compare the depth the
+  // pass writes against the light-space depth the lighting shaders reconstruct.
+  if (current_rt_height_ > current_rt_width_ && current_rt_height_ >= 1024) {
+    static uint32_t n = 0;
+    if ((n++ % 499) == 0) {
+      REXGPU_INFO("nx1_d3d9: SHADOWVP rt={}x{} clip_disable={} scale=({:.4g},{:.4g},{:.6g}) "
+                  "offset=({:.4g},{:.4g},{:.6g}) -> vpz=[{:.6g},{:.6g}]",
+                  current_rt_width_, current_rt_height_, v.clip_disable, v.scale_x, v.scale_y,
+                  v.scale_z, v.offset_x, v.offset_y, v.offset_z, z_min, z_max);
+    }
+  }
+
   D3DVIEWPORT9 vp;
   vp.X = DWORD(std::max(0.0f, host_offset[0]));
   vp.Y = DWORD(std::max(0.0f, host_offset[1]));
@@ -655,9 +699,19 @@ void Renderer::ResolveViewport(const uint8_t* base, uint32_t guest_device) {
   }
 }
 
-void Renderer::UploadPixelUniforms(uint32_t base_reg, const uint8_t* base, uint32_t guest_device) {
+void Renderer::UploadPixelUniforms(uint32_t base_reg, bool needs_inv_tex_dim, const uint8_t* base,
+                                   uint32_t guest_device) {
+  // ps_3_0 only exposes 224 float registers.
+  if (base_reg + 2 > 224) {
+    return;
+  }
   const AlphaTestState alpha = ReadAlphaTestState(base, guest_device);
 
+  // The translator binds these at *fixed* offsets above the constant window:
+  //   [0]     = alpha threshold
+  //   [1]     = alpha compare function
+  //   [2..17] = g_InvTexDim[16], (1/width, 1/height) per sampler
+  //
   // The shader's alpha-test branch was baked in from its spec-constant mask, so a
   // shader that has one always runs it. Disabling the test at the render-state
   // level therefore has to be expressed as "always pass" (compare function 7).
@@ -665,6 +719,25 @@ void Renderer::UploadPixelUniforms(uint32_t base_reg, const uint8_t* base, uint3
   const float compare[4] = {float(alpha.enabled ? alpha.compare_function : 7u), 0.0f, 0.0f, 0.0f};
   device_->SetPixelShaderConstantF(base_reg, threshold, 1);
   device_->SetPixelShaderConstantF(base_reg + 1, compare, 1);
+
+  // g_InvTexDim feeds offset tfetches: `tex2D(s, uv + offset * g_InvTexDim[i].xy)`, and the
+  // translator only *declares* it for shaders that have one. Writing it regardless walks over 16
+  // registers the shader never reserved -- which is where fxc parked its `def` literals, and D3D9
+  // keeps those in the same constant file (a Set*ShaderConstantF after SetPixelShader wins).
+  // Clobbering `def cN, 0, 1, -1, -0` -- the 0/1 source of every flattened `cmp` -- kills every
+  // predicated block in the shader. So upload it only for shaders that actually read it.
+  if (!needs_inv_tex_dim || base_reg + 18 > 224) {
+    return;
+  }
+  float dims[16 * 4] = {};
+  for (uint32_t s = 0; s < 16; ++s) {
+    const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, s);
+    if (t.valid && t.width && t.height) {
+      dims[s * 4 + 0] = 1.0f / float(t.width);
+      dims[s * 4 + 1] = 1.0f / float(t.height);
+    }
+  }
+  device_->SetPixelShaderConstantF(base_reg + 2, dims, 16);
 }
 
 bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_device) {
@@ -716,58 +789,166 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     UploadVertexUniforms(HostConstantCount(*vs));
   }
 
-  // EXPERIMENT: replace every colour pixel shader with a flat mid-grey output. This keeps the
-  // geometry, depth and vertex path exactly as-is but removes all texture sampling and lighting
-  // math. If the speckle vanishes it lives in the pixel shader (texture/lighting); if it
-  // survives a flat-shaded world it is geometry/edge aliasing and only MSAA will touch it.
+  // TEMP DIAGNOSTIC (no shadows): replace the world pixel shader with one that does the sun
+  // shadow lookup *itself* and shows the result. The guest VS puts the shadow lookup
+  // (world -> shadow atlas UV + light-space depth) in TEXCOORD4, and the shadow atlas is on
+  // sampler 5. This bypasses the guest PS's p0 predication entirely, so it isolates the data
+  // (atlas + UV + depth) from the shader logic that consumes it:
+  //   mode 1: red = stored atlas depth at the fragment's shadow UV (should look like a depth
+  //           render of the scene from the sun; uniform => UV wrong)
+  //   mode 2: green = the fragment's own light-space depth (should be a smooth gradient)
+  //   mode 3: white/black = the actual compare, i.e. the shadow itself
   static IDirect3DPixelShader9* debug_ps = nullptr;
   static bool debug_ps_tried = false;
   if (!debug_ps_tried) {
     debug_ps_tried = true;
-    // Solid colour keyed to sampler 0's Xenos texture format (set as c0 per draw), so the
-    // garbage surface reveals which format it uses.
     const char* kSrc =
-        "float4 g : register(c0);\n"
-        "float4 main() : COLOR { return g; }";
+        // The guest PS uses v4.xy directly as the atlas UV (`add r14, c3, v4.xyxy`) -- there is
+        // no perspective divide, and o4.w is a 4th linear function, not a divisor.
+        "sampler2D shadowMap : register(s5);\n"
+        "float4 mode : register(c0);\n"
+        "float4 main(float4 t4 : TEXCOORD4) : COLOR {\n"
+        "  float2 uv = t4.xy;\n"
+        "  float d = tex2D(shadowMap, uv).r;\n"
+        "  if (mode.x < 1.5) return float4(d, d, d, 1);\n"          // atlas depth (dark: 0..0.5)
+        "  if (mode.x < 2.5) return float4(d * 2, d * 2, d * 2, 1);\n"  // amplified
+        "  if (mode.x < 3.5) return float4(t4.z, t4.z, t4.z, 1);\n"  // fragment light depth
+        "  if (mode.x < 4.5) return float4(frac(uv.x), frac(uv.y), 0, 1);\n"  // the UV itself
+        "  if (mode.x < 5.5) return float4(uv.x, uv.y, 0, 1);\n"     // UV unwrapped (range check)
+        "  if (mode.x < 6.5) { float l = (t4.z >= d) ? 1.0 : 0.0; return float4(l, l, l, 1); }\n"
+        // 7/8 are the A/B for why u overshoots ~2x. If either renders a real shadow pattern
+        // (and not noise), that is the answer:
+        //   7: the sampler is meant to WRAP  -> folding u back into range fixes it
+        //   8: the u row's scale is 2x wrong -> halving u fixes it
+        "  if (mode.x < 7.5) {\n"
+        "    float dw = tex2D(shadowMap, frac(uv)).r;\n"
+        "    float l = (t4.z >= dw) ? 1.0 : 0.0; return float4(l, l, l, 1);\n"
+        "  }\n"
+        "  if (mode.x < 8.5) {\n"
+        "    float dh = tex2D(shadowMap, float2(uv.x * 0.5, uv.y)).r;\n"
+        "    float l = (t4.z >= dh) ? 1.0 : 0.0; return float4(l, l, l, 1);\n"
+        "  }\n"
+        "  return float4(frac(uv.x * 0.5), uv.y, 0, 1);\n"           // 9: half-u UV range check
+        "}";
     ID3DBlob* code = nullptr;
+    ID3DBlob* err = nullptr;
     if (SUCCEEDED(D3DCompile(kSrc, strlen(kSrc), nullptr, nullptr, nullptr, "main", "ps_3_0", 0, 0,
-                             &code, nullptr)) &&
+                             &code, &err)) &&
         code) {
       device_->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &debug_ps);
       code->Release();
+    } else if (err) {
+      REXGPU_ERROR("nx1_d3d9: shadow debug PS failed: {}",
+                   static_cast<const char*>(err->GetBufferPointer()));
     }
+    if (err) err->Release();
   }
-  // Only flatten the offscreen world passes, not the fullscreen composite/tonemap that samples
-  // them: the composite renders to the display-sized target, the world to a smaller one.
-  const bool offscreen = current_rt_width_ != backbuffer_width_ ||
-                         current_rt_height_ != backbuffer_height_;
-  if (false && ps && debug_ps && offscreen) {
-    // Legend (Xenos format -> colour): 18 DXT1 red, 20 DXT5 green, 49 DXN blue, 58 DXT3A yellow,
-    // 59 DXT5A orange, 6 8888 magenta, 10 A8L8 cyan, 2 L8 white, anything else grey.
-    const uint32_t fmt = ReadTextureFetchConstant(base, guest_device, 0).format;
-    static uint32_t legend_logged = 0;
-    float c[4] = {0.5f, 0.5f, 0.5f, 1.0f};
-    switch (fmt) {
-      case 18: c[0] = 1; c[1] = 0; c[2] = 0; break;      // DXT1 red
-      case 20: c[0] = 0; c[1] = 1; c[2] = 0; break;      // DXT5 green
-      case 49: c[0] = 0; c[1] = 0; c[2] = 1; break;      // DXN blue
-      case 58: c[0] = 1; c[1] = 1; c[2] = 0; break;      // DXT3A yellow
-      case 59: c[0] = 1; c[1] = 0.5f; c[2] = 0; break;   // DXT5A orange
-      case 6:  c[0] = 1; c[1] = 0; c[2] = 1; break;      // 8888 magenta
-      case 10: c[0] = 0; c[1] = 1; c[2] = 1; break;      // A8L8 cyan
-      case 2:  c[0] = 1; c[1] = 1; c[2] = 1; break;      // L8 white
-      default:
-        if (legend_logged++ < 40) {
-          REXGPU_INFO("nx1_d3d9: debug fmt {} -> grey (unlisted)", fmt);
-        }
-        break;
+  // Only hijack draws that really do have the shadow atlas on s5 (a depth-format fetch) --
+  // every other world draw has an ordinary texture there and would just show its red channel.
+  // TEMP DIAGNOSTIC (no shadows): show the CASCADE FADE, the thing that multiplies the shadow
+  // term to zero. Read straight out of the emitted SM3 HLSL for shader 4E127BDFABD81721:
+  //
+  //   r8.xyzw = r8.xywz + c[3].wzzz;          cascade-space coords
+  //   r0.yw   = max(abs(r8.yz), abs(r8.xw));  box distance
+  //   r0.xy   = saturate(-r0.yw + c[16].xx);  <-- FADE; 0 here erases the shadow
+  //   r0.x    = r0.z * r0.x + r0.w;           PCF result * FADE
+  //
+  // The guest's own constants are still in the D3D9 constant file when we swap the shader in
+  // (SetPixelShader does not clear it), so this reads the REAL c1/c3/c16 rather than guesses.
+  // That makes the register numbers shader-specific, hence the exact-hash gate: for this shader
+  // c1<-g2, c3<-g4=(16,32,-8,-24), c16<-g254=(8,..). Cascade 0 survives u in (0,1), v in (0,0.5)
+  // (the atlas's top tile); cascade 1 survives u in (0,4), v in (0,1.5) and remaps into the
+  // bottom tile. If both fades are black on screen, the coordinates are out of range and that is
+  // the bug; if they are lit, the fade is innocent and the fault is downstream of it.
+  static IDirect3DPixelShader9* fade_ps = nullptr;
+  static bool fade_ps_tried = false;
+  if (!fade_ps_tried) {
+    fade_ps_tried = true;
+    const char* kFadeSrc =
+        // Fed by the host from each shader's own remap (guest g2/g4), not by register number:
+        // the same engine constant lands in a different host register in every shader.
+        "float4 c1 : register(c25);\n"
+        "float4 c3 : register(c26);\n"
+        "float4 c16 : register(c27);\n"
+        "float4 mode : register(c24);\n"
+        "float4 main(float4 t4 : TEXCOORD4) : COLOR {\n"
+        "  float u = t4.x, v = t4.y;\n"
+        // cascade 0: the coords used directly (r8.z = 16u-8, r8.w = 32v-8)
+        "  float d0 = max(abs(c3.x * u + c3.z), abs(c3.y * v + c3.z));\n"
+        "  float fade0 = saturate(-d0 + c16.x);\n"
+        // cascade 1: coords rescaled by c1 first (r8.y = 16*(.25u+c1.x)-8, r8.x = 32*(.25v+c1.y)-24)
+        "  float d1 = max(abs(c3.x * (u * c1.w + c1.x) + c3.z),\n"
+        "                 abs(c3.y * (v * c1.w + c1.y) + c3.w));\n"
+        "  float fade1 = saturate(-d1 + c16.x);\n"
+        "  if (mode.x < 10.5) return float4(fade0, fade1, 0, 1);\n"  // 10: red=c0 green=c1
+        "  if (mode.x < 11.5) return float4(saturate(u), saturate(v), 0, 1);\n"  // 11: raw uv
+        "  return float4(saturate(u * 0.5), saturate(v * 0.5), 0, 1);\n"  // 12: uv halved
+        "}";
+    ID3DBlob* code = nullptr;
+    ID3DBlob* err = nullptr;
+    if (SUCCEEDED(D3DCompile(kFadeSrc, strlen(kFadeSrc), nullptr, nullptr, nullptr, "main",
+                             "ps_3_0", 0, 0, &code, &err)) &&
+        code) {
+      device_->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &fade_ps);
+      code->Release();
+    } else if (err) {
+      REXGPU_ERROR("nx1_d3d9: fade debug PS failed: {}",
+                   static_cast<const char*>(err->GetBufferPointer()));
     }
-    device_->SetPixelShader(debug_ps);
-    device_->SetPixelShaderConstantF(0, c, 1);
-    device_->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-    return true;
+    if (err) err->Release();
+    // Say so unconditionally: a probe that silently does not exist is indistinguishable from a
+    // probe that ran and found nothing -- and that ambiguity has already cost runs here.
+    REXGPU_INFO("nx1_d3d9: FADEPROBE shader built={} cvar={}", fade_ps != nullptr,
+                REXCVAR_GET(nx1_d3d9_dbg_shadow));
   }
 
+  const int32_t dbg_shadow = REXCVAR_GET(nx1_d3d9_dbg_shadow);
+  if (dbg_shadow >= 10 && ps && fade_ps) {
+    // Every draw that binds the depth atlas on s5 -- the signature of a sun-shadow draw. Gating
+    // on one shader hash covered too few pixels to see (it drew, but nothing changed on screen).
+    const TextureFetchConstant s5 = ReadTextureFetchConstant(base, guest_device, 5);
+    const int r_c1 = cache.HostRegisterForGuest(*ps, 2);  // cascade-1 rescale
+    const int r_c3 = cache.HostRegisterForGuest(*ps, 4);  // cascade scale/offset (16,32,-8,-24)
+    if (s5.valid && (s5.format == 22 || s5.format == 23) && r_c1 >= 0 && r_c3 >= 0) {
+      // Upload the guest's own constants FIRST: the normal path does this below, after the point
+      // we return from, so c1/c3 would otherwise still hold the previous draw's values -- the
+      // exact stale-register trap that produced a false theory once already.
+      cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
+      float c1v[4] = {}, c3v[4] = {};
+      device_->GetPixelShaderConstantF(r_c1, c1v, 1);
+      device_->GetPixelShaderConstantF(r_c3, c3v, 1);
+      device_->SetPixelShader(fade_ps);  // fade_ps has no `def`s, so it cannot clobber these
+      device_->SetPixelShaderConstantF(25, c1v, 1);
+      device_->SetPixelShaderConstantF(26, c3v, 1);
+      const float fade_edge[4] = {8.0f, 0, 0, 0};  // c16.xx; a per-shader literal, 8.0 here
+      device_->SetPixelShaderConstantF(27, fade_edge, 1);
+      const float m[4] = {float(dbg_shadow), 0, 0, 0};
+      device_->SetPixelShaderConstantF(24, m, 1);
+      device_->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+      static std::mutex fm;
+      static std::vector<uint64_t> fseen;
+      std::lock_guard<std::mutex> lk(fm);
+      if (std::find(fseen.begin(), fseen.end(), ps_hash) == fseen.end() && fseen.size() < 8) {
+        fseen.push_back(ps_hash);
+        REXGPU_INFO("nx1_d3d9: FADEPROBE {:016X} mode={} c1(g2)=c{}=({:.4g},{:.4g},{:.4g},{:.4g}) "
+                    "c3(g4)=c{}=({:.4g},{:.4g},{:.4g},{:.4g})",
+                    ps_hash, dbg_shadow, r_c1, c1v[0], c1v[1], c1v[2], c1v[3], r_c3, c3v[0],
+                    c3v[1], c3v[2], c3v[3]);
+      }
+      return true;
+    }
+  }
+  if (dbg_shadow > 0 && dbg_shadow < 10 && ps && debug_ps && current_rt_width_ == 1024 &&
+      current_rt_height_ == 600) {
+    const TextureFetchConstant s5 = ReadTextureFetchConstant(base, guest_device, 5);
+    if (s5.valid && (s5.format == 22 || s5.format == 23)) {
+      device_->SetPixelShader(debug_ps);
+      const float m[4] = {float(dbg_shadow), 0, 0, 0};
+      device_->SetPixelShaderConstantF(0, m, 1);
+      device_->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+      return true;
+    }
+  }
   device_->SetPixelShader(ps ? ps->ps : nullptr);
   // A draw with no pixel shader is a depth/shadow-only pass: the Xbox exports no
   // color, so nothing is written to the render target. On D3D9, SetPixelShader(null)
@@ -780,7 +961,7 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   device_->SetRenderState(D3DRS_COLORWRITEENABLE, ps ? ReadColorWriteMask(base, guest_device) : 0);
   if (ps) {
     cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
-    UploadPixelUniforms(HostConstantCount(*ps), base, guest_device);
+    UploadPixelUniforms(HostConstantCount(*ps), ps->needs_inv_tex_dim, base, guest_device);
   }
 
   return true;
@@ -942,7 +1123,190 @@ void Renderer::InvalidateSamplerShadow() {
   }
 }
 
-void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device) {
+// TEMP DIAGNOSTIC (world darkness): on scene-pass draws, log which samplers carry a valid fetch
+// constant but no host texture (a lightmap that fails to materialize samples as black -> the
+// whole world drops to ambient), and dump the first few distinct world pixel shaders with their
+// constants to identify the lightmap sampler and any sun/exposure uniforms.
+void Renderer::ProbeWorldDraw(const uint8_t* base, uint32_t guest_device) {
+  if (current_rt_width_ == backbuffer_width_ || current_rt_height_ < 400) {
+    return;  // scene pass only: offscreen, world-sized
+  }
+  static uint32_t tick = 0;
+  if ((tick++ % 397) != 0) {
+    return;
+  }
+  auto& tracker = ResourceTracker::Get();
+  uint32_t depth_mask = 0;  // samplers bound to a depth (f22/f23) fetch this draw
+  char b[900];
+  int n = std::snprintf(b, sizeof(b), "nx1_d3d9: WORLDTEX rt=%ux%u", current_rt_width_,
+                        current_rt_height_);
+  for (uint32_t s = 0; s < 16 && n < 830; ++s) {
+    const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, s);
+    if (!t.valid || !t.base_address) {
+      continue;
+    }
+    IDirect3DBaseTexture9* tex = tracker.GetTexture(base, guest_device, s);
+    n += std::snprintf(b + n, sizeof(b) - n, " s%u:%ux%u f%u sw%03X %s", s, t.width, t.height,
+                       t.format, t.swizzle & 0xFFF, tex ? "ok" : "NULL");
+    if ((t.format == 22 || t.format == 23) && n < 810) {  // depth fetch: the shadow atlas
+      depth_mask |= 1u << s;
+      // The shadow lookup UV overshoots [0,1] on one axis (u~1.97, v~0.93 for a known object),
+      // so what the guest asks for here decides whether that is a bug or by design: WRAP (0)
+      // folds u back into range, CLAMP/BORDER does not.
+      const SamplerClampModes cm = ReadSamplerClampModes(base, guest_device, s);
+      n += std::snprintf(b + n, sizeof(b) - n, "@%08X clamp(u%u,v%u)->host(%u,%u)",
+                         t.base_address, cm.u, cm.v, uint32_t(HostAddressMode(cm.u)),
+                         uint32_t(HostAddressMode(cm.v)));
+    }
+  }
+  REXGPU_INFO("{}", b);
+
+  // The lit path (shadow taps, volume light, env cube) is predicated on p0, which needs
+  // `albedo.a * vertexColour.a >= c252.x`. If our vertex layout does not deliver COLOR, that
+  // alpha is 0 and the whole block is skipped -- which is exactly what forcing the shadow
+  // atlas proved. Read back the bound declaration and dump the COLOR element of a few real
+  // vertices.
+  if (depth_mask) {
+    static uint32_t vc = 0;
+    if ((vc++ % 211) == 0) {
+      IDirect3DVertexDeclaration9* decl = nullptr;
+      IDirect3DVertexBuffer9* vb = nullptr;
+      UINT off = 0, stride = 0;
+      if (SUCCEEDED(device_->GetVertexDeclaration(&decl)) && decl &&
+          SUCCEEDED(device_->GetStreamSource(0, &vb, &off, &stride)) && vb && stride) {
+        D3DVERTEXELEMENT9 els[MAXD3DDECLLENGTH + 1] = {};
+        UINT n_els = 0;
+        char eb[700];
+        int en = std::snprintf(eb, sizeof(eb), "nx1_d3d9: WORLDVTX stride=%u decl:", stride);
+        int color_off = -1, color_type = -1;
+        if (SUCCEEDED(decl->GetDeclaration(els, &n_els))) {
+          for (UINT i = 0; i + 1 < n_els && en < 600; ++i) {
+            en += std::snprintf(eb + en, sizeof(eb) - en, " [s%u+%u u%u/%u t%u]", els[i].Stream,
+                                els[i].Offset, els[i].Usage, els[i].UsageIndex, els[i].Type);
+            if (els[i].Usage == D3DDECLUSAGE_COLOR && els[i].Stream == 0) {
+              color_off = int(els[i].Offset);
+              color_type = int(els[i].Type);
+            }
+          }
+        }
+        en += std::snprintf(eb + en, sizeof(eb) - en, " | COLOR off=%d type=%d", color_off,
+                            color_type);
+        // The NORMAL is guest FMT_2_10_10_10 signed, expanded by us to FLOAT4. Garbage or
+        // constant normals make N.L constant -> exactly the flat, shadowless lighting we see,
+        // even with a correct sun. Dump them as floats; they must be unit-length and vary.
+        int norm_off = -1, norm_type = -1;
+        for (UINT i = 0; i + 1 < n_els; ++i) {
+          if (els[i].Usage == D3DDECLUSAGE_NORMAL && els[i].Stream == 0) {
+            norm_off = int(els[i].Offset);
+            norm_type = int(els[i].Type);
+          }
+        }
+        en += std::snprintf(eb + en, sizeof(eb) - en, " NORMAL off=%d type=%d", norm_off,
+                            norm_type);
+        void* data = nullptr;
+        if (SUCCEEDED(vb->Lock(off, 4 * stride, &data, D3DLOCK_READONLY)) && data) {
+          for (uint32_t v = 0; v < 4 && en < 560; ++v) {
+            const uint8_t* base_v = static_cast<const uint8_t*>(data) + size_t(v) * stride;
+            if (color_off >= 0) {
+              const uint8_t* p = base_v + color_off;
+              en += std::snprintf(eb + en, sizeof(eb) - en, " v%u:c[%02X %02X %02X %02X]", v, p[0],
+                                  p[1], p[2], p[3]);
+            }
+            if (norm_off >= 0 && norm_type == D3DDECLTYPE_FLOAT4) {
+              const float* nf = reinterpret_cast<const float*>(base_v + norm_off);
+              en += std::snprintf(eb + en, sizeof(eb) - en, " n(%.3f,%.3f,%.3f,%.3f)", nf[0], nf[1],
+                                  nf[2], nf[3]);
+            }
+          }
+          vb->Unlock();
+        }
+        REXGPU_INFO("{}", eb);
+      }
+      if (vb) vb->Release();
+      if (decl) decl->Release();
+    }
+  }
+
+  // Only dump shaders that actually sample a shadow/depth map this draw -- those hold the
+  // shadow compare we're after.
+  static uint32_t dumped = 0;
+  static std::unordered_set<void*> seen;
+  if (dumped >= 10 || !depth_mask) {
+    return;
+  }
+  IDirect3DPixelShader9* ps = nullptr;
+  if (FAILED(device_->GetPixelShader(&ps)) || !ps) {
+    return;
+  }
+  if (!seen.insert(ps).second) {
+    ps->Release();
+    return;
+  }
+  ++dumped;
+  float pc[24 * 4] = {};
+  device_->GetPixelShaderConstantF(0, pc, 24);
+  char cb[900];
+  int cn = 0;
+  for (uint32_t i = 0; i < 24 && cn < 850; ++i) {
+    cn += std::snprintf(cb + cn, sizeof(cb) - cn, " c%u(%.3g,%.3g,%.3g,%.3g)", i, pc[i * 4],
+                        pc[i * 4 + 1], pc[i * 4 + 2], pc[i * 4 + 3]);
+  }
+  const uint32_t ps_object = BoundPixelShader(base, guest_device);
+  const uint64_t ps_hash =
+      ps_object ? HashGuestUcode(ReadGuestUcode(base, ps_object, /*pixel_shader=*/true)) : 0;
+  const uint32_t vs_object = BoundVertexShader(base, guest_device);
+  const uint64_t vs_hash = vs_object
+      ? HashGuestUcode(ReadGuestUcode(base, vs_object, /*pixel_shader=*/false,
+                                      VertexShaderPass(base, vs_object, ps_object != 0)))
+      : 0;
+  REXGPU_INFO("nx1_d3d9: WORLDPS #{} ps={} pshash=0x{:016X} vshash=0x{:016X} depthmask={:#x} "
+              "consts:{}",
+              dumped, (void*)ps, ps_hash, vs_hash, depth_mask, cb);
+  UINT fsize = 0;
+  if (SUCCEEDED(ps->GetFunction(nullptr, &fsize)) && fsize) {
+    std::vector<uint8_t> fn(fsize);
+    if (SUCCEEDED(ps->GetFunction(fn.data(), &fsize))) {
+      ID3DBlob* text = nullptr;
+      if (SUCCEEDED(D3DDisassemble(fn.data(), fsize, 0, nullptr, &text)) && text) {
+        REXGPU_INFO("nx1_d3d9: WORLDPS-ASM #{}:\n{}", dumped,
+                    static_cast<const char*>(text->GetBufferPointer()));
+        text->Release();
+      }
+    }
+  }
+  ps->Release();
+
+  // The shadow UV + light-space depth (v4 in the PS) are computed in the VERTEX shader from
+  // the guest's shadow lookup matrix. Forcing the atlas to "occluded everywhere" changed
+  // nothing, so that varying is off-scale -- dump the VS and its constants to find the matrix.
+  IDirect3DVertexShader9* vs = nullptr;
+  if (SUCCEEDED(device_->GetVertexShader(&vs)) && vs) {
+    float vc[48 * 4] = {};
+    device_->GetVertexShaderConstantF(0, vc, 48);
+    char vb[1600];
+    int vn = 0;
+    for (uint32_t i = 0; i < 48 && vn < 1500; ++i) {
+      vn += std::snprintf(vb + vn, sizeof(vb) - vn, " c%u(%.4g,%.4g,%.4g,%.4g)", i, vc[i * 4],
+                          vc[i * 4 + 1], vc[i * 4 + 2], vc[i * 4 + 3]);
+    }
+    REXGPU_INFO("nx1_d3d9: WORLDVS #{} vsconsts:{}", dumped, vb);
+    UINT vsz = 0;
+    if (SUCCEEDED(vs->GetFunction(nullptr, &vsz)) && vsz) {
+      std::vector<uint8_t> fn(vsz);
+      if (SUCCEEDED(vs->GetFunction(fn.data(), &vsz))) {
+        ID3DBlob* text = nullptr;
+        if (SUCCEEDED(D3DDisassemble(fn.data(), vsz, 0, nullptr, &text)) && text) {
+          REXGPU_INFO("nx1_d3d9: WORLDVS-ASM #{}:\n{}", dumped,
+                      static_cast<const char*>(text->GetBufferPointer()));
+          text->Release();
+        }
+      }
+    }
+    vs->Release();
+  }
+}
+
+void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t surface_key) {
   auto& tracker = ResourceTracker::Get();
   // A scene is ~5000 draws over 16 samplers, and consecutive draws overwhelmingly share
   // their textures and filters -- so shadow the sampler state and only touch D3D when it
@@ -953,6 +1317,15 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device) {
   // so an object we release cannot be freed (and its address reused) while still bound.
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, guest_device, sampler);
+    // Read the fetch constant once (needed for both the LOD substitution and the sampler state).
+    TextureFetchConstant t{};
+    if (tex) {
+      t = ReadTextureFetchConstant(base, guest_device, sampler);
+      // For a static-geometry world draw, hold the highest-res texture this surface has shown and
+      // substitute it when the engine swaps sampler to a receding (garbage) LOD -- see
+      // PreferLargestForSurface. surface_key 0 (UI / inline draws) leaves the binding untouched.
+      tex = tracker.PreferLargestForSurface(surface_key, sampler, t.format, tex, t.width, t.height);
+    }
     if (tex != sampler_texture_[sampler]) {
       device_->SetTexture(sampler, tex);
       sampler_texture_[sampler] = tex;
@@ -960,7 +1333,6 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device) {
     if (!tex) {
       continue;
     }
-    const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, sampler);
     const SamplerClampModes clamp = ReadSamplerClampModes(base, guest_device, sampler);
     // Anisotropy is minification-only, so it replaces the min filter and nothing else. Half of
     // NX1's binds ask for a point *mip* filter, which is only sane on hardware that filters
@@ -969,16 +1341,24 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device) {
     const uint32_t aniso = HostMaxAnisotropy(t.aniso_filter, max_anisotropy_);
     const D3DTEXTUREFILTERTYPE min_filter =
         aniso > 1 ? D3DTEXF_ANISOTROPIC : HostFilter(t.min_filter);
+    // Pair smooth minification with a linear (trilinear) mip filter. NX1 often asks for a POINT mip
+    // filter, which on Xenos is fine because anisotropy filters underneath it -- but on desktop D3D9 a
+    // point mip filter under linear/aniso minification leaves hard mip-level steps, visible as bands
+    // sweeping across smooth gradients (the sky dome above all). Keep point mip only when the
+    // minification itself is point (a deliberately crisp surface).
+    const D3DTEXTUREFILTERTYPE mip_filter =
+        min_filter == D3DTEXF_POINT ? HostMipFilter(t.mip_filter) : D3DTEXF_LINEAR;
     const uint32_t states[kSamplerStates] = {
         uint32_t(HostAddressMode(clamp.u)), uint32_t(HostAddressMode(clamp.v)),
         uint32_t(HostAddressMode(clamp.w)), uint32_t(HostFilter(t.mag_filter)),
-        uint32_t(min_filter),               uint32_t(HostMipFilter(t.mip_filter)),
+        uint32_t(min_filter),               uint32_t(mip_filter),
         aniso,
+        uint32_t(t.gamma && REXCVAR_GET(nx1_d3d9_srgb_tex) ? TRUE : FALSE),
     };
     static constexpr D3DSAMPLERSTATETYPE kTypes[kSamplerStates] = {
         D3DSAMP_ADDRESSU,  D3DSAMP_ADDRESSV,  D3DSAMP_ADDRESSW,
         D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-        D3DSAMP_MAXANISOTROPY,
+        D3DSAMP_MAXANISOTROPY, D3DSAMP_SRGBTEXTURE,
     };
     for (uint32_t i = 0; i < kSamplerStates; ++i) {
       if (states[i] != sampler_state_[sampler][i]) {
@@ -1038,8 +1418,17 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   }
 
   device_->SetIndices(ib);
-  BindTextures(base, guest_device);
+  // Stable per-surface identity for prefer-largest LOD substitution: a static world surface draws
+  // the same index-buffer range every frame (the index buffers plateau at a few hundred addresses),
+  // so (ib address, draw range) keys the surface across its near/far LOD swaps. Mix in a golden-ratio
+  // constant so start_index/index_count don't collide across nearby ranges.
+  const uint32_t ib_base = ReadIndexBuffer(base, guest_device).base_address;
+  const uint64_t surface_key =
+      uint64_t(ib_base) ^ (uint64_t(start_index) * 0x9E3779B185EBCA87ull) ^
+      (uint64_t(index_count) << 40) ^ (uint64_t(base_vertex_index) * 0xD1B54A32D192ED03ull);
+  BindTextures(base, guest_device, surface_key);
   ApplyRenderStates(base, guest_device);
+  ProbeWorldDraw(base, guest_device);
 
   const HRESULT dhr = device_->DrawIndexedPrimitive(host_prim, int(base_vertex_index), 0,
                                                     vertex_count, start_index, prim_count);

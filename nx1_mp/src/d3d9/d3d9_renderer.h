@@ -118,7 +118,9 @@ class Renderer {
   bool BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t needed_vertices,
                    uint32_t* vertex_count);
   /// Untile + bind every bound texture and its sampler state.
-  void BindTextures(const uint8_t* base, uint32_t guest_device);
+  void BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t surface_key = 0);
+  /// TEMP DIAGNOSTIC (world darkness): sampler bindings + PS dump on scene-pass draws.
+  void ProbeWorldDraw(const uint8_t* base, uint32_t guest_device);
   /// The copy half of a resolve (EDRAM -> host texture). Caller holds render_mutex_.
   void ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
                    uint32_t dest_point);
@@ -137,7 +139,10 @@ class Renderer {
   /// Upload the packed NDC/half-pixel params a vertex shader expects at c[base_reg].
   void UploadVertexUniforms(uint32_t base_reg);
   /// Upload the alpha-test uniforms a pixel shader expects at c[base_reg], c[base_reg+1].
-  void UploadPixelUniforms(uint32_t base_reg, const uint8_t* base, uint32_t guest_device);
+  /// `needs_inv_tex_dim` gates the g_InvTexDim[16] block: uploading it to a shader that never
+  /// declared it overwrites the shader's own `def` literals (see ReadsUndefinedConstRange).
+  void UploadPixelUniforms(uint32_t base_reg, bool needs_inv_tex_dim, const uint8_t* base,
+                           uint32_t guest_device);
 
   Renderer() = default;
   ~Renderer() { Shutdown(); }
@@ -211,7 +216,7 @@ class Renderer {
   // InvalidateSamplerShadow() -- ResourceTracker's depth blit does exactly that on sampler
   // 0, and silently desyncing the shadow against it corrupted every later draw that
   // happened to want the texture the shadow still believed was bound.
-  static constexpr uint32_t kSamplerStates = 7;  ///< U, V, W address + mag, min, mip filter, aniso
+  static constexpr uint32_t kSamplerStates = 8;  ///< U, V, W address + mag, min, mip filter, aniso, sRGB
   static constexpr uint32_t kSamplerStateUnset = ~0u;
   /// Clamped to the adapter's D3DCAPS9::MaxAnisotropy at device creation; 1 = no aniso.
   uint32_t max_anisotropy_ = 1;

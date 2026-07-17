@@ -285,6 +285,7 @@ struct TextureFetchConstant {
   uint32_t base_address;  ///< guest physical byte address (dword1.base_address << 12)
   uint32_t format;        ///< xenos::TextureFormat
   uint32_t endian;        ///< xenos::Endian (0=none,1=8in16,2=8in32,3=16in32)
+  bool gamma;             ///< TextureSign::kGamma on RGB: hardware linearizes on fetch
   bool tiled;
   uint32_t pitch_pixels;  ///< row pitch in texels (dword0.pitch << 5); 0 => derive from width
   uint32_t width;         ///< texels
@@ -325,6 +326,10 @@ inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint
 
   TextureFetchConstant t{};
   t.valid = (d0 & 0x3) == 2;  // FetchConstantType::kTexture
+  // TextureSign::kGamma (3) on the RGB channels: the hardware linearizes the sample on
+  // fetch. NX1 flags its colour maps and every resolve of a k_8_8_8_8_GAMMA target this
+  // way -- mirror it with D3DSAMP_SRGBTEXTURE or the whole frame reads a gamma curve dark.
+  t.gamma = ((d0 >> 2) & 0x3) == 3;
   t.pitch_pixels = ((d0 >> 22) & 0x1FF) << 5;
   t.tiled = ((d0 >> 31) & 0x1) != 0;
   t.format = d1 & 0x3F;

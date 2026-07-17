@@ -53,18 +53,27 @@ struct CubeMapData
     int cubeMapIndex;
 };
 
+// The returned selector is 1-BASED, and must stay that way. Hardware returns a non-zero .w
+// here (the face id / major axis), and NX1's world lighting shaders do not merely carry it to
+// tfetchCube -- they predicate on it:
+//     cube r2, r11.xxzy, r11.yzxx
+//     setp_ne_push r4.___w, c252.xxxx, r2.wwww   ; p0 = (c252.x == 0) && (r2.w != 0)
+//     (p0) tfetch2D r7.x___, r16.xy, tf5         ; the eight sun shadow taps
+// A 0-based index made the first (and usually only) cube in a shader return .w = 0, so p0 was
+// false on every pixel and every shadow tap was dead code -- the world rendered lit but
+// perfectly flat. Keep this in step with cubeDir's threshold below.
 float4 cube(float4 value, inout CubeMapData d)
 {
     if (d.cubeMapIndex == 0) d.cubeMapDirections[0] = value.xyz;
     else                     d.cubeMapDirections[1] = value.xyz;
     float idx = (float)d.cubeMapIndex;
     d.cubeMapIndex++;
-    return float4(0.0, 0.0, 0.0, idx);
+    return float4(0.0, 0.0, 0.0, idx + 1.0);
 }
 
 float3 cubeDir(CubeMapData d, float sel)
 {
-    return sel < 0.5 ? d.cubeMapDirections[0] : d.cubeMapDirections[1];
+    return sel < 1.5 ? d.cubeMapDirections[0] : d.cubeMapDirections[1];
 }
 
 // Same semantics as shader_common.h's Nx1AlphaTestClip, but the compare function

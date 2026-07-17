@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -88,6 +89,77 @@ void ShaderCache::Shutdown() {
   device_ = nullptr;
 }
 
+#ifdef NX1_HAVE_SM3_SHADER_CACHE
+/// True when the shader reads a constant register in [lo, hi] that it does not `def` itself.
+///
+/// This is the test for "did the translator declare g_InvTexDim[16] at this register?". The PS
+/// uniform block sits at *fixed* offsets above the constant window -- threshold, compare
+/// function, then g_InvTexDim[16] -- but the translator only emits g_InvTexDim for shaders that
+/// actually have an offset tfetch (`needDims` in sm3_transform.cpp). A shader without one never
+/// reserves those 16 registers, and fxc parks its `def` literals in the free space.
+///
+/// That distinction matters because a `def` literal is NOT baked into the shader: it lives in
+/// the ordinary constant file and D3D9 applies it when the shader is *set*, so any
+/// Set*ShaderConstantF we issue afterwards for the same register silently overwrites it.
+/// Uploading all 18 registers unconditionally clobbered `def cN, 0, 1, -1, -0` -- the register
+/// every flattened `cmp` reads its 0/1 results from.
+///
+/// Inferring this from def *placement* does not work: fxc also places defs *below* the uniform
+/// base (observed: "uniforms at c1, first def at c0"). Reading the shader's actual constant use
+/// is the reliable signal.
+bool ReadsUndefinedConstRange(const DWORD* code, uint32_t dword_count, uint32_t lo, uint32_t hi) {
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51, kDcl = 0x1F;
+  constexpr uint32_t kRegNumMask = 0x7FF;
+  constexpr uint32_t kConstRegType = 1;  // D3DSPR_CONST
+  bool self_defined[512] = {};
+
+  // Pass 1: the registers the shader supplies itself.
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;  // SM2+ instruction length, in dwords
+    if (len == 0) break;                     // malformed; do not spin
+    if (op == kDef && i + 1 < dword_count) {
+      const uint32_t reg = code[i + 1] & kRegNumMask;
+      if (reg < 512) self_defined[reg] = true;
+    }
+    i += 1 + len;
+  }
+
+  // Pass 2: any constant read in [lo, hi] the shader did not define.
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (op != kDef && op != kDcl) {
+      for (uint32_t k = 1; k <= len && i + k < dword_count; ++k) {
+        const DWORD p = code[i + k];
+        if (!(p & 0x80000000u)) continue;  // not a parameter token
+        // Register type is split across bits 28..30 and 11..12; number is bits 0..10.
+        const uint32_t type = ((p >> 28) & 0x7) | ((p >> 8) & 0x18);
+        const uint32_t reg = p & kRegNumMask;
+        if (type == kConstRegType && reg >= lo && reg <= hi && reg < 512 && !self_defined[reg]) {
+          return true;
+        }
+      }
+    }
+    i += 1 + len;
+  }
+  return false;
+}
+#endif
+
 const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
 #ifndef NX1_HAVE_SM3_SHADER_CACHE
   (void)ucode_hash;
@@ -125,6 +197,23 @@ const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
   Sm3Shader shader{};
   shader.entry = found;
   const auto* code = reinterpret_cast<const DWORD*>(bytecode_ + found->bytecodeOffset);
+  // Does this pixel shader actually read g_InvTexDim[16]? It is bound at a fixed offset above
+  // the constant window, but only declared for shaders with an offset tfetch -- and uploading it
+  // to a shader that never declared it overwrites the `def` literals fxc put there.
+  if (found->flags & NX1_SM3_PIXEL_SHADER) {
+    const uint32_t base = (found->flags & NX1_SM3_UNCOMPACTED_CONSTANTS)
+                              ? kMaxHostConstants
+                              : (found->remapCount < 1u ? 1u : found->remapCount);
+    shader.needs_inv_tex_dim =
+        base + 17 < kMaxHostConstants &&
+        ReadsUndefinedConstRange(code, found->bytecodeSize / 4, base + 2, base + 17);
+    static uint32_t with_dims = 0, without_dims = 0;
+    (shader.needs_inv_tex_dim ? with_dims : without_dims)++;
+    if (((with_dims + without_dims) % 64) == 0) {
+      REXGPU_INFO("nx1_d3d9: g_InvTexDim classification: {} shaders read it, {} do not",
+                  with_dims, without_dims);
+    }
+  }
 
   HRESULT hr;
   if (found->flags & NX1_SM3_PIXEL_SHADER) {
@@ -176,6 +265,23 @@ bool NeedsHostNdcTransform(const Sm3Shader& shader) {
 #else
   return shader.entry && (shader.entry->flags & NX1_SM3_NEEDS_HOST_HALF_PIXEL) != 0;
 #endif
+}
+
+int ShaderCache::HostRegisterForGuest(const Sm3Shader& shader, uint32_t guest_register) const {
+#ifdef NX1_HAVE_SM3_SHADER_CACHE
+  const Nx1Sm3CacheEntry* e = shader.entry;
+  if (!e || (e->flags & NX1_SM3_UNCOMPACTED_CONSTANTS)) {
+    return int(guest_register);  // uncompacted: uploaded 1:1
+  }
+  for (uint32_t i = 0; i < e->remapCount; ++i) {
+    if (g_nx1Sm3ConstantRemap[e->remapOffset + i] == guest_register) {
+      return int(i);
+    }
+  }
+#endif
+  (void)shader;
+  (void)guest_register;
+  return -1;
 }
 
 void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
@@ -248,6 +354,111 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
   if (count == 0) {
     return;
   }
+
+  // TEMP DIAGNOSTIC (no shadows). Log each host register's GUEST source register, its uploaded
+  // value, and its provenance (literal table / PM4 ring / shadow file). The remap is PER SHADER,
+  // so any reading of a host constant without it is a guess.
+  //
+  // Gate each stage on the constants that actually matter, not on size -- a `count >= 14` cut
+  // never fired at all, because the world pixel shader is smaller than that.
+  //   VS: reads the sun shadow matrix (guest c24..c27 -> world-to-shadow-atlas UV).
+  //   PS: reads guest c252/c255 -- the literal registers feeding the p0 gate that predicates
+  //       every shadow tap (`sge r12.w, r7.w, c252.x` / `setp_ne_push p0, c255.y, r12.w`).
+  //       This is the whole ballgame: the atlas and the matrix are now proven good, so the
+  //       question is only why that predicate never lets the taps run.
+  bool reads_gate = false;
+  if (!(e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS)) {
+    if (pixel_stage) {
+      // Constant-based gates all failed to isolate the sun-shadow shader: 164 of the 2549
+      // dumped shaders carry the `(p0) tfetch2D ... tf5` pattern, and every one of them reads
+      // g252 for unrelated reasons too, so any log cap fills with the wrong shaders. The one
+      // reliable signature of a shadow draw is what it BINDS: a depth-format texture on
+      // sampler 5 (the atlas). Fetch constants live in guest memory, readable right here.
+      const TextureFetchConstant s5 = ReadTextureFetchConstant(base, guest_device, 5);
+      reads_gate = s5.valid && (s5.format == 22 || s5.format == 23);
+    } else {
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t g = g_nx1Sm3ConstantRemap[e.remapOffset + i];
+        if (g >= 24 && g <= 27) {
+          reads_gate = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!(e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS) && reads_gate) {
+    static std::mutex m;
+    static std::vector<const void*> seen_ps, seen_vs;  // per stage: one list starved the other
+    std::lock_guard<std::mutex> lk(m);
+    std::vector<const void*>& seen = pixel_stage ? seen_ps : seen_vs;
+    if (std::find(seen.begin(), seen.end(), (const void*)&e) == seen.end() && seen.size() < 12) {
+      seen.push_back((const void*)&e);
+      const char* stage = pixel_stage ? "PS" : "VS";
+      const void* obj = pixel_stage ? (const void*)shader.ps : (const void*)shader.vs;
+      char b[1600];
+      // The hash ties the line to tools/new_shader_dump/shader_<hash>.ucode.* -- without it the
+      // literal values are unreadable, because each shader packs its own pool into c252..c255
+      // and the microcode picks channels out of it (`c255.y` means nothing across shaders).
+      int nn = std::snprintf(b, sizeof(b), "nx1_d3d9: %sREMAP %016llX n=%u lits=%u |", stage,
+                             (unsigned long long)e.hash, count, literal_count);
+      (void)obj;
+      for (uint32_t i = 0; i < count && nn < 1450; ++i) {
+        const uint32_t g = g_nx1Sm3ConstantRemap[e.remapOffset + i];
+        const char* src = "sh";
+        for (uint32_t li = 0; li < literal_count; ++li) {
+          const uint32_t idx = g + file_base;
+          if (idx >= literals[li].reg && idx < literals[li].reg + literals[li].float4s) {
+            src = "LIT";
+            break;
+          }
+        }
+        if (src[0] == 's' && ring.Lookup(pixel_stage, g) != 0) {
+          src = "RING";
+        }
+        nn += std::snprintf(b + nn, sizeof(b) - nn, " c%u<-g%u=%s(%.4g,%.4g,%.4g,%.4g)", i, g, src,
+                            staging[i * 4], staging[i * 4 + 1], staging[i * 4 + 2],
+                            staging[i * 4 + 3]);
+      }
+      REXGPU_INFO("{}", b);
+      // The literal table itself: which file registers the shader loads, and from where.
+      char lb[600];
+      int ln = std::snprintf(lb, sizeof(lb), "nx1_d3d9: %sLITS %016llX count=%u |", stage,
+                             (unsigned long long)e.hash, literal_count);
+      for (uint32_t li = 0; li < literal_count && ln < 520; ++li) {
+        ln += std::snprintf(lb + ln, sizeof(lb) - ln, " [reg=%u n=%u @%08X]", literals[li].reg,
+                            literals[li].float4s, literals[li].address);
+      }
+      REXGPU_INFO("{}", lb);
+    }
+  }
+
+  // The sun shadow matrix (guest VS c24..c27) should be a per-FRAME cascade transform, i.e. the
+  // same for every world draw. Log it whenever it changes: if it churns per draw it is not a sun
+  // cascade at all, and if it carries no real translation the UVs land outside the atlas.
+  if (reads_gate && !pixel_stage) {
+    static std::mutex m2;
+    static float last[16] = {};
+    static uint32_t changes = 0;
+    float now[16] = {};
+    for (uint32_t r = 0; r < 4; ++r) {
+      read_register(24 + r, &now[r * 4]);
+    }
+    std::lock_guard<std::mutex> lk(m2);
+    if (std::memcmp(now, last, sizeof(now)) != 0 && changes < 12) {
+      ++changes;
+      std::memcpy(last, now, sizeof(now));
+      char sb[700];
+      int sn = std::snprintf(sb, sizeof(sb), "nx1_d3d9: SHADOWMTX #%u (vs=%p)", changes,
+                             (void*)shader.vs);
+      for (uint32_t r = 0; r < 4; ++r) {
+        sn += std::snprintf(sb + sn, sizeof(sb) - sn, " c%u=%s(%.6g,%.6g,%.6g,%.6g)", 24 + r,
+                            ring.Lookup(false, 24 + r) ? "RING" : "sh", now[r * 4], now[r * 4 + 1],
+                            now[r * 4 + 2], now[r * 4 + 3]);
+      }
+      REXGPU_INFO("{}", sb);
+    }
+  }
+
   if (pixel_stage) {
     device_->SetPixelShaderConstantF(0, staging, count);
   } else {

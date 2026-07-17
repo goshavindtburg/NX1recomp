@@ -138,6 +138,20 @@ class ResourceTracker {
   /// constant holds no texture or an unsupported format.
   IDirect3DBaseTexture9* GetTexture(const uint8_t* base, uint32_t guest_device, uint32_t sampler);
 
+  /// Prefer-largest-resolution substitution, keyed on a draw's STABLE geometry surface. The engine
+  /// streams world textures at CPU-side LODs: as a surface recedes it binds sampler 0/4/5 to a
+  /// physically smaller texture allocation, and in this build that far-LOD memory is recycled to
+  /// garbage (the distance "confetti"). This retains the largest texture a surface has decoded (the
+  /// full-res captured up close, which carries our host-generated mip chain) and substitutes it when
+  /// the engine later swaps to a smaller LOD, so the driver minifies clean pixels instead of garbage.
+  /// `surface_key` 0 disables it (UI / inline-geometry draws). `format` is the guest texture format,
+  /// mixed into the retention key so a different-format texture the same surface binds to this sampler
+  /// in another pass (e.g. a normal map in the depth pre-pass vs the albedo in the colour pass) is
+  /// never substituted for this one. Returns the texture to actually bind.
+  IDirect3DBaseTexture9* PreferLargestForSurface(uint64_t surface_key, uint32_t sampler,
+                                                 uint32_t format, IDirect3DBaseTexture9* tex,
+                                                 uint32_t width, uint32_t height);
+
   /// Untile + upload a 3D (volume) texture. The composite's colour-grading LUT is one, and an
   /// unbound sampler reads black -- which blacks out the entire composited frame.
   IDirect3DBaseTexture9* GetVolumeTexture(const TextureFetchConstant& t, uint32_t sampler);
@@ -266,6 +280,7 @@ class ResourceTracker {
   void* index_buffers_ = nullptr;  ///< std::unordered_map<uint64_t, IndexBufferEntry>*
   void* index_ranges_ = nullptr;   ///< std::unordered_map<uint64_t, uint32_t>* (draw -> max index)
   void* textures_ = nullptr;       ///< std::unordered_map<uint64_t, TextureEntry>*
+  void* best_textures_ = nullptr;  ///< std::unordered_map<uint64_t, BestTexture>* (surface^sampler -> largest)
   void* resolves_ = nullptr;       ///< std::unordered_map<uint64_t, ResolvedTarget>*
   void* render_targets_ = nullptr; ///< std::unordered_map<uint32_t, HostTarget>*
   IDirect3DSurface9* backbuffer_ = nullptr;

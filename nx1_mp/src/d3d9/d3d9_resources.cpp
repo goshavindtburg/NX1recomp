@@ -18,8 +18,10 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 
 #include <d3dcompiler.h>
 #include <xxhash.h>
@@ -31,6 +33,22 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
                     "Give textures a mip chain, filtered down from level 0 by the driver. Off "
                     "leaves every minified surface aliasing (the coloured speckle).")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// TEMP DIAGNOSTIC (no shadows)
+// Mind the polarity -- the obvious reading is backwards and cost a long detour. A tap is
+// consumed as `sge r14, r4.zzzz, r14` => `(frag_z >= atlas_z) ? 1 : 0`, where 1 means OCCLUDED,
+// and fragment light-space depths are ~0.45. So:
+//     100 (atlas = 1.0) => 0.45 >= 1.0 is false => nothing occluded => fully LIT (looks
+//                          identical to a broken shadow path -- useless as a test)
+//       0 (atlas = 0.0) => 0.45 >= 0.0 is true  => everything occluded => world goes DARK
+// 0 is the test that tells you whether the shadow path is live.
+REXCVAR_DEFINE_INT32(nx1_d3d9_shadow_test, -1, "GPU",
+                     "Debug: replace shadow-atlas depth with a constant (value/100). -1 = off, "
+                     "0 = everything occluded (world must go fully shadowed if the shadow path "
+                     "is live), 100 = nothing occluded.");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dump_shadow, false, "GPU",
+                    "Debug: dump each shadow-atlas resolve to texdump/shadow_atlas_*.bmp.");
 
 #ifdef _WIN32
 
@@ -223,7 +241,7 @@ enum : uint32_t {
 // RRRR fetch swizzle (replicate the one channel into all four) that we cannot
 // reproduce on a fixed-function D3D9 sampler, so we CPU-decode them to A8R8G8B8
 // with the value written into every channel -- then any shader swizzle reads it.
-enum class TexDecode { kNone, kDXT3A, kDXT5A };
+enum class TexDecode { kNone, kDXT3A, kDXT5A, kColorSwizzle };
 
 struct HostTextureFormat {
   D3DFORMAT d3d;
@@ -555,6 +573,16 @@ struct VertexHash {
 using VertexHashMap = std::unordered_map<uint64_t, VertexHash>;
 using IndexBufferMap = std::unordered_map<uint64_t, IndexBufferEntry>;
 using TextureMap = std::unordered_map<uint64_t, TextureEntry>;
+
+/// The largest-resolution texture a geometry surface has bound on a given sampler. `tex` is AddRef'd
+/// so it outlives eviction of the base-keyed TextureMap entry it came from. See PreferLargestForSurface.
+struct BestTexture {
+  IDirect3DBaseTexture9* tex = nullptr;
+  uint32_t area = 0;  ///< width * height of the retained texture
+  uint64_t last_frame = 0;
+};
+using BestTextureMap = std::unordered_map<uint64_t, BestTexture>;
+
 using ResolveMap = std::unordered_map<uint64_t, ResolvedTarget>;
 /// Keyed by EDRAM region, not by D3DSurface pointer -- see ReadSurfaceEdramKey.
 using TargetMap = std::unordered_map<uint64_t, HostTarget>;
@@ -836,6 +864,42 @@ void DecodeBcImage(D3DFORMAT fmt, const uint8_t* src, uint32_t row_bytes, uint32
   }
 }
 
+/// Decode a block-compressed COLOUR texture (BC1/2/3) into A8R8G8B8 while applying the fetch
+/// constant's channel swizzle. A compressed host texture samples fixed RGBA, so it cannot honour a
+/// swizzle that broadcasts one channel to RGB -- which is how the smoke/effect sprites are stored
+/// (luminance in one channel, mask in another, e.g. swizzle 0x200 = R,G,B<-red, A<-green). Those
+/// otherwise render as a single-channel, always-opaque square. `bc_fmt`/`bc_bytes` describe the
+/// source blocks; component index 4 selects constant 0, 5 selects constant 1.
+void DecodeBcColorSwizzledToArgb(uint8_t* dst, uint32_t dst_pitch, const uint8_t* src,
+                                 uint32_t blocks_wide, uint32_t blocks_high, uint32_t width,
+                                 uint32_t height, D3DFORMAT bc_fmt, uint32_t bc_bytes,
+                                 uint32_t swizzle) {
+  const uint8_t sel[4] = {uint8_t(swizzle & 7), uint8_t((swizzle >> 3) & 7),
+                          uint8_t((swizzle >> 6) & 7), uint8_t((swizzle >> 9) & 7)};
+  for (uint32_t by = 0; by < blocks_high; ++by) {
+    for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
+      Rgba8 tex[16];
+      DecodeBcBlock(bc_fmt, src + (size_t(by) * blocks_wide + bx) * bc_bytes, tex);
+      for (uint32_t ty = 0; ty < 4; ++ty) {
+        const uint32_t py = by * 4 + ty;
+        if (py >= height) break;
+        uint8_t* row = dst + size_t(py) * dst_pitch;
+        for (uint32_t tx = 0; tx < 4; ++tx) {
+          const uint32_t px = bx * 4 + tx;
+          if (px >= width) break;
+          const Rgba8& c = tex[ty * 4 + tx];
+          const uint8_t comp[8] = {c.r, c.g, c.b, c.a, 0, 255, 0, 0};
+          uint8_t* p = row + size_t(px) * 4;
+          p[0] = comp[sel[2]];  // B <- swizzle.z
+          p[1] = comp[sel[1]];  // G <- swizzle.y
+          p[2] = comp[sel[0]];  // R <- swizzle.x
+          p[3] = comp[sel[3]];  // A <- swizzle.w
+        }
+      }
+    }
+  }
+}
+
 uint16_t Pack565(Rgba8 c) {
   return uint16_t(((c.r >> 3) << 11) | ((c.g >> 2) << 5) | (c.b >> 3));
 }
@@ -1065,6 +1129,7 @@ void ResourceTracker::Initialize(IDirect3DDevice9Ex* device) {
   index_buffers_ = new IndexBufferMap();
   index_ranges_ = new IndexRangeMap();
   textures_ = new TextureMap();
+  best_textures_ = new BestTextureMap();
   resolves_ = new ResolveMap();
   render_targets_ = new TargetMap();
 
@@ -1192,6 +1257,14 @@ void ResourceTracker::Shutdown() {
     }
     delete map;
     textures_ = nullptr;
+  }
+  if (best_textures_) {
+    auto* map = static_cast<BestTextureMap*>(best_textures_);
+    for (auto& [key, b] : *map) {
+      if (b.tex) b.tex->Release();
+    }
+    delete map;
+    best_textures_ = nullptr;
   }
   if (resolves_) {
     auto* map = static_cast<ResolveMap*>(resolves_);
@@ -1726,6 +1799,18 @@ void ResourceTracker::AdvanceFrame() {
       }
     }
   }
+  // Per-surface retained textures (PreferLargestForSurface). Each holds a reference on a texture that
+  // may already be gone from textures_ above, so this is where those references are dropped.
+  if (auto* map = static_cast<BestTextureMap*>(best_textures_)) {
+    for (auto it = map->begin(); it != map->end();) {
+      if (it->second.last_frame < cutoff) {
+        if (it->second.tex) it->second.tex->Release();
+        it = map->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   if (auto* map = static_cast<VertexHashMap*>(vertex_hashes_)) {
     for (auto it = map->begin(); it != map->end();) {
       it = it->second.frame < cutoff ? map->erase(it) : std::next(it);
@@ -1984,7 +2069,23 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     return entry.tex;
   }
 
-  const HostTextureFormat host = PickHostTextureFormat(t.format);
+  HostTextureFormat host = PickHostTextureFormat(t.format);
+  // A block-compressed colour texture whose swizzle broadcasts one source channel to all of R,G,B
+  // (a luminance/mask sprite -- the smoke and effect sprites are stored this way, e.g. swizzle
+  // 0x200 = R,G,B<-red, A<-green) cannot be honoured by a compressed host texture, which samples a
+  // fixed RGBA. Materialise it to A8R8G8B8 and apply the swizzle ourselves. Normal RGB textures map
+  // R,G,B from distinct channels, so they stay compressed on the fast path.
+  D3DFORMAT src_bc = D3DFMT_UNKNOWN;
+  if (host.valid && host.decode == TexDecode::kNone &&
+      (host.d3d == D3DFMT_DXT1 || host.d3d == D3DFMT_DXT3 || host.d3d == D3DFMT_DXT5)) {
+    const uint32_t sx = t.swizzle & 7, sy = (t.swizzle >> 3) & 7, sz = (t.swizzle >> 6) & 7;
+    if (sx == sy && sy == sz && sx < 4) {  // R,G,B all from the same data channel -> broadcast
+      src_bc = host.d3d;
+      host.d3d = D3DFMT_A8R8G8B8;
+      host.decode = TexDecode::kColorSwizzle;
+      host.opaque_block = false;
+    }
+  }
   if (!host.valid) {
     if ((unsupported_texture_formats_++ % 100) == 0) {
       REXGPU_WARN("nx1_d3d9: unsupported Xenos texture format {} (sampler {})", t.format, sampler);
@@ -2078,6 +2179,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     entry.committed = false;
   }
 
+  // Set when a broadcast-swizzle sprite decodes to a fully transparent (unstreamed) image, so it is
+  // not committed and keeps re-decoding until its texel pool is resident.
+  bool swizzle_all_zero = false;
+
   // IDirect3DDevice9Ex has no D3DPOOL_MANAGED. Fill a lockable SYSTEMMEM staging
   // texture with level 0 and UpdateTexture it into a DEFAULT texture that can be sampled.
   IDirect3DTexture9* staging = nullptr;
@@ -2100,7 +2205,24 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       host.opaque_block ? extent.block_width * bpb : uint32_t(locked.Pitch);
   auto* dst = static_cast<uint8_t*>(locked.Pitch >= 0 ? locked.pBits : nullptr);
   if (dst) {
-    if (host.decode != TexDecode::kNone) {
+    if (host.decode == TexDecode::kColorSwizzle) {
+      // Detile the compressed colour blocks, then decode to A8R8G8B8 applying the channel swizzle
+      // (the compressed host format cannot honour a broadcast swizzle) -- see src_bc above.
+      std::vector<uint8_t> scratch(size_t(extent.block_width) * extent.block_height * bpb);
+      DetileMip2D(scratch.data(), extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DecodeBcColorSwizzledToArgb(dst, uint32_t(locked.Pitch), scratch.data(), extent.block_width,
+                                  extent.block_height, t.width, height, src_bc, bpb, t.swizzle);
+      // A broadcast-swizzle sprite that decodes to all zero is not resident yet: its texel pool has
+      // not been streamed in (the same residency gap behind the distant-surface confetti). Caching
+      // that as a settled texture would leave the effect permanently invisible even after the data
+      // lands, so mark it dirty to force a re-decode until it carries real content.
+      uint64_t sa = 0;
+      for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* r = dst + size_t(y) * locked.Pitch;
+        for (uint32_t x = 0; x < t.width; ++x) sa += r[x * 4 + 3];
+      }
+      swizzle_all_zero = sa == 0;
+    } else if (host.decode != TexDecode::kNone) {
       // CPU-decode single-channel BC-alpha: detile the compressed 8-byte blocks
       // into a linear scratch buffer, then expand each block to A8R8G8B8 (v,v,v,v).
       std::vector<uint8_t> scratch(size_t(extent.block_width) * extent.block_height * bpb);
@@ -2142,6 +2264,43 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       cur.swap(next);
     }
   }
+  // TEMP DIAGNOSTIC (no shadows): dump the decoded lightmap atlas (8888, 512x2048 / 512x1024)
+  // while its level 0 is still mapped. IW4 bakes the sun's shadows into the lightmaps, and
+  // forcing the dynamic shadow atlas changed nothing -- so the question is whether the baked
+  // shadows are present in this data at all.
+  if (dst && t.format == 6 && t.width == 512 && (height == 2048 || height == 1024)) {
+    static uint32_t n = 0;
+    if (n++ < 3) {
+      char p[128];
+      std::snprintf(p, sizeof(p), "texdump/lightmap_%08X_%ux%u.bmp", t.base_address, t.width,
+                    height);
+      if (FILE* f = std::fopen(p, "wb")) {
+        const uint32_t row = (t.width * 3 + 3) & ~3u;
+        uint8_t hdr[54] = {'B', 'M'};
+        const uint32_t fsz = 54 + row * height, off = 54, ih = 40, data = row * height;
+        const uint16_t planes = 1, bpp = 24;
+        std::memcpy(hdr + 2, &fsz, 4);  std::memcpy(hdr + 10, &off, 4);
+        std::memcpy(hdr + 14, &ih, 4);  std::memcpy(hdr + 18, &t.width, 4);
+        std::memcpy(hdr + 22, &height, 4); std::memcpy(hdr + 26, &planes, 2);
+        std::memcpy(hdr + 28, &bpp, 2); std::memcpy(hdr + 34, &data, 4);
+        std::fwrite(hdr, 1, 54, f);
+        std::vector<uint8_t> line(row, 0);
+        for (int y = int(height) - 1; y >= 0; --y) {
+          const uint8_t* r = dst + size_t(y) * locked.Pitch;
+          for (uint32_t x = 0; x < t.width; ++x) {
+            line[x * 3 + 0] = r[x * 4 + 0];
+            line[x * 3 + 1] = r[x * 4 + 1];
+            line[x * 3 + 2] = r[x * 4 + 2];
+          }
+          std::fwrite(line.data(), 1, row, f);
+        }
+        std::fclose(f);
+        REXGPU_INFO("nx1_d3d9: LIGHTMAPDUMP wrote {} (swizzle {:#05x}, tiled={})", p, t.swizzle,
+                    t.tiled);
+      }
+    }
+  }
+
   staging->UnlockRect(0);
 
   // D3DUSAGE_AUTOGENMIPMAP reports a single level and keeps its sub-levels to itself: the
@@ -2172,11 +2331,49 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
 
   entry.layout_key = layout_key;
   entry.dirty = false;
+  // A broadcast-swizzle sprite that came out fully transparent is not resident yet: keep it dirty
+  // (re-decode next bind) and never let it commit, so it recovers the moment its pool streams in.
+  if (swizzle_all_zero) {
+    entry.dirty = true;
+    entry.good_frames = 0;
+    entry.committed = false;
+  }
   // Record the guest byte range so DrainMemoryWrites can dirty this entry when the guest rewrites
   // it. The mirror itself armed the write-watch when it captured these pages in MirrorSnapshot.
   entry.watch_addr = t.base_address;
   entry.watch_size = uint32_t(guest_bytes);
   return entry.tex;
+}
+
+IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface_key,
+                                                                uint32_t sampler, uint32_t format,
+                                                                IDirect3DBaseTexture9* tex,
+                                                                uint32_t width, uint32_t height) {
+  if (!surface_key || !tex || !best_textures_) return tex;
+  auto* map = static_cast<BestTextureMap*>(best_textures_);
+  // Key on format as well as surface+sampler: the same geometry is drawn in several passes (shadow,
+  // depth pre-pass, colour) that each bind a DIFFERENT texture to the same sampler, so conflating
+  // them substituted, e.g., a normal map for the albedo. Separating by format keeps each pass's
+  // texture in its own lineage.
+  auto& b = (*map)[MixKey(MixKey(surface_key, sampler), format)];
+  b.last_frame = frame_;
+  const uint32_t area = width * height;
+  if (area > b.area) {
+    // STRICTLY larger -> the new best. Adopt it, holding a reference so it survives the base-keyed
+    // cache evicting the entry it came from. Strictly-larger (not >=) is deliberate: a same-size
+    // re-read of a texture whose slot was recycled to garbage must NOT replace the clean retained one.
+    if (b.tex) b.tex->Release();
+    tex->AddRef();
+    b.tex = tex;
+    b.area = area;
+    return tex;
+  }
+  // Same size: a fresh binding at the largest resolution (a render target, or updated content). Keep
+  // the retained texture but show the current one -- nothing is frozen stale at full resolution.
+  if (area == b.area) return tex;
+  // Smaller than what this surface has shown before: a receding LOD. Serve the retained full-res,
+  // whose host-built mip chain the driver minifies to clean pixels instead of the recycled garbage.
+  return b.tex ? b.tex : tex;
 }
 
 void ResourceTracker::SetBackbuffer(IDirect3DSurface9* surface, uint32_t width, uint32_t height) {
@@ -2549,9 +2746,15 @@ bool ResourceTracker::EnsureDepthBlit() {
   // Reads the INTZ depth surface and writes it as a plain float. ps_2_0, not 3_0: the
   // quad is drawn with pre-transformed (XYZRHW) vertices through the fixed-function
   // vertex pipeline, and D3D9 refuses to pair that with a 3_0 pixel shader.
+  // c0.x is a debug override (nx1_d3d9_shadow_test): x < 0 passes depth through, otherwise
+  // the blit writes the constant c0.x so the shadow compare can be exercised end-to-end.
   static const char kSource[] =
       "sampler2D depth : register(s0);\n"
-      "float4 main(float2 uv : TEXCOORD0) : COLOR { return tex2D(depth, uv).rrrr; }\n";
+      "float4 dbg : register(c0);\n"
+      "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
+      "  float d = tex2D(depth, uv).r;\n"
+      "  return (dbg.x < 0 ? d : dbg.x).rrrr;\n"
+      "}\n";
 
   ID3DBlob* code = nullptr;
   ID3DBlob* errors = nullptr;
@@ -2647,6 +2850,12 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   device_->SetVertexDeclaration(nullptr);
   device_->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
   device_->SetPixelShader(depth_blit_ps_);
+  // TEMP DIAGNOSTIC (no shadows): nx1_d3d9_shadow_test >= 0 replaces every shadow-atlas
+  // depth with that constant. 1.0 = "nearest occluder everywhere": if the lighting
+  // shaders' shadow path is live, the world must go fully shadowed.
+  const int32_t shadow_test = REXCVAR_GET(nx1_d3d9_shadow_test);
+  const float dbg[4] = {shadow_test < 0 ? -1.0f : float(shadow_test) / 100.0f, 0.0f, 0.0f, 0.0f};
+  device_->SetPixelShaderConstantF(0, dbg, 1);
   device_->SetTexture(0, src_depth);
   device_->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
   device_->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
@@ -2654,6 +2863,14 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   device_->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
   device_->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
   device_->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+  // The blit must copy raw depth values: the guest RT bound before this resolve is
+  // usually a gamma surface, which leaves sRGB *write* conversion enabled on the device.
+  // Save it across the blit -- the per-draw path does not reissue it (it is set at
+  // SetRenderTarget time), so leaking FALSE back out would undo the gamma encode of
+  // every draw until the next target switch.
+  DWORD old_srgb_write = FALSE;
+  device_->GetRenderState(D3DRS_SRGBWRITEENABLE, &old_srgb_write);
+  device_->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
   device_->SetRenderState(D3DRS_ZENABLE, FALSE);
   device_->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
   device_->SetRenderState(D3DRS_STENCILENABLE, FALSE);
@@ -2679,8 +2896,89 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
                               {x1, y1, 0.0f, 1.0f, u1, v1}};
   device_->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(BlitVertex));
 
+  // TEMP DIAGNOSTIC (no shadows): sample the atlas content after each blit. Degenerate
+  // stats (all zero / all one) mean the cascade passes never wrote depth; varied values
+  // mean the content is fine and the fault is in the lighting shader's sampling/compare.
+  {
+    static uint32_t n = 0;
+    if ((n++ % 181) == 0) {
+      IDirect3DSurface9* off = nullptr;
+      if (SUCCEEDED(device_->CreateOffscreenPlainSurface(width, height, D3DFMT_R32F,
+                                                         D3DPOOL_SYSTEMMEM, &off, nullptr)) &&
+          off) {
+        if (SUCCEEDED(device_->GetRenderTargetData(dst, off))) {
+          D3DLOCKED_RECT lr{};
+          if (SUCCEEDED(off->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+            float mn = 1e30f, mx = -1e30f;
+            double sum = 0;
+            uint64_t cnt = 0, zeros = 0;
+            for (uint32_t y = 0; y < height; y += 4) {
+              const float* row = reinterpret_cast<const float*>(
+                  static_cast<const uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch);
+              for (uint32_t x = 0; x < width; x += 4) {
+                const float v = row[x];
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+                sum += v;
+                ++cnt;
+                zeros += v == 0.0f ? 1 : 0;
+              }
+            }
+            REXGPU_INFO("nx1_d3d9: SHADOWATLAS 0x{:08X} {}x{} sr=({},{},{},{}) at=({},{}) "
+                        "min={:.6f} max={:.6f} mean={:.6f} zero={}% [shadow_test={}]",
+                        PhysicalAddress(dest_address), width, height, sr.left, sr.top, sr.right,
+                        sr.bottom, dest_point.x, dest_point.y, mn, mx,
+                        sum / double(std::max<uint64_t>(1, cnt)),
+                        zeros * 100 / std::max<uint64_t>(1, cnt), shadow_test);
+            // Dump the atlas itself: the stats say "real depth", but only the image says
+            // whether it is a *sun-view depth render of this scene* and whether both cascade
+            // tiles are populated. Normalized by max -- the useful values occupy a thin slice
+            // of [0,1] (the light-space depth range is ~62900 world units).
+            if (REXCVAR_GET(nx1_d3d9_dump_shadow) && mx > mn) {
+              static uint32_t dump_n = 0;
+              char path[256];
+              std::snprintf(path, sizeof(path), "texdump/shadow_atlas_%08X_%u.bmp",
+                            PhysicalAddress(dest_address), dump_n++);
+              if (std::FILE* f = std::fopen(path, "wb")) {
+                const uint32_t stride = (width * 3 + 3) & ~3u;
+                BITMAPFILEHEADER fh{};
+                BITMAPINFOHEADER ih{};
+                fh.bfType = 0x4D42;
+                fh.bfOffBits = sizeof(fh) + sizeof(ih);
+                fh.bfSize = fh.bfOffBits + stride * height;
+                ih.biSize = sizeof(ih);
+                ih.biWidth = LONG(width);
+                ih.biHeight = LONG(height);  // positive: rows are written bottom-up
+                ih.biPlanes = 1;
+                ih.biBitCount = 24;
+                std::fwrite(&fh, sizeof(fh), 1, f);
+                std::fwrite(&ih, sizeof(ih), 1, f);
+                std::vector<uint8_t> row(stride, 0);
+                for (uint32_t y = 0; y < height; ++y) {
+                  const float* src = reinterpret_cast<const float*>(
+                      static_cast<const uint8_t*>(lr.pBits) + size_t(height - 1 - y) * lr.Pitch);
+                  for (uint32_t x = 0; x < width; ++x) {
+                    const float t = (src[x] - mn) / (mx - mn);
+                    const uint8_t g = uint8_t((t < 0 ? 0 : t > 1 ? 1 : t) * 255.0f + 0.5f);
+                    row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = g;
+                  }
+                  std::fwrite(row.data(), stride, 1, f);
+                }
+                std::fclose(f);
+                REXGPU_INFO("nx1_d3d9: SHADOWATLAS dumped {}", path);
+              }
+            }
+            off->UnlockRect();
+          }
+        }
+        off->Release();
+      }
+    }
+  }
+
   device_->SetTexture(0, nullptr);
   device_->SetPixelShader(nullptr);
+  device_->SetRenderState(D3DRS_SRGBWRITEENABLE, old_srgb_write);
   device_->SetRenderTarget(0, old_rt);
   device_->SetDepthStencilSurface(old_ds);
   if (old_rt) {
