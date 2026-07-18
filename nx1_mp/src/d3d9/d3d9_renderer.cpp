@@ -1005,14 +1005,14 @@ void Renderer::UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg,
   std::memcpy(last_ps_dims_, dims, sizeof(dims));
 }
 
-bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_device,
-                                       const RecordedDraw& d) {
+void Renderer::ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_device,
+                                          RecordedDraw& d) {
   auto& cache = ShaderCache::Get();
 
   const uint32_t vs_object = d.vs_object;
   const uint32_t ps_object = d.ps_object;
   if (!vs_object) {
-    return false;
+    return;
   }
 
   // A pixel shader is optional: the depth pre-pass binds none, and that is exactly
@@ -1066,16 +1066,11 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
                     current_rt_height_);
       }
     }
-    return false;
+    return;
   }
+  d.vs = vs;
+  d.ps = ps;
 
-
-
-  const auto t_bind = smark();
-  if (vs->vs != bound_vs_) {
-    device_->SetVertexShader(vs->vs);
-    bound_vs_ = vs->vs;
-  }
   // Skip the upload when the guest says nothing changed. Measured: 94% of draws write no
   // vertex constants and 78% write no pixel constants, and UploadConstants re-reads and
   // re-uploads ~10 registers each time regardless.
@@ -1089,15 +1084,56 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   const bool skip_vs_constants = REXCVAR_GET(nx1_d3d9_skip_clean_constants) &&
                                  guest_dirty_vs_ == 0 && ring_gen == last_const_ring_gen_ &&
                                  vs == last_const_vs_;
+  // A skipped stage records count 0, which is exactly what the executor needs: the values are
+  // already sitting in the device's constant file from the draw that did upload them.
+  float staging[kMaxHostConstants * 4];
   if (skip_vs_constants) {
     ++prof_const_skipped_vs_;
   } else {
-    // DEFERRED-GAP: reads the guest's live constant file. This is the one the recorder already
-    // has an answer for -- d.constant_delta indexes the groups the guest rewrote -- but the
-    // executor needs a running constant file to apply them into before this can switch over.
-    // That is the next increment; see ExecuteDraw.
-    cache.UploadConstants(base, guest_device, *vs, /*pixel_stage=*/false);
+    const uint32_t n = cache.ResolveConstants(base, guest_device, *vs, /*pixel_stage=*/false,
+                                              staging);
+    d.vs_const_count = n;
+    d.vs_const_offset = cmdbuf_.AddConstants(staging, n);
     last_const_vs_ = vs;
+  }
+  if (ps) {
+    const bool skip_ps_constants = REXCVAR_GET(nx1_d3d9_skip_clean_constants) &&
+                                   guest_dirty_ps_ == 0 && ring_gen == last_const_ring_gen_ &&
+                                   ps == last_const_ps_;
+    if (skip_ps_constants) {
+      ++prof_const_skipped_ps_;
+    } else {
+      const uint32_t n = cache.ResolveConstants(base, guest_device, *ps, /*pixel_stage=*/true,
+                                                staging);
+      d.ps_const_count = n;
+      d.ps_const_offset = cmdbuf_.AddConstants(staging, n);
+      last_const_ps_ = ps;
+    }
+  }
+  last_const_ring_gen_ = ring_gen;
+}
+
+bool Renderer::BindShadersAndConstants(const RecordedDraw& d) {
+  auto& cache = ShaderCache::Get();
+  // Resolution already happened at record time and found no usable shader pair (no vertex
+  // shader bound, or a cache miss that was reported there). Nothing to draw.
+  if (!d.vs) {
+    return false;
+  }
+  const Sm3Shader* const vs = d.vs;
+  const Sm3Shader* const ps = d.ps;
+
+  const bool sprof = REXCVAR_GET(nx1_d3d9_profile);
+  const auto t_bind = sprof ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+
+  if (vs->vs != bound_vs_) {
+    device_->SetVertexShader(vs->vs);
+    bound_vs_ = vs->vs;
+  }
+  if (d.vs_const_count) {
+    cache.ApplyConstants(*vs, /*pixel_stage=*/false, cmdbuf_.constants(d.vs_const_offset),
+                         d.vs_const_count);
   }
   if (!NeedsHostNdcTransform(*vs)) {
     UploadVertexUniforms(*vs, HostConstantCount(*vs));
@@ -1109,7 +1145,7 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   if (ps) {
     active_sampler_mask_ |= ps->all_samplers ? 0xFFFFu : ps->sampler_mask;
   }
-  if (vs && vs->all_samplers) {
+  if (vs->all_samplers) {
     active_sampler_mask_ = 0xFFFFu;  // unwalkable VS: cannot rule out vertex-texture fetch
   }
 
@@ -1132,20 +1168,15 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     bound_color_write_ = want_color_write;
   }
   if (ps) {
-    const bool skip_ps_constants = REXCVAR_GET(nx1_d3d9_skip_clean_constants) &&
-                                   guest_dirty_ps_ == 0 && ring_gen == last_const_ring_gen_ &&
-                                   ps == last_const_ps_;
-    if (skip_ps_constants) {
-      ++prof_const_skipped_ps_;
-    } else {
-      cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
-      last_const_ps_ = ps;
+    if (d.ps_const_count) {
+      cache.ApplyConstants(*ps, /*pixel_stage=*/true, cmdbuf_.constants(d.ps_const_offset),
+                           d.ps_const_count);
     }
     UploadPixelUniforms(*ps, HostConstantCount(*ps), ps->needs_inv_tex_dim, d);
   }
-  sadd(prof_shbind_ns_, t_bind);
-  last_const_ring_gen_ = ring_gen;
-
+  if (sprof) {
+    prof_shbind_ns_ += uint64_t((std::chrono::steady_clock::now() - t_bind).count());
+  }
   return true;
 }
 
@@ -1526,6 +1557,10 @@ void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, Reco
   d.cull = ReadCullState(base, guest_device);
   d.alpha = ReadAlphaTestState(base, guest_device);
   d.color_write_mask = ReadColorWriteMask(base, guest_device);
+
+  // Last, because the constant skip is keyed on the shader pair this resolves. Everything above
+  // is a plain read of device state; this is the part that MUST stay on the guest thread.
+  ResolveShadersAndConstants(base, guest_device, d);
 }
 
 void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
@@ -1655,7 +1690,7 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
   padd(prof_viewport_ns_, t_vp);
 
   auto t_sh = ptick();
-  const bool shaders_ok = BindShadersAndConstants(base, guest_device, d);
+  const bool shaders_ok = BindShadersAndConstants(d);
   padd(prof_shaders_ns_, t_sh);
   if (!shaders_ok) {
     return;
@@ -1763,7 +1798,7 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
   CaptureDrawState(base, guest_device, d);
 
   ResolveViewport(d);
-  if (!BindShadersAndConstants(base, guest_device, d)) {
+  if (!BindShadersAndConstants(d)) {
     return;
   }
   // A non-indexed draw reads exactly [start_vertex, start_vertex + vertex_count), so its
@@ -1802,7 +1837,7 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
 
   ResolveViewport(d);
 
-  if (!BindShadersAndConstants(base, guest_device, d)) {
+  if (!BindShadersAndConstants(d)) {
     return;
   }
 
@@ -1877,7 +1912,7 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
   CaptureDrawState(base, guest_device, d);
 
   ResolveViewport(d);
-  if (!BindShadersAndConstants(base, guest_device, d)) {
+  if (!BindShadersAndConstants(d)) {
     return;
   }
 

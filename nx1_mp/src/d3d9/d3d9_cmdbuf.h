@@ -41,6 +41,35 @@
  * buys no speed at all; it exists so that any rendering difference is a recording-completeness
  * bug and nothing else, found without threading in the picture. Only once that is clean does
  * execution move to a worker, behind a cvar.
+ *
+ * THREADING CONTRACT
+ *
+ * Decided before writing the queue, because it determines what has to be queued at all.
+ *
+ * The device is created with D3DCREATE_MULTITHREADED, so the D3D9 runtime serialises concurrent
+ * calls for us. That solves THREAD-SAFETY and nothing else -- it does not give ORDERING, and
+ * ordering is the actual requirement: a resolve that runs before the draws it is meant to capture
+ * produces a correct-but-empty surface, and the shadow-cascade and composite passes depend
+ * entirely on that sequencing. So the rule is not "make the calls safe", it is:
+ *
+ *   EVERY command that affects the render stream -- draws, Clear, Resolve, SetRenderTarget,
+ *   SetDepthStencil -- goes through this ONE ordered buffer. The worker is the only thing that
+ *   executes them.
+ *
+ * The frame boundary does NOT need queueing, which is what keeps this small:
+ *
+ *   - Present and the ImGui overlay stay on the guest thread. They run AFTER the guest waits for
+ *     the worker to drain, so the worker is idle and no ordering question arises. Neither needs
+ *     any change.
+ *   - ResourceTracker becomes worker-owned for the duration of a frame. Nothing on the guest
+ *     thread touches it mid-frame: the XGSet*Header registration hooks are pure pass-throughs,
+ *     and the write-watch callback only queues ranges under its own lock (see MemWatchThunk).
+ *   - BeginFrame / DrainMemoryWrites run at the boundary, i.e. after the drain, for the same
+ *     reason.
+ *
+ * The drain barrier at Present is therefore the single synchronisation point, and the overlap
+ * being bought is the guest's between-draw logic (measured 5.3-7.5 ms) running while the worker
+ * translates.
  */
 
 #pragma once
@@ -54,6 +83,8 @@
 #include "guest_d3d.h"
 
 namespace nx1::d3d9 {
+
+struct Sm3Shader;  // d3d9_shaders.h
 
 /// A constant-file DELTA: only the register groups the guest actually rewrote, as raw guest
 /// bytes.
@@ -143,6 +174,24 @@ struct RecordedDraw {
   /// delta as the draw before it, so the executor simply does not re-apply anything.
   uint32_t constant_delta = 0;
 
+  /// RESOLVED constant values, ready to hand straight to SetVertex/PixelShaderConstantF.
+  ///
+  /// Resolution stays on the guest thread and only the upload is deferred -- see
+  /// ShaderCache::ResolveConstants for why that is forced rather than chosen (the PM4 ring and
+  /// the shader literals are both transient, and the guest's dirty mask does not even report ring
+  /// writes). Offsets index the frame's constant pool; count is REGISTERS, so the float span is
+  /// count*4. count == 0 means this stage had nothing to upload, which is the common case: the
+  /// clean-constant skip elides ~53% of vertex and ~16% of pixel uploads.
+  uint32_t vs_const_offset = 0;
+  uint32_t vs_const_count = 0;
+  uint32_t ps_const_offset = 0;
+  uint32_t ps_const_count = 0;
+
+  /// The translated shaders this draw runs, resolved at record time. Pointers are stable because
+  /// ShaderMap is node-based (see d3d9_shaders.cpp) -- do not convert it to FlatMap.
+  const Sm3Shader* vs = nullptr;
+  const Sm3Shader* ps = nullptr;
+
   /// Stable per-surface identity for the prefer-largest LOD substitution, computed at record
   /// time because it derives from the index range.
   uint64_t surface_key = 0;
@@ -155,10 +204,29 @@ struct RecordedDraw {
 /// unload.
 class CommandBuffer {
  public:
+  /// Append `count` registers (count*4 floats) of resolved constants; returns the pool offset.
+  ///
+  /// !! POINTER INVALIDATION -- MUST BE FIXED BEFORE THE WORKER LANDS !!
+  /// constants() hands back a pointer INTO this vector. Today that is safe only because the flow
+  /// is synchronous and strictly append-then-read within one draw: nothing appends between a
+  /// draw's AddConstants and its ApplyConstants. The moment a worker reads frame data while the
+  /// guest thread keeps recording, a growth reallocation frees the block the worker is reading --
+  /// a use-after-free that will present as random constant corruption or a driver crash, not as
+  /// an obvious fault. Same hazard the FlatMap notes describe, with a worse failure mode.
+  /// Fix before step 3: either reserve a hard cap and refuse to grow, or hand the executor
+  /// offsets into a chunked pool whose blocks never move.
+  uint32_t AddConstants(const float* values, uint32_t count) {
+    const uint32_t offset = uint32_t(const_pool_.size());
+    const_pool_.insert(const_pool_.end(), values, values + size_t(count) * 4);
+    return offset;
+  }
+  const float* constants(uint32_t offset) const { return const_pool_.data() + offset; }
+
   void BeginFrame() {
     draws_.clear();
     deltas_.clear();
     delta_pool_.clear();
+    const_pool_.clear();
     // The executor's running constant file carries across frames exactly as the guest's shadow
     // does, so a frame does not need to open with a full copy.
   }
@@ -183,13 +251,14 @@ class CommandBuffer {
   /// scheme and needs to stay visible.
   size_t captured_bytes() const {
     return draws_.size() * sizeof(RecordedDraw) + deltas_.size() * sizeof(ConstantDelta) +
-           delta_pool_.size();
+           delta_pool_.size() + const_pool_.size() * sizeof(float);
   }
 
  private:
   std::vector<RecordedDraw> draws_;
   std::vector<ConstantDelta> deltas_;
   std::vector<uint8_t> delta_pool_;
+  std::vector<float> const_pool_;
 };
 
 }  // namespace nx1::d3d9

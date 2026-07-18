@@ -130,9 +130,15 @@ class Renderer {
   /// called from the draw hook BEFORE __imp__, which is the only moment these bits are valid.
   void CaptureGuestDirtyMask(const uint8_t* base, uint32_t guest_device);
 
-  /// Resolve the guest's bound shaders, bind their SM3 translations, and upload
-  /// their constants. Returns false on a cache miss -- the draw must be skipped.
-  bool BindShadersAndConstants(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d);
+  /// Bind the SM3 shaders the record already resolved and upload their constants from the
+  /// record. Returns false when resolution found no usable pair -- the draw must be skipped.
+  bool BindShadersAndConstants(const RecordedDraw& d);
+
+  /// Record-time half: hash the guest's microcode, look up the SM3 translations, and RESOLVE
+  /// the constant values into the frame's pool. Must run on the guest thread -- the PM4 ring and
+  /// the shader literals it reads are both transient (see ShaderCache::ResolveConstants).
+  /// Leaves d.vs null on a cache miss, which is how the executor learns to skip the draw.
+  void ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_device, RecordedDraw& d);
 
  private:
   /// Translate and submit one recorded draw.
