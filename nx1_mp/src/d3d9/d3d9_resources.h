@@ -331,6 +331,11 @@ class ResourceTracker {
  private:
   TextureProfile prof_tex_;
 
+  /// Last layout GetVertexLayout resolved, memoized so a repeat draw skips the map probe.
+  /// See the comment there for why holding this pointer is safe.
+  uint64_t last_layout_key_ = 0;
+  const VertexLayout* last_layout_ = nullptr;
+
   /// Detile scratch for the CPU-decode formats, reused across rebuilds. It was a local
   /// std::vector, which malloc'd AND zero-filled up to a texture's worth of bytes on every
   /// rebuild only for DetileMip2D to overwrite every one of them. Grow-only, never shrunk, so

@@ -1296,6 +1296,8 @@ void ResourceTracker::Shutdown() {
     }
     delete map;
     layouts_ = nullptr;
+    last_layout_ = nullptr;  // memo points into the map just deleted
+    last_layout_key_ = 0;
   }
   if (vertex_buffers_) {
     auto* map = static_cast<VertexBufferMap*>(vertex_buffers_);
@@ -1378,8 +1380,20 @@ const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32
     key = MixKey(key, StreamStride(base, guest_device, s));
   }
 
+  // Last-result memo. This runs once per draw (~5000 a frame) and consecutive draws
+  // overwhelmingly share a layout, so the repeat case skips the map probe entirely. The
+  // cached pointer stays valid because LayoutMap is a node-based std::unordered_map: entries
+  // are never moved by later insertions, and nothing erases from it outside Shutdown. That is
+  // load-bearing -- converting it to FlatMap would leave this dangling, as would an eviction
+  // sweep, and the caller holds the returned pointer across its whole draw setup.
+  if (key == last_layout_key_ && last_layout_) {
+    return last_layout_->decl ? last_layout_ : nullptr;
+  }
+
   auto* map = static_cast<LayoutMap*>(layouts_);
   if (auto it = map->find(key); it != map->end()) {
+    last_layout_key_ = key;
+    last_layout_ = &it->second;
     return it->second.decl ? &it->second : nullptr;
   }
 

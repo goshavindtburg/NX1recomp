@@ -700,12 +700,23 @@ void Renderer::UploadVertexUniforms(const Sm3Shader& shader, uint32_t base_reg) 
       ndc_scale_[0],  ndc_scale_[1],  ndc_scale_[2],  0.0f,
       ndc_offset_[0], ndc_offset_[1], ndc_offset_[2], 0.0f,
   };
+  // Skip when the same shader is still bound and the viewport has not moved. Sound because
+  // these registers sit ABOVE this shader's constant window (base_reg == count, window is
+  // [0, count)), so the shader's own uploads never reach them -- and a DIFFERENT shader's
+  // window covering them is exactly what the identity check rules out. ndc_scale_/ndc_offset_
+  // only move when the viewport changes, so in practice this elides two D3D calls per draw.
+  if (&shader == last_vs_uniform_shader_ &&
+      std::memcmp(last_vs_uniform_params_, params, sizeof(params)) == 0) {
+    return;
+  }
   if (!shader.IsDefRegister(base_reg)) {
     device_->SetVertexShaderConstantF(base_reg, params, 1);
   }
   if (!shader.IsDefRegister(base_reg + 1)) {
     device_->SetVertexShaderConstantF(base_reg + 1, &params[4], 1);
   }
+  last_vs_uniform_shader_ = &shader;
+  std::memcpy(last_vs_uniform_params_, params, sizeof(params));
 }
 
 void Renderer::ResolveViewport(const uint8_t* base, uint32_t guest_device) {
@@ -808,12 +819,20 @@ void Renderer::UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg,
   // values -- sitting where defs belonged. That was the sun-shadow killer.
   const float threshold[4] = {alpha.threshold, 0.0f, 0.0f, 0.0f};
   const float compare[4] = {float(alpha.enabled ? alpha.compare_function : 7u), 0.0f, 0.0f, 0.0f};
-  if (!shader.IsDefRegister(base_reg)) {
-    device_->SetPixelShaderConstantF(base_reg, threshold, 1);
+  // Same reasoning as the vertex side: above the window, so only another shader can disturb
+  // these, and same-shader means none did.
+  const bool same_ps = &shader == last_ps_uniform_shader_;
+  if (!same_ps || last_ps_alpha_[0] != threshold[0] || last_ps_alpha_[1] != compare[0]) {
+    if (!shader.IsDefRegister(base_reg)) {
+      device_->SetPixelShaderConstantF(base_reg, threshold, 1);
+    }
+    if (!shader.IsDefRegister(base_reg + 1)) {
+      device_->SetPixelShaderConstantF(base_reg + 1, compare, 1);
+    }
+    last_ps_alpha_[0] = threshold[0];
+    last_ps_alpha_[1] = compare[0];
   }
-  if (!shader.IsDefRegister(base_reg + 1)) {
-    device_->SetPixelShaderConstantF(base_reg + 1, compare, 1);
-  }
+  last_ps_uniform_shader_ = &shader;
 
   // g_InvTexDim feeds offset tfetches: `tex2D(s, uv + offset * g_InvTexDim[i].xy)`, and the
   // translator only *declares* it for shaders that have one. Writing it regardless walks over 16
@@ -824,19 +843,36 @@ void Renderer::UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg,
   if (!needs_inv_tex_dim || base_reg + 18 > 224) {
     return;
   }
+  // Only the slots this shader declares. g_InvTexDim[i] is read by an offset tfetch on
+  // sampler i, so a slot the shader never dcl's is a register it can never read -- and
+  // resolving it cost a full fetch-constant decode plus a single-register D3D call, 16 of
+  // each per draw where ~4 were meaningful. The leftover registers keep another shader's
+  // values, which is unobservable for exactly the same reason.
+  const uint32_t mask = active_sampler_mask_;
   float dims[16 * 4] = {};
   for (uint32_t s = 0; s < 16; ++s) {
+    if (!(mask & (1u << s))) {
+      continue;
+    }
     const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, s);
     if (t.valid && t.width && t.height) {
       dims[s * 4 + 0] = 1.0f / float(t.width);
       dims[s * 4 + 1] = 1.0f / float(t.height);
     }
   }
+  // The dimensions only change when a bound texture does, so compare before issuing: a
+  // 256-byte memcmp against up to sixteen single-register D3D calls.
+  if (same_ps && mask == last_ps_dims_mask_ &&
+      std::memcmp(last_ps_dims_, dims, sizeof(dims)) == 0) {
+    return;
+  }
   for (uint32_t s = 0; s < 16; ++s) {
-    if (!shader.IsDefRegister(base_reg + 2 + s)) {
+    if ((mask & (1u << s)) && !shader.IsDefRegister(base_reg + 2 + s)) {
       device_->SetPixelShaderConstantF(base_reg + 2 + s, &dims[s * 4], 1);
     }
   }
+  last_ps_dims_mask_ = mask;
+  std::memcpy(last_ps_dims_, dims, sizeof(dims));
 }
 
 bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_device) {
@@ -1127,6 +1163,9 @@ void Renderer::InvalidateStateShadow() {
   bound_ps_ = kPixelShaderUnknown;
   bound_color_write_ = kColorWriteUnset;
   InvalidateVertexShadow();
+  last_vs_uniform_shader_ = nullptr;
+  last_ps_uniform_shader_ = nullptr;
+  last_ps_dims_mask_ = 0;
   ShaderCache::Get().InvalidateDefShadow();
   // The draw-signature skip trusts that the device still holds the previous draw's bindings;
   // once something else has rebound them that is no longer true.

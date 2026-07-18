@@ -311,6 +311,17 @@ class Renderer {
   IDirect3DVertexBuffer9* bound_stream_vb_[4];
   uint32_t bound_stream_stride_[4];
 
+  /// Last state uploaded by UploadVertexUniforms / UploadPixelUniforms. These registers sit
+  /// above each shader's constant window, so only a different shader's window can disturb
+  /// them -- hence the shader-identity guard alongside the value compare. Pointers are stable
+  /// because ShaderMap is node-based (see d3d9_shaders.cpp).
+  const Sm3Shader* last_vs_uniform_shader_ = nullptr;
+  float last_vs_uniform_params_[8] = {};
+  const Sm3Shader* last_ps_uniform_shader_ = nullptr;
+  float last_ps_alpha_[2] = {};
+  float last_ps_dims_[16 * 4] = {};
+  uint32_t last_ps_dims_mask_ = 0;
+
   /// Forget the vertex declaration and stream sources only. Split out because the UP draw
   /// paths disturb exactly those and nothing else.
   void InvalidateVertexShadow();
