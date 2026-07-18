@@ -186,6 +186,14 @@ struct RecordedDraw {
   uint32_t vs_const_count = 0;
   uint32_t ps_const_offset = 0;
   uint32_t ps_const_count = 0;
+  /// Whether resolution actually RAN for this stage, which is NOT the same as count != 0 and
+  /// must not be collapsed into it. ApplyConstants(count == 0) is not a no-op: it still
+  /// re-asserts the shader's `def` literals, and the runtime does not reapply those on SetShader
+  /// -- so a shader with an empty constant window still needs the call, or the previous shader's
+  /// window upload stays sitting in its def registers. Conflating the two skipped that call and
+  /// produced band-shaped artifacts, the same signature as the DOF bands and the sun-shadow bug.
+  bool vs_const_valid = false;
+  bool ps_const_valid = false;
 
   /// The translated shaders this draw runs, resolved at record time. Pointers are stable because
   /// ShaderMap is node-based (see d3d9_shaders.cpp) -- do not convert it to FlatMap.

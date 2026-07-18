@@ -1111,6 +1111,7 @@ void Renderer::ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_de
     const uint32_t n = cache.ResolveConstants(base, guest_device, *vs, /*pixel_stage=*/false,
                                               staging);
     d.vs_const_count = n;
+    d.vs_const_valid = true;
     d.vs_const_offset = cmdbuf_.AddConstants(staging, n);
     last_const_vs_ = vs;
   }
@@ -1124,6 +1125,7 @@ void Renderer::ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_de
       const uint32_t n = cache.ResolveConstants(base, guest_device, *ps, /*pixel_stage=*/true,
                                                 staging);
       d.ps_const_count = n;
+      d.ps_const_valid = true;
       d.ps_const_offset = cmdbuf_.AddConstants(staging, n);
       last_const_ps_ = ps;
     }
@@ -1149,7 +1151,7 @@ bool Renderer::BindShadersAndConstants(const RecordedDraw& d) {
     device_->SetVertexShader(vs->vs);
     bound_vs_ = vs->vs;
   }
-  if (d.vs_const_count) {
+  if (d.vs_const_valid) {
     cache.ApplyConstants(*vs, /*pixel_stage=*/false, cmdbuf_.constants(d.vs_const_offset),
                          d.vs_const_count);
   }
@@ -1186,7 +1188,7 @@ bool Renderer::BindShadersAndConstants(const RecordedDraw& d) {
     bound_color_write_ = want_color_write;
   }
   if (ps) {
-    if (d.ps_const_count) {
+    if (d.ps_const_valid) {
       cache.ApplyConstants(*ps, /*pixel_stage=*/true, cmdbuf_.constants(d.ps_const_offset),
                            d.ps_const_count);
     }
