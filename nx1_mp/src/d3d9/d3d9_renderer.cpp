@@ -441,8 +441,10 @@ void Renderer::Present() {
   if (this_frame_ns > prof_frame_max_ns_) {
     prof_frame_max_ns_ = this_frame_ns;
     prof_frame_max_drain_ns_ = prof_drain_wait_frame_ns_;
+    prof_frame_max_record_ns_ = prof_record_frame_ns_;
   }
   prof_drain_wait_frame_ns_ = 0;
+  prof_record_frame_ns_ = 0;
   last_present = t_present;
   // Last thing before the flip, so it sits on top of the finished frame.
   Overlay::Get().Render();
@@ -594,9 +596,10 @@ void Renderer::Present() {
         // they need a plain ns -> ms conversion.
         static constexpr double kNsToMs = 1.0 / 1e6;
         REXGPU_INFO("nx1_d3d9: PROF/hitch worst frame {:.1f} ms ({:.1f} ms of it blocked on the "
-                    "worker)",
-                    prof_frame_max_ns_ * kNsToMs, prof_frame_max_drain_ns_ * kNsToMs);
-        prof_frame_max_ns_ = prof_frame_max_drain_ns_ = 0;
+                    "worker, {:.1f} ms recording)",
+                    prof_frame_max_ns_ * kNsToMs, prof_frame_max_drain_ns_ * kNsToMs,
+                    prof_frame_max_record_ns_ * kNsToMs);
+        prof_frame_max_ns_ = prof_frame_max_drain_ns_ = prof_frame_max_record_ns_ = 0;
         REXGPU_INFO("nx1_d3d9: PROF/bound guest waited {:.2f} ms/frame for the worker, worker "
                     "starved {:.2f} ms/frame -- limited by {}",
                     drain_ms, idle_ms,
@@ -2037,7 +2040,11 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   // with nothing else in the picture. Recording cost shows up as PROF/record.
   const auto t_rec = std::chrono::steady_clock::now();
   RecordDraw(base, guest_device, prim_type, base_vertex_index, start_index, index_count);
-  prof_record_ns_ += uint64_t((std::chrono::steady_clock::now() - t_rec).count());
+  {
+    const uint64_t rec = uint64_t((std::chrono::steady_clock::now() - t_rec).count());
+    prof_record_ns_ += rec;
+    prof_record_frame_ns_ += rec;
+  }
 
   SubmitCommand(base, guest_device, uint32_t(cmdbuf_.commands().size() - 1));
 }

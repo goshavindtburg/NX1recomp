@@ -370,6 +370,10 @@ class Renderer {
   uint64_t prof_frame_max_ns_ = 0;
   uint64_t prof_frame_max_drain_ns_ = 0;
   uint64_t prof_drain_wait_frame_ns_ = 0;
+  /// Recording cost of the worst frame. Separates OUR guest-thread work (notably lazy shader
+  /// creation, which calls into the driver) from the game's own stalls.
+  uint64_t prof_frame_max_record_ns_ = 0;
+  uint64_t prof_record_frame_ns_ = 0;
   std::atomic<uint64_t> prof_worker_idle_ns_{0};
 
   /// Shader-resolution memo: (object address, pass) -> translated shader.
