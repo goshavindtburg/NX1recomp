@@ -52,6 +52,11 @@ REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_isolate, -1, "GPU",
                      "Cycle this to find which blend config a surface uses. Indices are per-run "
                      "-- read them from the same run's log. -1 = off");
 
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_blend_verify, false, "GPU",
+                    "With dbg_blend_isolate set, read the device's ACTUAL render states back "
+                    "for that config instead of hiding it -- tells apart \"we never issued the "
+                    "blend\" from \"we issued it and it did not take\"");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_blend_log, false, "GPU",
                     "Log every distinct blend configuration the guest asks for, once each "
                     "(glass-transparency hunt)");
@@ -1630,8 +1635,39 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
     // from the same run's log, not an earlier one.
     if (blend_isolate >= 0 && it != seen.end() &&
         size_t(blend_isolate) == size_t(it - seen.begin())) {
-      SetRenderStateCached(D3DRS_COLORWRITEENABLE, 0);
-      bound_color_write_ = 0;
+      if (REXCVAR_GET(nx1_d3d9_dbg_blend_verify)) {
+        // Ask D3D what it ACTUALLY has, rather than trusting our shadow.
+        //
+        // Glass is BLENDCFG #2: colour ZERO->SRCCOLOR, i.e. dest * srcColour -- multiply
+        // blending. A multiply blend CANNOT produce an opaque surface: white output would leave
+        // the scenery untouched and a tint would colour it. Opaque means the blend is not being
+        // applied at all, and the likeliest reason is SetRenderStateCached skipping a call
+        // because its shadow disagrees with the device (the hazard InvalidateStateShadow exists
+        // for). Reading the state back is the only way to tell "we never issued it" apart from
+        // "we issued it and it did not take".
+        static std::mutex vm;
+        static bool reported = false;
+        std::lock_guard<std::mutex> vlk(vm);
+        if (!reported) {
+          reported = true;
+          DWORD be = 0, sb = 0, db = 0, sep = 0, cw = 0, af = 0;
+          device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &be);
+          device_->GetRenderState(D3DRS_SRCBLEND, &sb);
+          device_->GetRenderState(D3DRS_DESTBLEND, &db);
+          device_->GetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, &sep);
+          device_->GetRenderState(D3DRS_COLORWRITEENABLE, &cw);
+          device_->GetRenderState(D3DRS_ALPHATESTENABLE, &af);
+          REXGPU_INFO("nx1_d3d9: BLENDVERIFY device says blendenable={} src={} dst={} "
+                      "separate={} colourwrite={:#x} alphatest={} || we intended enable={} "
+                      "src={} dst={} mask={:#x}",
+                      be, sb, db, sep, cw, af, blend.enabled ? 1 : 0,
+                      uint32_t(HostBlendFactor(blend.color_src)),
+                      uint32_t(HostBlendFactor(blend.color_dst)), d.color_write_mask);
+        }
+      } else {
+        SetRenderStateCached(D3DRS_COLORWRITEENABLE, 0);
+        bound_color_write_ = 0;
+      }
     }
   }
 
