@@ -35,6 +35,7 @@
 #include <windows.h>
 #endif
 
+#include "d3d9_cmdbuf.h"
 #include "guest_d3d.h"
 
 namespace nx1::d3d9 {
@@ -112,6 +113,11 @@ class Renderer {
   void Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
                uint32_t dest_point, uint32_t flags, uint32_t clear_color, float clear_z,
                uint32_t clear_stencil);
+
+  /// Capture one draw into the command buffer. Records only what the guest may overwrite
+  /// before a worker consumes it -- see d3d9_cmdbuf.h for what is deliberately left out.
+  void RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
+                  uint32_t base_vertex_index, uint32_t start_index, uint32_t index_count);
 
   /// Snapshot m_Pending.m_Mask[5] before the guest's draw body flushes and zeroes it. Must be
   /// called from the draw hook BEFORE __imp__, which is the only moment these bits are valid.
@@ -277,6 +283,9 @@ class Renderer {
   /// Guest dirty-mask statistics: how often each of m_Pending.m_Mask[5] is clear, and how
   /// often it is unchanged from the previous draw. These bound how much per-draw state
   /// resolution could be skipped outright.
+  CommandBuffer cmdbuf_;
+  uint64_t prof_record_ns_ = 0;
+
   uint64_t prof_mask_clear_[5] = {};
   uint64_t prof_mask_same_[5] = {};
   uint64_t prof_last_mask_[5] = {};

@@ -55,12 +55,31 @@
 
 namespace nx1::d3d9 {
 
-/// One captured shader-constant file. Duplicated only when the guest's dirty mask says the
-/// contents changed, so consecutive draws that share constants share a block.
-struct ConstantBlock {
-  /// Both stages, laid out exactly as the guest's ALU constant file so existing readers can be
-  /// pointed at this instead of guest memory: [0..255] vertex, [256..511] pixel.
-  float regs[512][4];
+/// A constant-file DELTA: only the register groups the guest actually rewrote, as raw guest
+/// bytes.
+///
+/// Two earlier versions were both too expensive, and the reasons are worth keeping:
+///
+///   1. Decoded floats -- 512 registers x 4 components of GuestReadF32 per block, ~1550 blocks
+///      a frame = 3.2M swapped reads = 22.5 ms on the guest thread.
+///   2. Raw memcpy of the whole 8 KB file -- direct cost fell to 1.4 ms, but at ~1450 blocks
+///      that is 14 MB/frame written through the cache. The frame got ~4-5 ms WORSE while the
+///      record timer showed only 1.67 ms: the eviction of the texture and vertex working sets
+///      cost more than the copy itself. Payload size matters more than payload cost.
+///
+/// The guest's dirty mask carries one bit per group of 4 registers, and a draw that touches
+/// constants typically touches a handful of groups -- so a delta is a few hundred bytes rather
+/// than 8 KB. The executor keeps a running constant file and applies deltas in order, which is
+/// exactly what the guest's own shadow does.
+struct ConstantDelta {
+  /// One bit per group of 4 registers, numbered from the MSB as the guest numbers them:
+  /// register r is bit 63 - (r >> 2). See D3DTag_ShaderConstantMask.
+  uint64_t vs_mask = 0;
+  uint64_t ps_mask = 0;
+  /// Offset into the frame's delta byte pool, and how many bytes: the set groups' registers,
+  /// vertex stage first, 64 bytes per group, raw big-endian.
+  uint32_t offset = 0;
+  uint32_t bytes = 0;
 };
 
 /// Everything a draw needs that the guest may overwrite before the worker gets to it.
@@ -80,6 +99,9 @@ struct RecordedDraw {
   /// vertex streams alias 94/95, which is why the whole array comes along rather than the
   /// declared slots -- knowing which slots a shader declares needs the shader resolved, and
   /// that work belongs on the worker.
+  /// RAW guest bytes, big-endian, exactly as the guest stores them -- decode with
+  /// ReadTextureFetchConstantAt-style reads on the worker. Not decoded at record time: see the
+  /// note in ConstantBlock about what byte-swapping during capture costs.
   uint32_t fetch_constants[guest_device::kFetchConstantCount][6] = {};
   /// Guest addresses of the bound shader objects. The worker hashes the microcode and looks up
   /// the SM3 translation; the objects themselves are stable for the frame.
@@ -102,8 +124,9 @@ struct RecordedDraw {
   uint32_t color_write_mask = 0;
 
   // --- constants -----------------------------------------------------------------------
-  /// Index into the frame's constant-block pool. Draws that changed nothing share one.
-  uint32_t constant_block = 0;
+  /// Index into the frame's delta list. A draw that changed no constants points at the same
+  /// delta as the draw before it, so the executor simply does not re-apply anything.
+  uint32_t constant_delta = 0;
 
   /// Stable per-surface identity for the prefer-largest LOD substitution, computed at record
   /// time because it derives from the index range.
@@ -119,8 +142,10 @@ class CommandBuffer {
  public:
   void BeginFrame() {
     draws_.clear();
-    blocks_.clear();
-    dirty_block_ = true;  // first draw of a frame always materialises a block
+    deltas_.clear();
+    delta_pool_.clear();
+    // The executor's running constant file carries across frames exactly as the guest's shadow
+    // does, so a frame does not need to open with a full copy.
   }
 
   RecordedDraw& AddDraw() {
@@ -128,24 +153,28 @@ class CommandBuffer {
     return draws_.back();
   }
 
-  /// Return the block index for the current constants, materialising a new block only when the
-  /// guest has actually rewritten them since the last one.
-  uint32_t CurrentConstantBlock(const uint8_t* base, uint32_t guest_device, bool constants_dirty);
+  /// Append a delta for whatever the guest just rewrote, or reuse the previous one when the
+  /// masks are clear. `vs_mask`/`ps_mask` come from the draw hook, captured before the guest's
+  /// body flushed and zeroed them.
+  uint32_t RecordConstantDelta(const uint8_t* base, uint32_t guest_device, uint64_t vs_mask,
+                               uint64_t ps_mask);
 
   const std::vector<RecordedDraw>& draws() const { return draws_; }
-  const ConstantBlock& block(uint32_t index) const { return blocks_[index]; }
-  size_t block_count() const { return blocks_.size(); }
+  const ConstantDelta& delta(uint32_t index) const { return deltas_[index]; }
+  const uint8_t* delta_bytes(const ConstantDelta& d) const { return delta_pool_.data() + d.offset; }
+  size_t delta_count() const { return deltas_.size(); }
 
   /// Bytes captured this frame, for the profiler -- recording cost is the price of the whole
   /// scheme and needs to stay visible.
   size_t captured_bytes() const {
-    return draws_.size() * sizeof(RecordedDraw) + blocks_.size() * sizeof(ConstantBlock);
+    return draws_.size() * sizeof(RecordedDraw) + deltas_.size() * sizeof(ConstantDelta) +
+           delta_pool_.size();
   }
 
  private:
   std::vector<RecordedDraw> draws_;
-  std::vector<ConstantBlock> blocks_;
-  bool dirty_block_ = true;
+  std::vector<ConstantDelta> deltas_;
+  std::vector<uint8_t> delta_pool_;
 };
 
 }  // namespace nx1::d3d9

@@ -34,6 +34,10 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // TEMP PROFILING: accumulate per-phase draw cost and report it once a second.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_record, false, "GPU",
+                    "Record draws into the deferred-translation command buffer (step 1: "
+                    "records alongside the live path, nothing consumes it yet)");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_skip_clean_constants, true, "GPU",
                     "Skip the shader constant upload when the guest's dirty mask, the PM4 "
                     "ring generation and the bound shader all say nothing changed");
@@ -389,6 +393,15 @@ void Renderer::Present() {
   // Start every frame with a real bind, so a skip chain always descends from a draw that
   // refreshed the cache entries' last_frame within this frame.
   last_sig_valid_ = false;
+  if (REXCVAR_GET(nx1_d3d9_record)) {
+    if (REXCVAR_GET(nx1_d3d9_profile) && !cmdbuf_.draws().empty()) {
+      REXGPU_INFO("nx1_d3d9: PROF/record {} draws, {} constant deltas, {:.2f} MB, {:.2f} ms",
+                  cmdbuf_.draws().size(), cmdbuf_.delta_count(),
+                  double(cmdbuf_.captured_bytes()) / (1024.0 * 1024.0), prof_record_ns_ / 1e6);
+    }
+    prof_record_ns_ = 0;
+    cmdbuf_.BeginFrame();
+  }
 
   const bool prof_on = REXCVAR_GET(nx1_d3d9_profile);
   ResourceTracker::Get().prof_enabled_ = prof_on;
@@ -1463,6 +1476,45 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
   }
 }
 
+void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
+                          uint32_t base_vertex_index, uint32_t start_index,
+                          uint32_t index_count) {
+  RecordedDraw& d = cmdbuf_.AddDraw();
+  d.prim_type = prim_type;
+  d.base_vertex_index = base_vertex_index;
+  d.start_index = start_index;
+  d.index_count = index_count;
+  d.indexed = true;
+
+  // Every fetch constant, as one memcpy of RAW guest bytes. The 32 slots are contiguous, and
+  // -- exactly as with the constant blocks -- byte-swapping here is what makes recording
+  // expensive: 32 slots x 6 dwords of GuestRead32 is 192 swapped reads per draw, which at
+  // ~5000 draws was ~976k reads and several ms on the very thread this scheme exists to
+  // unload. The executor swaps what it reads, on the worker.
+  std::memcpy(d.fetch_constants, base + guest_device + guest_device::kFetchConstants,
+              sizeof(d.fetch_constants));
+
+  d.vs_object = BoundVertexShader(base, guest_device);
+  d.ps_object = BoundPixelShader(base, guest_device);
+  d.vs_pass = VertexShaderPass(base, d.vs_object, /*has_pixel_shader=*/d.ps_object != 0);
+  d.vertex_declaration = BoundVertexDeclaration(base, guest_device);
+  for (uint32_t stream = 0; stream < kMaxHostStreams; ++stream) {
+    d.stream_stride[stream] = StreamStride(base, guest_device, stream);
+  }
+
+  d.viewport = ReadViewportState(base, guest_device);
+  d.depth = ReadDepthState(base, guest_device);
+  d.blend = ReadBlendState(base, guest_device);
+  d.cull = ReadCullState(base, guest_device);
+  d.alpha = ReadAlphaTestState(base, guest_device);
+  d.color_write_mask = ReadColorWriteMask(base, guest_device);
+
+  // Only the register groups the guest actually rewrote. guest_dirty_* were captured in the
+  // draw hook, before the guest's body flushed and zeroed them.
+  d.constant_delta =
+      cmdbuf_.RecordConstantDelta(base, guest_device, guest_dirty_vs_, guest_dirty_ps_);
+}
+
 void Renderer::CaptureGuestDirtyMask(const uint8_t* base, uint32_t guest_device) {
   if (!guest_device) {
     return;
@@ -1536,6 +1588,16 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
     }
     prof_last_index_end_ = start_index + index_count;
     prof_last_prim_type_ = prim_type;
+  }
+
+  // Record this draw. Step 1 of deferred translation: the recorder runs alongside the live
+  // path and nothing consumes it yet, so behaviour is unchanged -- but it lets the capture be
+  // validated against what the live path actually reads, which is where "we forgot to capture
+  // X" bugs live. Recording cost shows up as PROF/record.
+  if (REXCVAR_GET(nx1_d3d9_record)) {
+    const auto t_rec = std::chrono::steady_clock::now();
+    RecordDraw(base, guest_device, prim_type, base_vertex_index, start_index, index_count);
+    prof_record_ns_ += uint64_t((std::chrono::steady_clock::now() - t_rec).count());
   }
 
   // TEMP PROFILING: per-phase frame cost. ~2000 draws/frame at ~19us each says the bottleneck
