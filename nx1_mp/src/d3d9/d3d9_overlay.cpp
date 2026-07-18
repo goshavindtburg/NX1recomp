@@ -25,6 +25,7 @@ REXCVAR_DECLARE(bool, nx1_d3d9_bc_mips);
 REXCVAR_DECLARE(bool, nx1_d3d9_profile);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipsrc);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_lod);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipfill);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam,
                                                              LPARAM lparam);
@@ -323,6 +324,16 @@ void Overlay::DrawPanels() {
     ImGui::TextUnformatted("Mip chains");
     ImGui::Checkbox("Generate mips at all", &REXCVAR_GET(nx1_d3d9_mips));
     ImGui::Checkbox("CPU-build block-compressed mips", &REXCVAR_GET(nx1_d3d9_bc_mips));
+    ImGui::TextUnformatted("Mip chain test");
+    int mipfill = int(REXCVAR_GET(nx1_d3d9_dbg_mipfill));
+    ImGui::RadioButton("off##mipfill", &mipfill, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("flat colours", &mipfill, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("gradient source", &mipfill, 2);
+    REXCVAR_SET(nx1_d3d9_dbg_mipfill, uint32_t(mipfill));
+    ImGui::TextDisabled("flat: tests the plumbing (proven OK).");
+    ImGui::TextDisabled("gradient: tests filter+encoder on varying data, bypassing our decoder.");
     ImGui::TextDisabled("Unticking the second leaves BC textures unmipped while keeping the");
     ImGui::TextDisabled("driver's chains -- it isolates our encoder from the driver's.");
 

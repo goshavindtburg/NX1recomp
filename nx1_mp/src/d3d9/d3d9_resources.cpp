@@ -43,6 +43,24 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_lod, 0, "GPU",
                       "Debug: paint one prefer-largest LOD branch white (1=substitute, "
                       "2=equal, 3=adopt)");
 
+/// Diagnostic: fill every CPU-generated mip level with a flat, distinct colour instead of the
+/// filtered image. Separates the two ways the built chain can be wrong: if distant surfaces
+/// show clean colour bands, the plumbing (level count, strides, UpdateTexture) is sound and
+/// the fault is in BoxFilterHalf/EncodeBcImage; if they still show noise, the plumbing is
+/// wrong and the filtered pixels were never the problem.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipfill, 0, "GPU",
+                      "Debug mip chain: 1=flat colour per level (tests plumbing), "
+                      "2=synthetic gradient as the level-0 source (tests filter+encoder "
+                      "without our BC decoder)");
+
+/// Diagnostic: dump the mip pipeline's intermediate images for the next N block-compressed
+/// textures built. Writes texdump/mip_<addr>_L<level>.bmp straight from the Rgba8 buffers, so
+/// what lands on disk is exactly what DecodeBcImage produced and what BoxFilterHalf produced
+/// -- no inference. Level 0 garbled means our BC decoder; level 0 clean but lower levels
+/// garbled means the filter.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipdump, 0, "GPU",
+                      "Debug: dump decoded mip levels for the next N BC textures built");
+
 /// Diagnostic: paint textures white by how their mip chain was provided.
 ///   1 = CPU-built (block compressed)   2 = driver auto-generated   3 = no chain at all
 /// The remaining speckled surfaces will be one of these three, and each implicates something
@@ -1130,6 +1148,46 @@ void EncodeBcImage(D3DFORMAT fmt, const std::vector<Rgba8>& src, uint32_t width,
 }
 
 /// Halve an RGBA image with a 2x2 box filter (odd dimensions repeat the last row/column).
+/// Write an Rgba8 image as a 32-bit BMP. Debug-only, so it favours being obviously correct
+/// over being fast: bottom-up rows, BGRA order, no compression.
+void DumpRgbaBmp(const char* path, const std::vector<Rgba8>& px, uint32_t w, uint32_t h) {
+  if (!w || !h || px.size() < size_t(w) * h) {
+    return;
+  }
+  FILE* f = std::fopen(path, "wb");
+  if (!f) {
+    return;
+  }
+  const uint32_t data_bytes = w * h * 4;
+  const uint32_t file_bytes = 54 + data_bytes;
+  uint8_t hdr[54] = {};
+  hdr[0] = 'B'; hdr[1] = 'M';
+  std::memcpy(hdr + 2, &file_bytes, 4);
+  const uint32_t pixel_offset = 54;
+  std::memcpy(hdr + 10, &pixel_offset, 4);
+  const uint32_t dib = 40;
+  std::memcpy(hdr + 14, &dib, 4);
+  std::memcpy(hdr + 18, &w, 4);
+  std::memcpy(hdr + 22, &h, 4);
+  const uint16_t planes = 1, bpp = 32;
+  std::memcpy(hdr + 26, &planes, 2);
+  std::memcpy(hdr + 28, &bpp, 2);
+  std::memcpy(hdr + 34, &data_bytes, 4);
+  std::fwrite(hdr, 1, sizeof(hdr), f);
+  std::vector<uint8_t> row(size_t(w) * 4);
+  for (uint32_t y = 0; y < h; ++y) {
+    const Rgba8* srow = &px[size_t(h - 1 - y) * w];
+    for (uint32_t x = 0; x < w; ++x) {
+      row[x * 4 + 0] = srow[x].b;
+      row[x * 4 + 1] = srow[x].g;
+      row[x * 4 + 2] = srow[x].r;
+      row[x * 4 + 3] = srow[x].a;
+    }
+    std::fwrite(row.data(), 1, row.size(), f);
+  }
+  std::fclose(f);
+}
+
 void BoxFilterHalf(const std::vector<Rgba8>& src, uint32_t sw, uint32_t sh,
                    std::vector<Rgba8>& dst, uint32_t dw, uint32_t dh) {
   dst.resize(size_t(dw) * dh);
@@ -2458,6 +2516,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   const uint32_t dst_row_bytes =
       host.opaque_block ? extent.block_width * bpb : uint32_t(locked.Pitch);
   auto* dst = static_cast<uint8_t*>(locked.Pitch >= 0 ? locked.pBits : nullptr);
+  /// Where the mip builder reads level 0 from. Defaults to the mapped surface, but the
+  /// block-compressed path below redirects it to a normal-RAM copy -- see the comment there.
+  const uint8_t* mip_source = dst;
   if (dst) {
     if (host.decode == TexDecode::kColorSwizzle) {
       // Detile the compressed colour blocks, then decode to A8R8G8B8 applying the channel swizzle
@@ -2490,6 +2551,25 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       DecodeBCAlphaToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                           extent.block_height, t.width, height,
                           host.decode == TexDecode::kDXT5A);
+    } else if (build_mips) {
+      // Detile into ordinary RAM and copy up, rather than writing straight into the mapped
+      // surface. The mip chain below has to READ level 0 back, and `dst` is D3D9 staging
+      // memory: mapped upload memory is routinely write-combined, which is fine to write and
+      // unreliable to read -- a read can bypass the pending write-combine buffers and return
+      // stale or partial bytes. Level 0 itself still looks right on screen because the GPU
+      // receives what we wrote; only our read-back sees garbage, and every generated level is
+      // built from it. That is the distance speckle on block-compressed surfaces.
+      const size_t level0_bytes = size_t(extent.block_height) * dst_row_bytes;
+      uint8_t* staged = DetileScratch(level0_bytes);
+      DetileMip2D(staged, dst_row_bytes, src, extent, bpb, t.endian, t.tiled);
+      const Swizzle32 swz = MakeSwizzle32(t.swizzle);
+      if (host.swizzle32 && !swz.identity) {
+        for (uint32_t by = 0; by < extent.block_height; ++by) {
+          SwizzleRow32(staged + size_t(by) * dst_row_bytes, extent.block_width, swz);
+        }
+      }
+      std::memcpy(dst, staged, level0_bytes);
+      mip_source = staged;
     } else {
       DetileMip2D(dst, dst_row_bytes, src, extent, bpb, t.endian, t.tiled);
       const Swizzle32 swz = MakeSwizzle32(t.swizzle);
@@ -2508,15 +2588,64 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   const auto t_mip = stage_mark();
   if (build_mips && dst) {
     std::vector<Rgba8> cur, next;
-    DecodeBcImage(host.d3d, dst, dst_row_bytes, t.width, height, cur);
+    DecodeBcImage(host.d3d, mip_source, dst_row_bytes, t.width, height, cur);
+    const uint32_t dump_left = REXCVAR_GET(nx1_d3d9_dbg_mipdump);
+    char dump_path[256];
+    if (dump_left) {
+      REXCVAR_SET(nx1_d3d9_dbg_mipdump, dump_left - 1);
+      std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_L0.bmp", t.base_address);
+      DumpRgbaBmp(dump_path, cur, t.width, height);
+      REXGPU_INFO("nx1_d3d9: mip dump {}x{} fmt {} -> texdump/mip_{:08X}_L*.bmp", t.width, height,
+                  t.format, t.base_address);
+    }
+    if (REXCVAR_GET(nx1_d3d9_dbg_mipfill) == 2) {
+      // Overwrite the decoded source with a smooth gradient. BoxFilterHalf and EncodeBcImage
+      // then do their real work on real varying data -- the case a flat fill cannot exercise,
+      // because a flat block collapses the BC endpoints and makes every index equivalent.
+      // Clean gradient bands at distance therefore acquit both, leaving DecodeBcImage.
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < t.width; ++x) {
+          cur[size_t(y) * t.width + x] = Rgba8{uint8_t(x * 255 / (t.width ? t.width : 1)),
+                                               uint8_t(y * 255 / (height ? height : 1)), 128, 255};
+        }
+      }
+    }
     for (uint32_t level = 1; level < levels; ++level) {
       const uint32_t lw = std::max(1u, t.width >> level);
       const uint32_t lh = std::max(1u, height >> level);
       BoxFilterHalf(cur, std::max(1u, t.width >> (level - 1)),
                     std::max(1u, height >> (level - 1)), next, lw, lh);
+      if (REXCVAR_GET(nx1_d3d9_dbg_mipfill) == 1) {
+        // Overwrite the filtered result with a flat colour for this level. Everything else --
+        // level count, encode, lock pitch, UpdateTexture -- runs exactly as it normally does,
+        // so what reaches the screen tests the plumbing alone.
+        static constexpr Rgba8 kLevelColors[8] = {
+            {255, 0, 0, 255},   {0, 255, 0, 255},   {0, 0, 255, 255},   {255, 255, 0, 255},
+            {255, 0, 255, 255}, {0, 255, 255, 255}, {255, 128, 0, 255}, {255, 255, 255, 255},
+        };
+        const Rgba8 c = kLevelColors[(level - 1) & 7];
+        for (auto& px : next) {
+          px = c;
+        }
+      }
+      if (dump_left) {
+        std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_L%u.bmp", t.base_address,
+                      level);
+        DumpRgbaBmp(dump_path, next, lw, lh);
+      }
 
       D3DLOCKED_RECT mip;
-      if (SUCCEEDED(staging->LockRect(level, &mip, nullptr, 0)) && mip.pBits) {
+      const HRESULT mip_hr = staging->LockRect(level, &mip, nullptr, 0);
+      if (FAILED(mip_hr) || !mip.pBits) {
+        // Silently skipping left this level as whatever the allocation happened to contain --
+        // uninitialised memory sampled as a mip, which is indistinguishable from the decode
+        // bugs we have been chasing. Say so rather than shipping garbage quietly.
+        REXGPU_ERROR("nx1_d3d9: mip level {} of {}x{} (fmt {}) failed to lock ({:#x}); that "
+                     "level holds uninitialised data",
+                     level, t.width, height, t.format, static_cast<uint32_t>(mip_hr));
+        continue;
+      }
+      {
         const uint32_t mip_row_bytes = host.opaque_block
                                            ? ((lw + 3) / 4) * BcBlockBytes(host.d3d)
                                            : uint32_t(mip.Pitch);
