@@ -412,7 +412,6 @@ class ResourceTracker {
     uint64_t why_layout = 0;   ///< layout_key changed under the same base address
     uint64_t why_dirty = 0;    ///< write-watch dirtied it before it could commit
     uint64_t why_zero = 0;     ///< never-resident broadcast-swizzle sprite, on its backoff retry
-    uint64_t deferred = 0;     ///< rebuilds pushed to a later frame by the budget
     uint64_t decode_bytes = 0; ///< source bytes streamed out of the mirror, to check the
                                ///< memory-bound theory against real bandwidth
   };
@@ -424,8 +423,6 @@ class ResourceTracker {
 
  private:
   TextureProfile prof_tex_;
-  /// Rebuilds performed this frame, against nx1_d3d9_texture_budget. Reset in AdvanceFrame.
-  uint32_t rebuilds_this_frame_ = 0;
 
  public:
   /// TEMP PROFILING: the streams phase has resisted two optimisations (eliding ~9100 D3D

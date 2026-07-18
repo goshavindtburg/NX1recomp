@@ -93,13 +93,6 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_texture_mirror, true, "GPU",
 /// occupant -- freezing makes that permanent. Turn this off to find out which side of that
 /// trade an artifact is on: with committing disabled the write-watch keeps re-decoding, so a
 /// texture that was merely early will correct itself once its data lands.
-REXCVAR_DEFINE_UINT32(nx1_d3d9_texture_budget, 6, "GPU",
-                      "Maximum texture rebuilds (untile + decode + upload) per frame; 0 = "
-                      "unlimited. A rebuild costs ~500 us, so an unbounded burst on first sight "
-                      "of a batch of textures stalls the frame. Over budget, the rebuild is "
-                      "deferred to a later frame and the surface samples its previous texture "
-                      "(or black, if it has none yet) until then");
-
 REXCVAR_DEFINE_BOOL(nx1_d3d9_commit_textures, true, "GPU",
                     "Freeze a texture's decode after it has been drawn cleanly for 32 frames");
 
@@ -2170,7 +2163,6 @@ void ResourceTracker::LearnTextureBaseline(uint32_t frames) {
 }
 
 void ResourceTracker::AdvanceFrame() {
-  rebuilds_this_frame_ = 0;
 
   // Poll the tracked address every frame and report whenever its populated-byte count changes.
   // We only ever sampled it at bind time; if the guest fills this memory and clears it again
@@ -2804,24 +2796,15 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ++mips_skip_unsupported_;
   }
 
-  // REBUILD BUDGET. A rebuild costs ~500 us and is memory-bound, so a frame that first sees a
-  // batch of textures -- rounding a corner, an effect spawning -- can pile up 20-30 of them and
-  // spend 15 ms here. Under async that lands on the worker and the guest blocks at the drain,
-  // which is exactly the 19-30 ms spikes PROF/hitch attributes to us (8-19 ms of drain against a
-  // 3.4 ms average).
-  //
-  // Over budget, defer to the next frame rather than pay it all now: return whatever this entry
-  // already has. That is usually a stale-but-correct texture; on first sight it is null, so the
-  // surface samples black for a frame or two before popping in. A brief pop is a far better
-  // artifact than a 30 ms stall, and nothing is lost -- entry.tex/layout_key stay unset so the
-  // early-out above keeps declining and the rebuild simply happens on a later frame.
-  if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_texture_budget);
-      budget && rebuilds_this_frame_ >= budget) {
-    ++prof_tex_.deferred;
-    return entry.tex;
-  }
-  ++rebuilds_this_frame_;
-
+  // NOTE: a per-frame REBUILD BUDGET was tried here and removed. The theory was that bursts of
+  // 20-30 rebuilds in one frame caused the 19-30 ms drain spikes PROF/hitch attributes to the
+  // worker. PROF/tex disproved it: steady state runs at UNDER ONE rebuild per frame
+  // (new=0.1-0.9, dirty=0.0), so a budget never binds during play. The only place it did bind
+  // was the map-load burst, where every texture is a first sight -- at 6/frame that needs
+  // thousands of frames to catch up and left the screen black for three seconds. No effect where
+  // it was aimed, real harm where it was not looked. If rebuild bursts ever do become the
+  // problem, any budget needs a cold-start exemption: deferring a first sight means rendering
+  // black, which is only tolerable when a stale texture already exists to show instead.
   const size_t guest_bytes = size_t(extent.block_pitch_h) * extent.block_pitch_v * bpb;
   // Decode from the CPU snapshot mirror, NOT live guest RAM. The mirror captured these bytes while
   // the texture was resident (early sweep / first touch) and holds them; live RAM would have the
