@@ -27,6 +27,7 @@
 #ifdef _WIN32
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <vector>
 #include <thread>
@@ -186,6 +187,37 @@ class Renderer {
   void ExecuteSetRenderTarget(const uint8_t* base, const RecordedCommand& c);
   void ExecuteSetDepthStencil(const uint8_t* base, const RecordedCommand& c);
   void ExecuteResolve(const uint8_t* base, const RecordedCommand& c);
+
+  //--- Deferred execution (step 3) --------------------------------------------------------
+  /// Execute one recorded command, whichever kind it is. The single dispatch point shared by
+  /// the synchronous path and the worker, so the two can never drift apart.
+  void ExecuteCommand(const uint8_t* base, uint32_t guest_device, const RecordedCommand& c);
+
+  /// Submit a recorded command for execution: runs it inline when async is off, otherwise hands
+  /// it to the worker. Every recording site calls this instead of an Execute* directly.
+  void SubmitCommand(const uint8_t* base, uint32_t guest_device, uint32_t command_index);
+
+  /// Block until the worker has executed everything submitted this frame. The single
+  /// synchronisation point -- Present and the overlay run after it, on the guest thread, with
+  /// the worker idle (see the threading contract in d3d9_cmdbuf.h).
+  void DrainWorker();
+
+  void WorkerMain();
+
+  std::thread worker_thread_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;      ///< signalled when work arrives or shutdown is set
+  std::condition_variable queue_done_cv_; ///< signalled when the queue empties
+  /// Index of the next command the worker should execute. The guest thread only ever appends to
+  /// cmdbuf_ and raises queue_head_; the worker only ever advances queue_tail_. cmdbuf_'s
+  /// storage must not move under the worker -- that is why the constant pool is chunked, and why
+  /// commands_/draws_ are reserved rather than grown (see BeginFrame).
+  size_t queue_head_ = 0;
+  size_t queue_tail_ = 0;
+  bool worker_running_ = false;
+  bool worker_active_ = false;  ///< async enabled for this frame; latched at BeginFrame
+  const uint8_t* worker_base_ = nullptr;
+  uint32_t worker_guest_device_ = 0;
 
   /// Translate the guest's depth/blend/cull GPU-register shadows to D3D9.
   void ApplyRenderStates(const RecordedDraw& d);

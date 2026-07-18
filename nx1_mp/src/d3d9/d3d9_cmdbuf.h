@@ -30,10 +30,28 @@
  *
  * WHAT IS NOT SAFE TO DEFER
  *
- * Anything the guest may rewrite before the worker consumes it. Vertex/index bulk data is
- * proven stable within a frame; constants are NOT (hence the versioned blocks); fetch
- * constants are NOT (hence copying all 32). One probe in 448 did show a vertex range changing,
- * so the executor must tolerate that case rather than assume it away -- see kValidateRanges.
+ * Anything the guest may rewrite before the worker consumes it. Constants are NOT stable (hence
+ * resolving them on the guest thread); fetch constants are NOT (hence copying all 32).
+ *
+ * MEASURED, per class, sampled at a stride across the whole frame:
+ *
+ *   vertex   1-2 changed of ~19500 probed   (~6% of ~311k candidates)
+ *   index    0 changed of ~19500 probed
+ *   ucode    0 changed of ~19800 probed
+ *
+ * The nonzero VERTEX figure is the control and the reason the other two are believable: it
+ * proves the probe can detect mutation at all, so zero for index and microcode is a real zero
+ * rather than a stuck instrument. An earlier version of this measurement reported a flawless
+ * 100% for all three and was pure artifact -- it had saturated a per-frame cap on the opening
+ * shadow passes and never looked at the rest of the frame. Never trust a stability result that
+ * has no class showing churn.
+ *
+ * So index data and microcode may be read late. Vertex data is imperfect and is ACCEPTED rather
+ * than fixed: the probe re-hashes at PRESENT, while the worker consumes a draw within
+ * milliseconds of it being recorded, so ~0.01% is an upper bound on the real exposure, not an
+ * estimate of it. The failure mode is one model showing stale geometry for a single frame;
+ * snapshotting vertex data or re-hashing every draw at execute time both cost more than this
+ * whole scheme saves.
  *
  * STAGING
  *
@@ -78,6 +96,7 @@
 
 #ifdef _WIN32
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -328,7 +347,7 @@ class CommandBuffer {
     return commands_.back();
   }
 
-  const std::vector<RecordedCommand>& commands() const { return commands_; }
+  const std::deque<RecordedCommand>& commands() const { return commands_; }
   RecordedDraw& draw(uint32_t index) { return draws_[index]; }
 
   /// Append a delta for whatever the guest just rewrote, or reuse the previous one when the
@@ -337,7 +356,7 @@ class CommandBuffer {
   uint32_t RecordConstantDelta(const uint8_t* base, uint32_t guest_device, uint64_t vs_mask,
                                uint64_t ps_mask);
 
-  const std::vector<RecordedDraw>& draws() const { return draws_; }
+  const std::deque<RecordedDraw>& draws() const { return draws_; }
   const ConstantDelta& delta(uint32_t index) const { return deltas_[index]; }
   const uint8_t* delta_bytes(const ConstantDelta& d) const { return delta_pool_.data() + d.offset; }
   size_t delta_count() const { return deltas_.size(); }
@@ -350,8 +369,8 @@ class CommandBuffer {
   }
 
  private:
-  std::vector<RecordedDraw> draws_;
-  std::vector<RecordedCommand> commands_;
+  std::deque<RecordedDraw> draws_;
+  std::deque<RecordedCommand> commands_;
   std::vector<ConstantDelta> deltas_;
   std::vector<uint8_t> delta_pool_;
 

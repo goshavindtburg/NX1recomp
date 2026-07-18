@@ -39,6 +39,14 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_record, false, "GPU",
                     "Recording itself is unconditional as of step 2 -- every draw executes from "
                     "its record -- so this gates the log line only");
 
+/// Step 3: execute the recorded command stream on a worker thread. Off by default until it has
+/// earned trust -- the correctness argument rests on the threading contract in d3d9_cmdbuf.h and
+/// on the measured stability of index/microcode/vertex memory, and a race here would present as
+/// intermittent corruption rather than a clean failure.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_async, false, "GPU",
+                    "Translate recorded GPU commands on a worker thread, overlapping our "
+                    "translation with the guest's own between-draw logic");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_skip_clean_constants, true, "GPU",
                     "Skip the shader constant upload when the guest's dirty mask, the PM4 "
                     "ring generation and the bound shader all say nothing changed");
@@ -232,6 +240,12 @@ bool Renderer::Initialize(HWND output_window) {
   current_rt_height_ = pp.BackBufferHeight;
   REXGPU_INFO("nx1_d3d9: device created ({}x{})", pp.BackBufferWidth, pp.BackBufferHeight);
 
+  // The translation worker. Started unconditionally so nx1_d3d9_async can be toggled at runtime
+  // without a device reset; it parks on the condition variable and costs nothing while async is
+  // off, because BeginFrame only latches worker_active_ when the cvar says so.
+  worker_running_ = true;
+  worker_thread_ = std::thread([this] { WorkerMain(); });
+
   // The guest asks for anisotropy per sampler, but the Xenos ratios go to 16:1 and a host
   // adapter is free to cap lower -- MAXANISOTROPY above MaxAnisotropy is an invalid state.
   D3DCAPS9 caps = {};
@@ -288,6 +302,19 @@ void Renderer::Shutdown() {
   // D3D9Ex device while another thread is mid-draw is a use-after-free that takes
   // the GPU driver down with it.
   shutting_down_.store(true, std::memory_order_release);
+  // Join the worker BEFORE taking render_mutex_ and before anything is released: it executes
+  // D3D calls and touches ResourceTracker, so tearing those down underneath it is the same
+  // cross-thread use-after-free this function already guards against for the ring thread. Done
+  // outside the lock because the worker does not take render_mutex_ and waiting on it while
+  // holding one would be a deadlock waiting to happen.
+  if (worker_thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lk(queue_mutex_);
+      worker_running_ = false;
+    }
+    queue_cv_.notify_all();
+    worker_thread_.join();
+  }
   {
     std::lock_guard<std::mutex> lock(render_mutex_);
     // Before the device goes: imgui holds device objects, and the WndProc subclass must be
@@ -342,6 +369,9 @@ void Renderer::Present() {
   if (shutting_down_.load(std::memory_order_acquire) || !device_) {
     return;
   }
+  // THE synchronisation point. Everything below -- the display blit, the overlay, PresentEx --
+  // runs on the guest thread with the worker idle, which is why none of them needed queueing.
+  DrainWorker();
   device_->EndScene();
 
   // Copy the frame the guest resolved to its display buffer onto the backbuffer. The
@@ -410,7 +440,14 @@ void Renderer::Present() {
   // UNCONDITIONAL. Every draw now executes from its record, so the buffer fills whatever the
   // cvar says; leaving the reset behind nx1_d3d9_record would grow it without bound for the
   // whole session. The cvar gates the report and nothing else.
+  //
+  // Safe to reset here only because Present already drained the worker: the frame boundary is
+  // the one moment nothing is reading the buffer.
   cmdbuf_.BeginFrame();
+  queue_head_ = queue_tail_ = 0;
+  // Latched once per frame rather than read per command, so the mode cannot change underneath a
+  // half-submitted frame -- which would leave commands queued that nothing ever drains.
+  worker_active_ = REXCVAR_GET(nx1_d3d9_async) && worker_running_;
 
   const bool prof_on = REXCVAR_GET(nx1_d3d9_profile);
   ResourceTracker::Get().prof_enabled_ = prof_on;
@@ -591,7 +628,7 @@ void Renderer::Clear(const uint8_t* base, uint32_t flags, uint32_t rect_addr, ui
     }
   }
   c.has_color = color_addr != 0;
-  ExecuteClear(c);
+  SubmitCommand(base, 0, uint32_t(cmdbuf_.commands().size() - 1));
 }
 
 void Renderer::ExecuteClear(const RecordedCommand& c) {
@@ -648,7 +685,7 @@ void Renderer::SetRenderTarget(const uint8_t* base, uint32_t index, uint32_t gue
   RecordedCommand& c = cmdbuf_.AddCommand(CommandKind::kSetRenderTarget);
   c.rt_index = index;
   c.surface = guest_surface;
-  ExecuteSetRenderTarget(base, c);
+  SubmitCommand(base, 0, uint32_t(cmdbuf_.commands().size() - 1));
 }
 
 void Renderer::ExecuteSetRenderTarget(const uint8_t* base, const RecordedCommand& c) {
@@ -694,7 +731,7 @@ void Renderer::SetDepthStencil(const uint8_t* base, uint32_t guest_surface) {
   }
   RecordedCommand& c = cmdbuf_.AddCommand(CommandKind::kSetDepthStencil);
   c.surface = guest_surface;
-  ExecuteSetDepthStencil(base, c);
+  SubmitCommand(base, 0, uint32_t(cmdbuf_.commands().size() - 1));
 }
 
 void Renderer::ExecuteSetDepthStencil(const uint8_t* base, const RecordedCommand& c) {
@@ -747,7 +784,7 @@ void Renderer::Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_
       c.clear_color[i] = GuestReadF32(base, clear_color + i * 4);
     }
   }
-  ExecuteResolve(base, c);
+  SubmitCommand(base, 0, uint32_t(cmdbuf_.commands().size() - 1));
 }
 
 void Renderer::ExecuteResolve(const uint8_t* base, const RecordedCommand& c) {
@@ -1668,6 +1705,82 @@ void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t p
       cmdbuf_.RecordConstantDelta(base, guest_device, guest_dirty_vs_, guest_dirty_ps_);
 }
 
+void Renderer::ExecuteCommand(const uint8_t* base, uint32_t guest_device,
+                              const RecordedCommand& c) {
+  switch (c.kind) {
+    case CommandKind::kDraw:
+      ExecuteDraw(base, guest_device, cmdbuf_.draws()[c.draw_index]);
+      break;
+    case CommandKind::kClear:
+      ExecuteClear(c);
+      break;
+    case CommandKind::kResolve:
+      ExecuteResolve(base, c);
+      break;
+    case CommandKind::kSetRenderTarget:
+      ExecuteSetRenderTarget(base, c);
+      break;
+    case CommandKind::kSetDepthStencil:
+      ExecuteSetDepthStencil(base, c);
+      break;
+  }
+}
+
+void Renderer::SubmitCommand(const uint8_t* base, uint32_t guest_device, uint32_t command_index) {
+  if (!worker_active_) {
+    ExecuteCommand(base, guest_device, cmdbuf_.commands()[command_index]);
+    return;
+  }
+  // Async: publish the command and let the worker pick it up. The guest thread returns
+  // immediately and carries on with its own between-draw logic, which is the entire point --
+  // that logic was measured at 5.3-7.5 ms a frame sitting idle behind our translation.
+  {
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    worker_base_ = base;
+    worker_guest_device_ = guest_device;
+    queue_head_ = size_t(command_index) + 1;
+  }
+  queue_cv_.notify_one();
+}
+
+void Renderer::DrainWorker() {
+  if (!worker_active_) {
+    return;
+  }
+  std::unique_lock<std::mutex> lk(queue_mutex_);
+  queue_done_cv_.wait(lk, [this] { return queue_tail_ >= queue_head_ || !worker_running_; });
+}
+
+void Renderer::WorkerMain() {
+  for (;;) {
+    size_t index = 0;
+    const uint8_t* base = nullptr;
+    uint32_t guest_device = 0;
+    {
+      std::unique_lock<std::mutex> lk(queue_mutex_);
+      queue_cv_.wait(lk, [this] { return queue_tail_ < queue_head_ || !worker_running_; });
+      if (!worker_running_ && queue_tail_ >= queue_head_) {
+        return;
+      }
+      index = queue_tail_;
+      base = worker_base_;
+      guest_device = worker_guest_device_;
+    }
+    // Executed OUTSIDE the lock: this is the ~10 ms of translation whose whole purpose is to
+    // overlap with the guest thread. Holding queue_mutex_ across it would serialise the two
+    // again and buy exactly nothing. Safe because the guest only ever APPENDS to cmdbuf_, and
+    // its deques and chunked constant pool never move an element that has been handed out.
+    ExecuteCommand(base, guest_device, cmdbuf_.commands()[index]);
+    {
+      std::lock_guard<std::mutex> lk(queue_mutex_);
+      queue_tail_ = index + 1;
+      if (queue_tail_ >= queue_head_) {
+        queue_done_cv_.notify_all();
+      }
+    }
+  }
+}
+
 void Renderer::ProbeStability(ProbeKind kind, uint32_t addr, uint32_t bytes) {
   // STRIDE, not first-N. Taking the first 256 of each class sampled only the frame's opening
   // passes -- the same shadow-cascade draws every frame -- and reported a perfect 100% across
@@ -1779,7 +1892,7 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   RecordDraw(base, guest_device, prim_type, base_vertex_index, start_index, index_count);
   prof_record_ns_ += uint64_t((std::chrono::steady_clock::now() - t_rec).count());
 
-  ExecuteDraw(base, guest_device, cmdbuf_.draws().back());
+  SubmitCommand(base, guest_device, uint32_t(cmdbuf_.commands().size() - 1));
 }
 
 void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d) {
@@ -1904,6 +2017,12 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
     }
     return;
   }
+  // Inline path: this draw is NOT in the ordered command list, so it must not run while the
+  // worker is mid-stream -- it touches the device and the same shadow state (bound shaders,
+  // samplers, render states) the worker is driving. Draining puts it back in order. Cheap in
+  // practice: these are a handful of draws a frame in game, and in menus -- where nearly every
+  // draw is a UP draw -- there is no queued world work to wait on.
+  DrainWorker();
   ++draws_attempted_;
   // Non-indexed draws are a handful a frame and are not deferred, so this record is a stack
   // scratch rather than a command-buffer entry -- it exists so every path resolves its state
@@ -1944,6 +2063,7 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
   if (!device_ || !host_prim || !prim_count || !num_vertices) {
     return;
   }
+  DrainWorker();  // inline path, not in the command list -- see Draw()
   ++draws_attempted_;
   // Stack scratch, not a command-buffer entry: a UP draw's vertex and index payloads live
   // inline in guest memory and are copied into the D3D call itself, so it can never be deferred.
@@ -2023,6 +2143,7 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
     }
     return;
   }
+  DrainWorker();  // inline path, not in the command list -- see Draw()
   RecordedDraw d{};  // stack scratch -- see DrawIndexedUP
   d.prim_type = prim_type;
   d.vertex_count = vertex_count;
