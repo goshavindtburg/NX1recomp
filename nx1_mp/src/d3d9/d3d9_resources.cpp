@@ -2361,6 +2361,33 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     }
   }
 
+  // TEMP DIAGNOSTIC (colour grading): dump the composite's tonemap ramp (s8 = 256x1). With a
+  // valid graded LUT (proven), the composite is oC0 = tex3D(LUT, ramp(scene)) -- so this ramp
+  // sets the LUT lookup coords. Log its curve at a few points, decoded as the shader sees it
+  // (A8R8G8B8 in memory = [B][G][R][A]). A straight 0->255 line is identity (correct passthrough
+  // into the LUT); a compressed/flat/wrong curve mis-indexes the grade.
+  if (t.width == 256 && height == 1 && dst) {
+    static std::mutex sm;
+    static std::vector<uint32_t> sseen;
+    std::lock_guard<std::mutex> lk(sm);
+    if (std::find(sseen.begin(), sseen.end(), t.base_address) == sseen.end() &&
+        sseen.size() < 8) {
+      sseen.push_back(t.base_address);
+      // fmt=2 (k_8) builds as L8 -- ONE byte per texel, sampled as luminance replicated to RGB.
+      // Read the row at its real host pitch and stride by the actual bytes/texel.
+      const uint8_t* row = static_cast<const uint8_t*>(locked.pBits);
+      const uint32_t bpt = uint32_t(locked.Pitch) / 256u;  // bytes per texel (1 for L8)
+      char b[420];
+      int n = std::snprintf(b, sizeof(b), "nx1_d3d9: RAMP8 @%08X fmt=%u bpt=%u 256x1:",
+                            t.base_address, t.format, bpt);
+      for (uint32_t x = 0; x <= 256; x += 32) {
+        const uint32_t xi = x > 255 ? 255 : x;
+        n += std::snprintf(b + n, sizeof(b) - n, " [%u]=%u", xi, row[size_t(xi) * bpt]);
+      }
+      REXGPU_INFO("{}", b);
+    }
+  }
+
   staging->UnlockRect(0);
 
   // D3DUSAGE_AUTOGENMIPMAP reports a single level and keeps its sub-levels to itself: the
@@ -2601,6 +2628,27 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
       size_t(extent.block_pitch_h) * extent.block_pitch_v * std::max(1u, t.depth) * bpb;
   const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
   const uint64_t content_hash = XXH3_64bits(src, guest_bytes);
+
+  // TEMP DIAGNOSTIC (colour grading): the composite is `oC0 = tex3D(s7, ...)`, a pure LUT
+  // replacement -- a truly-black LUT would make the frame black, and it is not. So log, on
+  // EVERY call for a small cubic LUT (not just cache-miss), whether the guest memory is empty
+  // and whether we are about to serve a cache hit. If the LUT is empty on a cache HIT, we are
+  // permanently serving a black texture built once from empty RAM.
+  if (t.width <= 64 && t.depth >= 8 && t.width == t.depth) {
+    static std::mutex hm;
+    static uint32_t hcount = 0;
+    std::lock_guard<std::mutex> lk(hm);
+    if ((hcount++ % 240) == 0) {
+      uint32_t nz = 0;
+      for (size_t bi = 0; bi < guest_bytes; ++bi) nz += src[bi] != 0 ? 1 : 0;
+      const bool cache_hit =
+          entry.vol && entry.layout_key == layout_key && entry.content_hash == content_hash;
+      REXGPU_INFO("nx1_d3d9: LUTLIVE s{} @{:08X} {}^3 nonzero={}/{} cachehit={} hosttex={}",
+                  sampler, t.base_address, t.width, nz, uint32_t(guest_bytes), cache_hit,
+                  entry.vol ? "have" : "none");
+    }
+  }
+
   if (entry.vol && entry.layout_key == layout_key && entry.content_hash == content_hash) {
     return entry.vol;
   }
@@ -2656,12 +2704,15 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
   // applied -- the question is whether the content is a real warm grade or has been flattened
   // / channel-swapped in our path. Identity LUT: cell(i,i,i) ~= (i/(N-1)) grey. A real grade
   // deviates (warm = R>B at the top). BGRA in memory: byte order is [B][G][R][A].
+  // Dedup on CONTENT hash, not layout_key: the LUT is built empty on frame 1 then populated,
+  // and keying on layout_key only ever dumped the empty first build. Now we also capture the
+  // real, populated grade.
   if (t.width <= 64 && t.depth >= 8 && t.width == t.depth) {
     static std::mutex lm;
     static std::vector<uint64_t> lseen;
     std::lock_guard<std::mutex> lk(lm);
-    if (std::find(lseen.begin(), lseen.end(), layout_key) == lseen.end() && lseen.size() < 24) {
-      lseen.push_back(layout_key);
+    if (std::find(lseen.begin(), lseen.end(), content_hash) == lseen.end() && lseen.size() < 24) {
+      lseen.push_back(content_hash);
       const uint32_t N = t.width;
       auto cell = [&](uint32_t x, uint32_t y, uint32_t z, char* out, size_t cap) {
         const uint8_t* px = static_cast<const uint8_t*>(box.pBits) + size_t(z) * box.SlicePitch +
@@ -2676,6 +2727,50 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
       cell(N - 1, N - 1, N - 1, c4, sizeof(c4));
       REXGPU_INFO("nx1_d3d9: LUTDIAG {}^3 fmt={} swizzle={:03X} diag: {} {} {} {} {}", N, t.format,
                   t.swizzle & 0xFFF, c0, c1, c2, c3, c4);
+
+      // Dump the whole cube as a (N*N) wide by N tall RGB montage (the N z-slices laid out
+      // left-to-right) -- a correct colour LUT is a smooth cube; a misplaced/sparse
+      // reconstruction (our 25%-nonzero suspect) shows as scattered lit cells on black.
+      uint32_t diag_nz = 0;
+      for (size_t bi = 0; bi < guest_bytes; ++bi) diag_nz += src[bi] != 0 ? 1 : 0;
+      if (diag_nz > 0) {
+        const uint32_t W = N * N, H = N;
+        const uint32_t stride = (W * 3 + 3) & ~3u;
+        std::vector<uint8_t> img(size_t(stride) * H, 0);
+        for (uint32_t z = 0; z < N; ++z) {
+          const uint8_t* slice =
+              static_cast<const uint8_t*>(box.pBits) + size_t(z) * box.SlicePitch;
+          for (uint32_t y = 0; y < N; ++y) {
+            const uint8_t* row = slice + size_t(y) * box.RowPitch;
+            for (uint32_t x = 0; x < N; ++x) {
+              const uint8_t* px = row + size_t(x) * 4;  // BGRA
+              uint8_t* out = img.data() + size_t(H - 1 - y) * stride + (z * N + x) * 3;
+              out[0] = px[0];  // B
+              out[1] = px[1];  // G
+              out[2] = px[2];  // R
+            }
+          }
+        }
+        char path[128];
+        std::snprintf(path, sizeof(path), "texdump/lut_%08X.bmp", t.base_address);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+          BITMAPFILEHEADER fh{};
+          BITMAPINFOHEADER ih{};
+          fh.bfType = 0x4D42;
+          fh.bfOffBits = sizeof(fh) + sizeof(ih);
+          fh.bfSize = fh.bfOffBits + uint32_t(img.size());
+          ih.biSize = sizeof(ih);
+          ih.biWidth = LONG(W);
+          ih.biHeight = LONG(H);
+          ih.biPlanes = 1;
+          ih.biBitCount = 24;
+          std::fwrite(&fh, sizeof(fh), 1, f);
+          std::fwrite(&ih, sizeof(ih), 1, f);
+          std::fwrite(img.data(), 1, img.size(), f);
+          std::fclose(f);
+          REXGPU_INFO("nx1_d3d9: LUTDIAG dumped {} ({}x{})", path, W, H);
+        }
+      }
       // Separate "we read the wrong/empty memory" from "detile zeroed good data": hash + first
       // dwords of the RAW guest bytes, and the address/tiling we resolved from.
       uint32_t nz = 0;

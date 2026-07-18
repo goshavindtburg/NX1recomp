@@ -61,6 +61,15 @@ REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_shadow, 0, "GPU",
                      "Debug: replace the world pixel shader with the sun shadow lookup (1-9), or "
                      "show the cascade fade on one known shader (10-12).");
 
+// 1 = solid red (does the composite reach the display?)  2 = the 3D LUT's z=0.5 slice sampled
+// across screen UV (a smooth colour gradient => the LUT binds+samples right on our device;
+// flat/black => the bound LUT is broken)  3 = tex3D(LUT, scene) with direct coords (bypasses
+// the s8 tonemap ramp + c4 half-texel scale: if THIS grades but the real shader does not, the
+// coord path is the bug)  4 = raw scene s0, ungraded baseline.
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_composite, 0, "GPU",
+                     "Debug: replace the colour-grading composite PS (1=red, 2=LUT slice, "
+                     "3=LUT(scene) direct, 4=raw scene).");
+
 namespace nx1::d3d9 {
 
 bool IsEnabled() {
@@ -547,6 +556,25 @@ void Renderer::ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t 
   }
 
   ResourceTracker::Get().ResolveColor(dest.base_address, dest.width, dest.height, rect, at);
+
+  // TEMP DIAGNOSTIC (colour grading): the composite grades into the 1920x1080 FRAME_BUFFER,
+  // then the guest resolves THAT to display. If our backbuffer isn't 1920x1080 we never catch
+  // that resolve and present a wrong/stale surface -- the ungraded scene, exactly the flat look.
+  // Log every colour resolve's address+size and whether it becomes the presented frame.
+  {
+    static std::mutex rm;
+    static std::vector<uint64_t> rseen;
+    std::lock_guard<std::mutex> lk(rm);
+    const uint64_t key = (uint64_t(dest.width) << 48) ^ (uint64_t(dest.height) << 32) ^
+                         dest.base_address;
+    if (std::find(rseen.begin(), rseen.end(), key) == rseen.end() && rseen.size() < 16) {
+      rseen.push_back(key);
+      REXGPU_INFO("nx1_d3d9: COLORRESOLVE @{:08X} {}x{} (backbuffer {}x{}) -> display={}",
+                  dest.base_address, dest.width, dest.height, backbuffer_width_,
+                  backbuffer_height_,
+                  (dest.width == backbuffer_width_ && dest.height == backbuffer_height_));
+    }
+  }
 
   // A display-sized colour resolve is the finished frame; remember it for Present.
   if (dest.width == backbuffer_width_ && dest.height == backbuffer_height_) {
@@ -1433,6 +1461,57 @@ void Renderer::ProbeWorldDraw(const uint8_t* base, uint32_t guest_device) {
         break;
       }
     }
+    // Composite override modes -- see the cvar comment. The composite reaches display (mode 1
+    // proved it red), so narrow WHERE the grade is lost: the bound LUT, or the lookup coords.
+    const int32_t dbg_comp = REXCVAR_GET(nx1_d3d9_dbg_composite);
+    if (has_lut && dbg_comp > 0) {
+      static IDirect3DPixelShader9* comp_ps = nullptr;
+      static int comp_built_mode = -1;
+      if (comp_built_mode != dbg_comp) {
+        comp_built_mode = dbg_comp;
+        if (comp_ps) {
+          comp_ps->Release();
+          comp_ps = nullptr;
+        }
+        const char* src = nullptr;
+        switch (dbg_comp) {
+          case 1:
+            src = "float4 main() : COLOR { return float4(1, 0, 0, 1); }";
+            break;
+          case 2:  // the LUT's mid slice across screen UV -- a gradient means it binds+samples
+            src = "sampler3D lut : register(s7);\n"
+                  "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
+                  "  return float4(tex3D(lut, float3(uv, 0.5)).xyz, 1); }";
+            break;
+          case 3:  // grade the scene directly, bypassing the s8 ramp and c4 half-texel scale
+            src = "sampler2D scene : register(s0);\n"
+                  "sampler3D lut : register(s7);\n"
+                  "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
+                  "  float3 s = tex2D(scene, uv).xyz;\n"
+                  "  return float4(tex3D(lut, s).xyz, 1); }";
+            break;
+          default:  // 4: raw ungraded scene
+            src = "sampler2D scene : register(s0);\n"
+                  "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
+                  "  return float4(tex2D(scene, uv).xyz, 1); }";
+            break;
+        }
+        ID3DBlob* c = nullptr;
+        ID3DBlob* e = nullptr;
+        if (SUCCEEDED(D3DCompile(src, strlen(src), nullptr, nullptr, nullptr, "main", "ps_3_0", 0,
+                                 0, &c, &e)) &&
+            c) {
+          device_->CreatePixelShader(static_cast<const DWORD*>(c->GetBufferPointer()), &comp_ps);
+          c->Release();
+        }
+        if (e) e->Release();
+        REXGPU_INFO("nx1_d3d9: DBGCOMPOSITE mode={} built={}", dbg_comp, comp_ps != nullptr);
+      }
+      if (comp_ps) {
+        device_->SetPixelShader(comp_ps);
+        device_->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+      }
+    }
     if (has_lut && (ctick++ % 191) == 0) {
       auto& tr = ResourceTracker::Get();
       char cb[900];
@@ -1450,6 +1529,19 @@ void Renderer::ProbeWorldDraw(const uint8_t* base, uint32_t guest_device) {
       cn += std::snprintf(cb + cn, sizeof(cb) - cn, " | rt=%ux%u", current_rt_width_,
                           current_rt_height_);
       REXGPU_INFO("{}", cb);
+
+      // The LUT lookup is `coords = ramp(scene) * c4.x + c4.y`. For a 16^3 LUT the correct
+      // half-texel mapping is c4.x = 15/16 = 0.9375, c4.y = 0.5/16 = 0.03125. If c4 is anything
+      // else, every pixel samples the LUT off its intended cell and the grade collapses toward
+      // identity -- which matches "grade off (mode 4) looks the same as grade on". Read the
+      // composite PS's live c0..c5.
+      float cc[6 * 4] = {};
+      if (SUCCEEDED(device_->GetPixelShaderConstantF(0, cc, 6))) {
+        REXGPU_INFO("nx1_d3d9: POSTC c4=({:.5f},{:.5f},{:.5f},{:.5f}) c5=({:.4f},{:.4f},{:.4f},"
+                    "{:.4f}) c3=({:.4f},{:.4f},{:.4f},{:.4f})",
+                    cc[16], cc[17], cc[18], cc[19], cc[20], cc[21], cc[22], cc[23], cc[12],
+                    cc[13], cc[14], cc[15]);
+      }
 
       // Dump the composite PS once: the LUT reads all-zero, but before chasing WHY, confirm the
       // shader even depends on it -- a zero LUT could be passthrough (additive) or black
