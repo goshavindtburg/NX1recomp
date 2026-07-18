@@ -47,6 +47,11 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_async, false, "GPU",
                     "Translate recorded GPU commands on a worker thread, overlapping our "
                     "translation with the guest's own between-draw logic");
 
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_isolate, -1, "GPU",
+                     "Make every draw using BLENDCFG #N write no colour, so it disappears. "
+                     "Cycle this to find which blend config a surface uses. Indices are per-run "
+                     "-- read them from the same run's log. -1 = off");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_blend_log, false, "GPU",
                     "Log every distinct blend configuration the guest asks for, once each "
                     "(glass-transparency hunt)");
@@ -1609,6 +1614,19 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
                   seen.size() - 1, blend.enabled ? 1 : 0, blend.color_src, blend.color_dst,
                   blend.color_op, blend.alpha_src, blend.alpha_dst, blend.alpha_op,
                   d.color_write_mask);
+    }
+    // Attribution. Knowing WHICH of these configs the glass uses is the whole question, and the
+    // list alone cannot say. Setting nx1_d3d9_dbg_blend_isolate to an index makes every draw
+    // using that config write nothing, so it visibly disappears -- cycle the value in the F4
+    // overlay until the glass vanishes and the index is identified in seconds.
+    //
+    // Indices are assigned in DISCOVERY ORDER, so they are stable only within one run. Read them
+    // from the same run's log, not an earlier one.
+    const int32_t isolate = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_isolate));
+    if (isolate >= 0 && it != seen.end() &&
+        size_t(isolate) == size_t(it - seen.begin())) {
+      SetRenderStateCached(D3DRS_COLORWRITEENABLE, 0);
+      bound_color_write_ = 0;
     }
   }
 
