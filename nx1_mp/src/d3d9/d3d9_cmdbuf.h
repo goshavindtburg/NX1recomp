@@ -121,6 +121,31 @@
  *      in the same category as the fetch constants. Missed because the stability probe measured
  *      index DATA and that was taken as clearing index reads generally.
  *
+ * WHY THERE IS A DRAIN BARRIER AND NOT FRAME PIPELINING
+ *
+ * PROF/bound shows both threads idle ~3.4 ms per frame at DIFFERENT times: the worker starves at
+ * frame start with nothing recorded yet, the guest blocks at frame end draining. Guest busy
+ * ~12.8 ms, worker busy ~10.4 ms, so a perfectly pipelined frame would be ~12.8 ms against ~16
+ * measured. That bubble is worth ~3.4 ms, roughly 62 -> 78 FPS, and closing it means overlapping
+ * frame N's execution with N+1's recording.
+ *
+ * MEASURED AND REJECTED. Carrying the stability probes one frame and re-hashing them at the next
+ * Present:
+ *
+ *   vertex   in-frame 99.91% unchanged   CROSS-FRAME 95.78%
+ *   index    in-frame 100%               CROSS-FRAME 100%
+ *   ucode    in-frame 100%               CROSS-FRAME 100%
+ *
+ * Vertex churn is ~46x worse across a frame boundary. Scaled back through the 1/16 sampling
+ * stride that is ~230 draws a frame reading vertex memory that is rewritten before the next
+ * frame ends -- the engine's dynamic geometry comes from recycled pools (the same behaviour that
+ * forced the vertex-buffer eviction sweep). Pipelining would therefore corrupt animated players,
+ * weapons and effects persistently, not occasionally.
+ *
+ * Making it correct needs vertex snapshots, which is what this design rejected as costing more
+ * than it saves -- and it would land on the guest thread, already the longer pole. So the drain
+ * barrier stays and the ~3.4 ms is left on the table deliberately, not by oversight.
+ *
  * Also worth keeping: two instruments silently became nonsense when their assumptions broke --
  * PROF/defer differencing timestamps from two threads, and the stability probe saturating its
  * cap on the frame's opening passes and reporting a confident 100%. Check that a measurement can
