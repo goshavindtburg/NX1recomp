@@ -1525,11 +1525,11 @@ void ResourceTracker::Shutdown() {
   device_ = nullptr;
 }
 
-const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32_t guest_device) {
+const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32_t decl_object,
+                                                     const uint32_t* stream_stride) {
   if (!device_ || !layouts_) {
     return nullptr;
   }
-  const uint32_t decl_object = BoundVertexDeclaration(base, guest_device);
   if (!decl_object) {
     return nullptr;
   }
@@ -1539,7 +1539,7 @@ const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32
   // of different pitch.
   uint64_t key = MixKey(decl_object, VertexDeclarationUniqueness(base, decl_object));
   for (uint32_t s = 0; s < kMaxHostStreams; ++s) {
-    key = MixKey(key, StreamStride(base, guest_device, s));
+    key = MixKey(key, stream_stride[s]);
   }
 
   // Last-result memo. This runs once per draw (~5000 a frame) and consecutive draws
@@ -1562,7 +1562,7 @@ const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32
   VertexLayout layout;
   layout.key = key;
   for (uint32_t s = 0; s < kMaxHostStreams; ++s) {
-    layout.guest_stride[s] = StreamStride(base, guest_device, s);
+    layout.guest_stride[s] = stream_stride[s];
     layout.bulk_swap[s] = true;
   }
 
@@ -1634,23 +1634,22 @@ const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32
   return stored.decl ? &stored : nullptr;
 }
 
-const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
-                                                           uint32_t guest_device,
-                                                           uint32_t stream0_stride) {
+const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base, uint32_t vs_object,
+                                                           uint32_t vs_pass,
+                                                           uint32_t stream0_stride,
+                                                           const uint32_t* stream_stride) {
   // stream0_stride == 0 is valid: it selects bound-buffer mode (strides come from
   // m_StreamStride). Only reject a genuinely unusable tracker here.
   if (!device_ || !layouts_) {
     return nullptr;
   }
-  const uint32_t vs_object = BoundVertexShader(base, guest_device);
   if (!vs_object) {
     return nullptr;
   }
-  // Resolve the exact microcode the draw runs -- same pass BindShadersAndConstants
-  // picks -- so the vfetch layout matches the shader the SM3 cache was keyed on.
-  const bool has_ps = BoundPixelShader(base, guest_device) != 0;
-  const uint32_t pass = VertexShaderPass(base, vs_object, has_ps);
-  const GuestUcode ucode = ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, pass);
+  // The caller resolved the exact microcode pass the draw runs -- the same one
+  // BindShadersAndConstants picked -- so the vfetch layout matches the shader the SM3 cache was
+  // keyed on. Deriving it here a second time would be a second chance to disagree.
+  const GuestUcode ucode = ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, vs_pass);
   if (!ucode.valid()) {
     return nullptr;
   }
@@ -1702,7 +1701,7 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
     if (!up_mode) {
       // The bound-buffer stride is not in the shader's vfetch (it reads 0 there);
       // the guest sets it via D3DDevice_SetStreamSource into m_StreamStride[].
-      layout.guest_stride[stream] = StreamStride(base, guest_device, stream);
+      layout.guest_stride[stream] = stream_stride[stream];
     }
     for (const auto& attribute : binding.attributes) {
       if (host_count >= MAXD3DDECLLENGTH) {
@@ -1776,7 +1775,8 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base,
   return stored.decl ? &stored : nullptr;
 }
 
-IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, uint32_t guest_device,
+IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base,
+                                                         const VertexFetchConstant& fetch,
                                                          uint32_t stream,
                                                          const VertexLayout& layout,
                                                          uint32_t needed_vertices,
@@ -1796,7 +1796,6 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
 
   const uint32_t guest_stride = layout.guest_stride[stream];
   const uint32_t host_stride = layout.host_stride[stream];
-  const VertexFetchConstant fetch = ReadVertexFetchConstant(base, guest_device, stream);
   if (!guest_stride || !host_stride) {
     return nullptr;
   }

@@ -151,11 +151,15 @@ class Renderer {
   /// Mirror the guest's vertex streams and bind them plus a host vertex declaration.
   /// `needed_vertices` bounds how much of each stream is mirrored (0 = all of it); see
   /// ResourceTracker::GetVertexBuffer. `vertex_count` receives the shortest stream's length.
-  bool BindStreams(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
-                   uint32_t needed_vertices, uint32_t* vertex_count);
-  /// Untile + bind every bound texture and its sampler state.
-  void BindTextures(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
-                    uint64_t surface_key = 0);
+  ///
+  /// Takes no guest_device: every piece of STATE it needs comes from the record. `base` is only
+  /// for bulk vertex data, which a worker reads late by design -- and dropping the parameter is
+  /// what stops that quietly regressing, since re-reading device state would no longer compile.
+  bool BindStreams(const uint8_t* base, const RecordedDraw& d, uint32_t needed_vertices,
+                   uint32_t* vertex_count);
+  /// Untile + bind every bound texture and its sampler state. No guest_device, for the same
+  /// reason as BindStreams: `base` is only for texture data.
+  void BindTextures(const uint8_t* base, const RecordedDraw& d, uint64_t surface_key = 0);
   /// The copy half of a resolve (EDRAM -> host texture). Caller holds render_mutex_.
   void ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
                    uint32_t dest_point);

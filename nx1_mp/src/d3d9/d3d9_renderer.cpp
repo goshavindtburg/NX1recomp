@@ -984,8 +984,7 @@ void Renderer::UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg,
     if (!(mask & (1u << s))) {
       continue;
     }
-    const TextureFetchConstant t =
-        DecodeTextureFetchConstant(reinterpret_cast<const uint8_t*>(d.fetch_constants[s]));
+    const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(s));
     if (t.valid && t.width && t.height) {
       dims[s * 4 + 0] = 1.0f / float(t.width);
       dims[s * 4 + 1] = 1.0f / float(t.height);
@@ -1150,13 +1149,9 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   return true;
 }
 
-bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
+bool Renderer::BindStreams(const uint8_t* base, const RecordedDraw& d,
                            uint32_t needed_vertices, uint32_t* vertex_count) {
   auto& tracker = ResourceTracker::Get();
-  // DEFERRED-GAP: GetVertexLayout / GetShaderVertexLayout / GetVertexBuffer all read the fetch
-  // constants and the declaration out of guest memory. d.fetch_constants and
-  // d.vertex_declaration already carry both; these need overloads taking them.
-  (void)d;
   // NX1 binds no CVertexDeclaration; for bound-buffer draws derive the multi-stream
   // layout from the vertex shader's vfetch (stream0_stride=0 selects bound mode).
   const bool vprof = REXCVAR_GET(nx1_d3d9_profile);
@@ -1167,9 +1162,10 @@ bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, const Rec
     if (vprof) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
   };
   const auto t_layout = vmark();
-  const VertexLayout* layout = tracker.GetVertexLayout(base, guest_device);
+  const VertexLayout* layout = tracker.GetVertexLayout(base, d.vertex_declaration, d.stream_stride);
   if (!layout) {
-    layout = tracker.GetShaderVertexLayout(base, guest_device, /*stream0_stride=*/0);
+    layout = tracker.GetShaderVertexLayout(base, d.vs_object, d.vs_pass, /*stream0_stride=*/0,
+                                           d.stream_stride);
   }
   vadd(prof_vlayout_ns_, t_layout);
   if (!layout) {
@@ -1188,7 +1184,8 @@ bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, const Rec
     uint32_t count = 0;
     const auto t_vb = vmark();
     IDirect3DVertexBuffer9* vb =
-        tracker.GetVertexBuffer(base, guest_device, stream, *layout, needed_vertices, &count);
+        tracker.GetVertexBuffer(base, DecodeVertexFetchConstant(d.vertex_fetch(stream)), stream,
+                                *layout, needed_vertices, &count);
     if (!vb) {
       return false;
     }
@@ -1376,7 +1373,7 @@ void Renderer::InvalidateStateShadow() {
   last_sig_valid_ = false;
 }
 
-void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
+void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
                             uint64_t surface_key) {
   auto& tracker = ResourceTracker::Get();
   // Fetch constants come from the RECORD, not from guest memory: d.fetch_constants holds all 32
@@ -1385,9 +1382,6 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const Re
   // anisotropy, gamma -- is decoded from that same constant, so the whole function is now
   // deferrable. `base` survives only for the texture DATA, which is bulk memory a worker reads
   // late by design.
-  const auto slot_bytes = [&d](uint32_t sampler) {
-    return reinterpret_cast<const uint8_t*>(d.fetch_constants[sampler]);
-  };
   // A scene is ~5000 draws over 16 samplers, and consecutive draws overwhelmingly share
   // their textures and filters -- so shadow the sampler state and only touch D3D when it
   // actually changes. Issuing all of it unconditionally was 80k SetTexture and ~500k
@@ -1412,7 +1406,7 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const Re
     if (!(sampler_mask & (1u << sampler))) {
       continue;
     }
-    std::memcpy(&sig[sig_n], slot_bytes(sampler), 6 * sizeof(uint32_t));
+    std::memcpy(&sig[sig_n], d.texture_fetch(sampler), 6 * sizeof(uint32_t));
     sig_n += 6;
   }
   if (sig_n && last_sig_valid_ && last_sig_dwords_ == sig_n && last_sig_mask_ == sampler_mask &&
@@ -1440,7 +1434,7 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const Re
     // memo misses, and the compare is pure added cost. Don't re-add it without data.
     // Decoded once here and handed to GetTexture: the sampler state below needs the same
     // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
-    const TextureFetchConstant t = DecodeTextureFetchConstant(slot_bytes(sampler));
+    const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(sampler));
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, t, sampler);
     if (tex) {
       // For a static-geometry world draw, hold the highest-res texture this surface has shown and
@@ -1690,7 +1684,7 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
 
   auto t_vb = ptick();
   uint32_t vertex_count = 0;
-  const bool streams_ok = BindStreams(base, guest_device, d, needed_vertices, &vertex_count);
+  const bool streams_ok = BindStreams(base, d, needed_vertices, &vertex_count);
   padd(prof_streams_ns_, t_vb);
   if (!streams_ok) {
     return;
@@ -1709,7 +1703,7 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
   }
   device_->SetIndices(ib);
   auto t_tex = ptick();
-  BindTextures(base, guest_device, d, d.surface_key);
+  BindTextures(base, d, d.surface_key);
   padd(prof_textures_ns_, t_tex);
 
   auto t_rs = ptick();
@@ -1775,10 +1769,10 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
   // A non-indexed draw reads exactly [start_vertex, start_vertex + vertex_count), so its
   // reach into the (possibly pooled) buffer is known without consulting any indices.
   uint32_t stream_vertices = 0;
-  if (!BindStreams(base, guest_device, d, start_vertex + vertex_count, &stream_vertices)) {
+  if (!BindStreams(base, d, start_vertex + vertex_count, &stream_vertices)) {
     return;
   }
-  BindTextures(base, guest_device, d);
+  BindTextures(base, d);
   ApplyRenderStates(d);
   device_->DrawPrimitive(host_prim, start_vertex, prim_count);
   ++draws_submitted_;
@@ -1816,9 +1810,10 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
   // NX1 UP draws bind no CVertexDeclaration -- the vertex layout is baked into the
   // vertex shader's vfetch. Prefer a declaration if one is set (rare), otherwise
   // derive the layout from the bound shader, keyed on the UP stream stride.
-  const VertexLayout* layout = tracker.GetVertexLayout(base, guest_device);
+  const VertexLayout* layout = tracker.GetVertexLayout(base, d.vertex_declaration, d.stream_stride);
   if (!layout) {
-    layout = tracker.GetShaderVertexLayout(base, guest_device, vertex_stride);
+    layout = tracker.GetShaderVertexLayout(base, d.vs_object, d.vs_pass, vertex_stride,
+                                           d.stream_stride);
   }
   if (!layout) {
     return;
@@ -1840,7 +1835,7 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
     return;
   }
 
-  BindTextures(base, guest_device, d);
+  BindTextures(base, d);
   ApplyRenderStates(d);
   const HRESULT hr = device_->DrawIndexedPrimitiveUP(
       host_prim, 0, num_vertices, prim_count, indices.data(),
@@ -1889,9 +1884,10 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
   auto& tracker = ResourceTracker::Get();
   // Same as DrawIndexedUP: NX1 binds no CVertexDeclaration, so derive the layout
   // from the bound vertex shader's vfetch when none is set.
-  const VertexLayout* layout = tracker.GetVertexLayout(base, guest_device);
+  const VertexLayout* layout = tracker.GetVertexLayout(base, d.vertex_declaration, d.stream_stride);
   if (!layout) {
-    layout = tracker.GetShaderVertexLayout(base, guest_device, vertex_stride);
+    layout = tracker.GetShaderVertexLayout(base, d.vs_object, d.vs_pass, vertex_stride,
+                                           d.stream_stride);
   }
   if (!layout) {
     return;
@@ -1905,7 +1901,7 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
     return;
   }
 
-  BindTextures(base, guest_device, d);
+  BindTextures(base, d);
   ApplyRenderStates(d);
   if (SUCCEEDED(device_->DrawPrimitiveUP(host_prim, prim_count, verts.data(), host_stride))) {
     ++draws_submitted_;

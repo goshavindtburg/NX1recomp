@@ -103,6 +103,21 @@ struct RecordedDraw {
   /// ReadTextureFetchConstantAt-style reads on the worker. Not decoded at record time: see the
   /// note in ConstantBlock about what byte-swapping during capture costs.
   uint32_t fetch_constants[guest_device::kFetchConstantCount][6] = {};
+
+  /// The raw bytes of one texture slot's fetch constant (24 B), ready for
+  /// DecodeTextureFetchConstant.
+  const uint8_t* texture_fetch(uint32_t sampler) const {
+    return reinterpret_cast<const uint8_t*>(fetch_constants) +
+           size_t(sampler) * guest_device::kFetchConstantStride;
+  }
+  /// The raw bytes of one vertex stream's fetch constant (8 B), ready for
+  /// DecodeVertexFetchConstant. The vertex fetch constants are 2-dword slots ALIASED onto the
+  /// tail of the same array -- stream 0 is slot 95, i.e. bytes 760..767 of the 768 -- which is
+  /// why the recorder copies all 32 texture slots rather than just the 16 that are textures.
+  const uint8_t* vertex_fetch(uint32_t stream) const {
+    return reinterpret_cast<const uint8_t*>(fetch_constants) +
+           size_t(VertexFetchSlotForStream(stream)) * 8;
+  }
   /// Guest addresses of the bound shader objects. The worker hashes the microcode and looks up
   /// the SM3 translation; the objects themselves are stable for the frame.
   uint32_t vs_object = 0;

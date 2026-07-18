@@ -29,6 +29,7 @@
 namespace nx1::d3d9 {
 
 struct TextureFetchConstant;  // guest_d3d.h
+struct VertexFetchConstant;   // guest_d3d.h
 
 inline constexpr uint32_t kMaxHostStreams = 4;
 
@@ -87,7 +88,13 @@ class ResourceTracker {
 
   /// Translate the guest's bound D3D::CVertexDeclaration. Returns nullptr if any
   /// element uses a Xenos vertex format we cannot express or decode.
-  const VertexLayout* GetVertexLayout(const uint8_t* base, uint32_t guest_device);
+  ///
+  /// Takes the declaration object address and the per-stream strides rather than the device, so
+  /// a deferred executor can pass what it recorded. The declaration OBJECT is still read out of
+  /// guest memory -- it is a separate allocation with its own lifetime, in the same
+  /// read-it-late class as the shader microcode.
+  const VertexLayout* GetVertexLayout(const uint8_t* base, uint32_t decl_object,
+                                      const uint32_t* stream_stride);
 
   /// Derive a host vertex layout from the bound vertex shader's `vfetch`
   /// instructions, for draws that bind no D3D::CVertexDeclaration (all NX1 menu
@@ -96,8 +103,13 @@ class ResourceTracker {
   /// analysis XenosRecomp ran to build each shader's input signature, so the
   /// declaration matches the compiled SM3 vertex shader. `stream0_stride` is the
   /// guest byte stride of the single UP stream. Returns nullptr on failure.
-  const VertexLayout* GetShaderVertexLayout(const uint8_t* base, uint32_t guest_device,
-                                            uint32_t stream0_stride);
+  /// `vs_object`/`vs_pass` identify the microcode to analyse -- the same pair
+  /// BindShadersAndConstants resolved, so the layout matches the SM3 shader that will run.
+  /// `stream_stride` supplies the bound-buffer strides (used only when stream0_stride == 0):
+  /// the vfetch reads 0 there, so they come from the guest's m_StreamStride[].
+  const VertexLayout* GetShaderVertexLayout(const uint8_t* base, uint32_t vs_object,
+                                            uint32_t vs_pass, uint32_t stream0_stride,
+                                            const uint32_t* stream_stride);
 
   /// Mirror vertex stream `stream`. `vertex_count` receives the mirrored length.
   ///
@@ -106,7 +118,8 @@ class ResourceTracker {
   /// lives in shared pools -- so for a skinned model that is megabytes, and mirroring it all
   /// meant hashing and converting ~78k vertices for a draw that touches a few hundred. Pass
   /// the draw's actual vertex reach (see GetDrawMaxIndex).
-  IDirect3DVertexBuffer9* GetVertexBuffer(const uint8_t* base, uint32_t guest_device,
+  /// `fetch` is the stream's decoded vertex fetch constant (recorded, not re-read).
+  IDirect3DVertexBuffer9* GetVertexBuffer(const uint8_t* base, const VertexFetchConstant& fetch,
                                           uint32_t stream, const VertexLayout& layout,
                                           uint32_t needed_vertices, uint32_t* vertex_count);
 

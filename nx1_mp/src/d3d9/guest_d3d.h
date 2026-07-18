@@ -243,12 +243,19 @@ struct VertexFetchConstant {
   uint32_t size_bytes;
 };
 
+/// Decode a vertex fetch constant (2 dwords) from a host pointer at its raw big-endian bytes.
+/// Split out for the same reason as DecodeTextureFetchConstant: the deferred-translation
+/// recorder captures these bytes verbatim, and one decode has to serve both.
+inline VertexFetchConstant DecodeVertexFetchConstant(const uint8_t* p) {
+  const uint32_t d0 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 0);
+  const uint32_t d1 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 4);
+  return VertexFetchConstant{d0 & ~3u, d1 & 3u, d1 & 0x03FFFFFCu};
+}
+
 inline VertexFetchConstant ReadVertexFetchConstant(const uint8_t* base, uint32_t device,
                                                    uint32_t stream) {
-  const uint32_t addr = VertexFetchConstantAddr(device, VertexFetchSlotForStream(stream));
-  const uint32_t d0 = GuestRead32(base, addr + 0);
-  const uint32_t d1 = GuestRead32(base, addr + 4);
-  return VertexFetchConstant{d0 & ~3u, d1 & 3u, d1 & 0x03FFFFFCu};
+  return DecodeVertexFetchConstant(
+      GuestPointer(base, VertexFetchConstantAddr(device, VertexFetchSlotForStream(stream))));
 }
 
 /// Stride of vertex stream `stream`, in bytes.
