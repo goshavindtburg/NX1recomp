@@ -164,6 +164,13 @@ REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVertices) {
   // that "taking over the ring" would delete. Everything it does here is PM4 construction for
   // a stream nobody consumes any more (Xenia's raster is already skipped), plus the CPU-side
   // fence/KickOff bookkeeping the guest genuinely needs. Measure before removing.
+#ifdef _WIN32
+  // Snapshot the guest's pending dirty mask BEFORE its draw body runs -- the body flushes the
+  // tagged state and then zeroes the mask, so reading it afterwards (as the renderer does)
+  // always sees zero. If these bits show that most draws change little, whole phases of state
+  // resolution can be skipped rather than re-read every draw.
+  nx1::d3d9::Renderer::Get().CaptureGuestDirtyMask(base, device);
+#endif
   NX1_TIME_IMP(__imp__rex_D3DDevice_DrawIndexedVertices(ctx, base));
 #ifdef _WIN32
   if (EnsureRenderer()) {

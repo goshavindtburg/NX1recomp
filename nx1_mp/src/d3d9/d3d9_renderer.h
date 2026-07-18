@@ -111,6 +111,10 @@ class Renderer {
                uint32_t dest_point, uint32_t flags, uint32_t clear_color, float clear_z,
                uint32_t clear_stencil);
 
+  /// Snapshot m_Pending.m_Mask[5] before the guest's draw body flushes and zeroes it. Must be
+  /// called from the draw hook BEFORE __imp__, which is the only moment these bits are valid.
+  void CaptureGuestDirtyMask(const uint8_t* base, uint32_t guest_device);
+
   /// Resolve the guest's bound shaders, bind their SM3 translations, and upload
   /// their constants. Returns false on a cache miss -- the draw must be skipped.
   bool BindShadersAndConstants(const uint8_t* base, uint32_t guest_device);
@@ -227,6 +231,30 @@ class Renderer {
   uint64_t prof_decl_calls_ = 0;
   uint64_t prof_stream_skips_ = 0;
   uint64_t prof_stream_calls_ = 0;
+  /// The guest's constant dirty masks, captured in the draw hook before its body flushes and
+  /// zeroes them. A clear mask means the guest wrote no constants for that stage since the
+  /// last draw, so a previous upload of the same shader is still valid.
+  uint64_t guest_dirty_vs_ = ~uint64_t(0);
+  uint64_t guest_dirty_ps_ = ~uint64_t(0);
+  /// What the last skippable upload was keyed on. The ring generation is essential: the dirty
+  /// mask only covers writes to the SHADOW, while GpuBeginShaderConstantF4 writes go to the
+  /// PM4 ring and leave it clear.
+  const Sm3Shader* last_const_vs_ = nullptr;
+  const Sm3Shader* last_const_ps_ = nullptr;
+  uint64_t last_const_ring_gen_ = ~uint64_t(0);
+  uint64_t prof_const_skipped_vs_ = 0;
+  uint64_t prof_const_skipped_ps_ = 0;
+
+  /// Guest dirty-mask statistics: how often each of m_Pending.m_Mask[5] is clear, and how
+  /// often it is unchanged from the previous draw. These bound how much per-draw state
+  /// resolution could be skipped outright.
+  uint64_t prof_mask_clear_[5] = {};
+  uint64_t prof_mask_same_[5] = {};
+  uint64_t prof_last_mask_[5] = {};
+  /// Draws whose index range continues the previous draw's -- the batchable fraction.
+  uint64_t prof_contiguous_draws_ = 0;
+  uint32_t prof_last_index_end_ = 0xFFFFFFFFu;
+  uint32_t prof_last_prim_type_ = 0xFFFFFFFFu;
   uint64_t prof_vlayout_ns_ = 0;
   uint64_t prof_vbuffer_ns_ = 0;
 

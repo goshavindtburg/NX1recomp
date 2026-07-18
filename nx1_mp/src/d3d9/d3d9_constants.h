@@ -73,6 +73,12 @@ class ConstantRing {
   /// the guest is about to flush from the shadow drops its ring record.
   void Retire(bool pixel_stage, uint64_t mask);
 
+  /// Bumped by Record and Retire, i.e. whenever ring ownership of any register changes.
+  /// A constant upload can be skipped only if this is unchanged since the last one: the
+  /// guest's dirty mask covers writes to the SHADOW, but a GpuBeginShaderConstantF4 write
+  /// goes to the ring and leaves that mask clear.
+  uint64_t generation() const { return generation_; }
+
   /// Guest EA holding register `reg`, or 0 when the shadow is authoritative.
   uint32_t Lookup(bool pixel_stage, uint32_t reg) const {
     return reg < kAluRegisters ? addr_[pixel_stage ? 1 : 0][reg] : 0;
@@ -92,6 +98,7 @@ class ConstantRing {
   /// 0 if the shadow owns it. Only ever touched by the thread currently recording into the
   /// owning device, so a plain array is sufficient.
   uint32_t addr_[2][kAluRegisters] = {};
+  uint64_t generation_ = 0;
 };
 
 }  // namespace nx1::d3d9

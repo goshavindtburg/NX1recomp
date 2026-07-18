@@ -47,6 +47,7 @@ ConstantRing& ConstantRing::For(uint32_t guest_device) {
 
 void ConstantRing::Record(bool pixel_stage, uint32_t start_register, uint32_t count,
                           uint32_t ring_addr) {
+  ++generation_;
   if (!ring_addr || start_register >= kAluRegisters) {
     return;
   }
@@ -60,19 +61,27 @@ void ConstantRing::Record(bool pixel_stage, uint32_t start_register, uint32_t co
 
 void ConstantRing::Retire(bool pixel_stage, uint64_t mask) {
   if (!mask) {
+    // Nothing to retire, so ring ownership is unchanged. Bumping the generation here would
+    // be wrong: RetireRingConstants runs on EVERY draw, so an unconditional bump made the
+    // generation change every frame-draw and vetoed 100% of clean-constant skips.
     return;
   }
   uint32_t* addr = addr_[pixel_stage ? 1 : 0];
+  bool changed = false;
   // One bit per group of 4 registers, numbered from the MSB: register r is bit
   // 63 - (r >> 2). See D3DTag_ShaderConstantMask (guest 0x824D0B90).
   for (uint32_t group = 0; group < kAluRegisters / 4; ++group) {
     if (mask & (uint64_t(1) << (63 - group))) {
       const uint32_t base = group * 4;
-      addr[base + 0] = 0;
-      addr[base + 1] = 0;
-      addr[base + 2] = 0;
-      addr[base + 3] = 0;
+      for (uint32_t i = 0; i < 4; ++i) {
+        changed |= addr[base + i] != 0;
+        addr[base + i] = 0;
+      }
     }
+  }
+  // Only a genuine ownership change invalidates a previous constant upload.
+  if (changed) {
+    ++generation_;
   }
 }
 

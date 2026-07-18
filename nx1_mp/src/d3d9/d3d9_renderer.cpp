@@ -34,6 +34,10 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // TEMP PROFILING: accumulate per-phase draw cost and report it once a second.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_skip_clean_constants, true, "GPU",
+                    "Skip the shader constant upload when the guest's dirty mask, the PM4 "
+                    "ring generation and the bound shader all say nothing changed");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_profile, false, "GPU",
                     "Debug: log where per-frame renderer time goes (per-phase ms + draw count).");
 
@@ -388,6 +392,38 @@ void Renderer::Present() {
                   double(tp.why_dirty) / prof_frames, double(tp.why_zero) / prof_frames,
                   double(tp.decode_bytes) / (1024.0 * 1024.0 * prof_frames),
                   tp.decode_ns ? double(tp.decode_bytes) / double(tp.decode_ns) : 0.0);
+      // How often the clean-constant skip actually fires. The dirty mask says ~94%/78% of
+      // draws write no constants, so a much lower skip rate means another condition is
+      // blocking it -- most likely the ring generation, which bumps on every
+      // GpuBeginShaderConstantF4 (i.e. every model's world matrix).
+      REXGPU_INFO("nx1_d3d9: PROF/const skipped vs={:.0f}% ps={:.0f}% of {:.0f} draws/frame",
+                  100.0 * prof_const_skipped_vs_ / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_const_skipped_ps_ / (prof_draws_ ? prof_draws_ : 1),
+                  double(prof_draws_) / prof_frames);
+      prof_const_skipped_vs_ = prof_const_skipped_ps_ = 0;
+
+      // What fraction of draws leave each guest dirty mask untouched, and what fraction
+      // continue the previous draw's index range. These are the two ceilings: skipping
+      // unchanged state, and merging adjacent draws.
+      REXGPU_INFO("nx1_d3d9: PROF/dirty clear%: m0={:.0f} m1={:.0f} m2={:.0f} m3={:.0f} m4={:.0f} "
+                  "| unchanged%: m0={:.0f} m1={:.0f} m2={:.0f} m3={:.0f} m4={:.0f} "
+                  "| contiguous draws {:.0f}%",
+                  100.0 * prof_mask_clear_[0] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_clear_[1] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_clear_[2] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_clear_[3] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_clear_[4] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_same_[0] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_same_[1] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_same_[2] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_same_[3] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_mask_same_[4] / (prof_draws_ ? prof_draws_ : 1),
+                  100.0 * prof_contiguous_draws_ / (prof_draws_ ? prof_draws_ : 1));
+      for (uint32_t i = 0; i < 5; ++i) {
+        prof_mask_clear_[i] = 0;
+        prof_mask_same_[i] = 0;
+      }
+      prof_contiguous_draws_ = 0;
       REXGPU_INFO("nx1_d3d9: PROF/shd outer hash={:.2f} lookup={:.2f} bind+upload={:.2f} ms/frame",
                   prof_hash_ns_ * tf, prof_lookup_ns_ * tf, prof_shbind_ns_ * tf);
       prof_hash_ns_ = prof_lookup_ns_ = prof_shbind_ns_ = 0;
@@ -990,7 +1026,25 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     device_->SetVertexShader(vs->vs);
     bound_vs_ = vs->vs;
   }
-  cache.UploadConstants(base, guest_device, *vs, /*pixel_stage=*/false);
+  // Skip the upload when the guest says nothing changed. Measured: 94% of draws write no
+  // vertex constants and 78% write no pixel constants, and UploadConstants re-reads and
+  // re-uploads ~10 registers each time regardless.
+  //
+  // Three conditions, all necessary. The dirty mask covers writes to the SHADOW. The ring
+  // generation covers GpuBeginShaderConstantF4 writes, which go to the PM4 ring and leave the
+  // mask clear -- that is the object->world matrix of every model draw, so missing it would
+  // weld the world into one pose. And the shader must match, because a different shader reads
+  // a different compacted register window even when the constants themselves are untouched.
+  const uint64_t ring_gen = ConstantRing::For(guest_device).generation();
+  const bool skip_vs_constants = REXCVAR_GET(nx1_d3d9_skip_clean_constants) &&
+                                 guest_dirty_vs_ == 0 && ring_gen == last_const_ring_gen_ &&
+                                 vs == last_const_vs_;
+  if (skip_vs_constants) {
+    ++prof_const_skipped_vs_;
+  } else {
+    cache.UploadConstants(base, guest_device, *vs, /*pixel_stage=*/false);
+    last_const_vs_ = vs;
+  }
   if (!NeedsHostNdcTransform(*vs)) {
     UploadVertexUniforms(*vs, HostConstantCount(*vs));
   }
@@ -1024,10 +1078,19 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     bound_color_write_ = want_color_write;
   }
   if (ps) {
-    cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
+    const bool skip_ps_constants = REXCVAR_GET(nx1_d3d9_skip_clean_constants) &&
+                                   guest_dirty_ps_ == 0 && ring_gen == last_const_ring_gen_ &&
+                                   ps == last_const_ps_;
+    if (skip_ps_constants) {
+      ++prof_const_skipped_ps_;
+    } else {
+      cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
+      last_const_ps_ = ps;
+    }
     UploadPixelUniforms(*ps, HostConstantCount(*ps), ps->needs_inv_tex_dim, base, guest_device);
   }
   sadd(prof_shbind_ns_, t_bind);
+  last_const_ring_gen_ = ring_gen;
 
   return true;
 }
@@ -1242,6 +1305,9 @@ void Renderer::InvalidateStateShadow() {
   bound_color_write_ = kColorWriteUnset;
   InvalidateVertexShadow();
   InvalidateRenderStateShadow();
+  last_const_vs_ = nullptr;
+  last_const_ps_ = nullptr;
+  last_const_ring_gen_ = ~uint64_t(0);
   last_vs_uniform_shader_ = nullptr;
   last_ps_uniform_shader_ = nullptr;
   last_ps_dims_mask_ = 0;
@@ -1366,6 +1432,24 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
   }
 }
 
+void Renderer::CaptureGuestDirtyMask(const uint8_t* base, uint32_t guest_device) {
+  if (!guest_device) {
+    return;
+  }
+  guest_dirty_vs_ = GuestRead64(base, guest_device + guest_device::kAluDirtyMaskVs);
+  guest_dirty_ps_ = GuestRead64(base, guest_device + guest_device::kAluDirtyMaskPs);
+  if (!REXCVAR_GET(nx1_d3d9_profile)) {
+    return;
+  }
+  for (uint32_t i = 0; i < 5; ++i) {
+    const uint32_t addr = guest_device + guest_device::kPendingMask + i * 8;
+    const uint64_t mask = (uint64_t(GuestRead32(base, addr)) << 32) | GuestRead32(base, addr + 4);
+    prof_mask_clear_[i] += mask == 0 ? 1 : 0;
+    prof_mask_same_[i] += mask == prof_last_mask_[i] ? 1 : 0;
+    prof_last_mask_[i] = mask;
+  }
+}
+
 void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
                            uint32_t base_vertex_index, uint32_t start_index,
                            uint32_t index_count) {
@@ -1391,6 +1475,23 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
     return;
   }
   ++draws_attempted_;
+
+  // MEASUREMENT, not an optimisation yet. The guest maintains its own dirty bits
+  // (m_Pending.m_Mask[5]) and zeroes them when a draw flushes, and we run inside the hook
+  // BEFORE the guest's draw body -- so these are still valid here. If consecutive draws leave
+  // most of them clear, we can skip re-resolving that state instead of re-reading it every
+  // draw, which attacks the per-draw cost directly rather than merging draws.
+  //
+  // Also tracked: how often a draw is a pure continuation of the previous one (same index
+  // buffer, index range picking up exactly where the last ended). That is the batchable
+  // fraction -- the draws that could merge into a single DrawIndexedPrimitive.
+  if (REXCVAR_GET(nx1_d3d9_profile)) {
+    if (start_index == prof_last_index_end_ && prof_last_prim_type_ == prim_type) {
+      ++prof_contiguous_draws_;
+    }
+    prof_last_index_end_ = start_index + index_count;
+    prof_last_prim_type_ = prim_type;
+  }
 
   // TEMP PROFILING: per-phase frame cost. ~2000 draws/frame at ~19us each says the bottleneck
   // is our own per-draw work, not Xenia -- but which part is guesswork until measured.
