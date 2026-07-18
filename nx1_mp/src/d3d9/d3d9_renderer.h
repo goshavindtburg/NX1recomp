@@ -33,6 +33,8 @@
 #include <windows.h>
 #endif
 
+#include "guest_d3d.h"
+
 namespace nx1::d3d9 {
 
 struct Sm3Shader;
@@ -190,6 +192,25 @@ class Renderer {
   float ndc_offset_[3] = {0.0f, 0.0f, 0.0f};
 
   uint64_t shader_cache_misses_ = 0;
+
+  /// Sampler slots the currently bound shaders actually declare, latched by
+  /// BindShadersAndConstants for BindTextures. 0xFFFF = "unknown, bind everything".
+  uint32_t active_sampler_mask_ = 0xFFFFu;
+
+  /// TEMP PROFILING (nx1_d3d9_profile): per-phase nanoseconds accumulated over a frame,
+  /// reported and reset in Present. Measures where the ~19us/draw actually goes.
+  uint64_t prof_viewport_ns_ = 0;
+  uint64_t prof_shaders_ns_ = 0;
+  uint64_t prof_indices_ns_ = 0;
+  uint64_t prof_streams_ns_ = 0;
+  uint64_t prof_textures_ns_ = 0;
+  uint64_t prof_states_ns_ = 0;
+  uint64_t prof_draw_ns_ = 0;
+  uint64_t prof_present_ns_ = 0;
+  uint64_t prof_draws_ = 0;
+  uint64_t prof_sampler_slots_ = 0;
+  uint64_t prof_frame_ns_ = 0;
+
 
   // The guest depth surface currently bound, so a depth resolve knows which host
   // (INTZ) texture to publish under the resolve's destination address.

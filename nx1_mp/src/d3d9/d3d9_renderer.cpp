@@ -32,6 +32,10 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
                     "starting the game.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// TEMP PROFILING: accumulate per-phase draw cost and report it once a second.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_profile, false, "GPU",
+                    "Debug: log where per-frame renderer time goes (per-phase ms + draw count).");
+
 namespace nx1::d3d9 {
 
 bool IsEnabled() {
@@ -337,7 +341,40 @@ void Renderer::Present() {
     if (back) back->Release();
   }
 
+  static auto last_present = std::chrono::steady_clock::now();
+  const auto t_present = std::chrono::steady_clock::now();
+  prof_frame_ns_ += uint64_t((t_present - last_present).count());
+  last_present = t_present;
   device_->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+  prof_present_ns_ += uint64_t((std::chrono::steady_clock::now() - t_present).count());
+
+  // TEMP PROFILING: report the frame's phase breakdown. Present is timed too -- if the frame
+  // is GPU-bound (or vsync-blocked) the cost lands there, not in our CPU-side setup, and that
+  // distinction decides whether to optimise our per-draw work or the GPU workload itself.
+  if (REXCVAR_GET(nx1_d3d9_profile)) {
+    static uint32_t prof_frames = 0;
+    if (++prof_frames >= 60) {
+      const double f = 1.0 / (1e6 * prof_frames);  // ns totals -> ms per frame
+      REXGPU_INFO("nx1_d3d9: PROF/frame draws={} | viewport={:.2f} shaders={:.2f} indices={:.2f} "
+                  "streams={:.2f} textures={:.2f} states={:.2f} draw={:.2f} present={:.2f} ms "
+                  "samp/draw={:.1f} | FRAME={:.2f} outside={:.2f}",
+                  prof_draws_ / prof_frames, prof_viewport_ns_ * f, prof_shaders_ns_ * f,
+                  prof_indices_ns_ * f, prof_streams_ns_ * f, prof_textures_ns_ * f,
+                  prof_states_ns_ * f, prof_draw_ns_ * f, prof_present_ns_ * f,
+                  prof_draws_ ? double(prof_sampler_slots_) / double(prof_draws_) : 0.0,
+                  prof_frame_ns_ * f,
+                  (prof_frame_ns_ - (prof_viewport_ns_ + prof_shaders_ns_ + prof_indices_ns_ +
+                                     prof_streams_ns_ + prof_textures_ns_ + prof_states_ns_ +
+                                     prof_draw_ns_ + prof_present_ns_)) * f);
+      prof_frames = 0;
+      prof_viewport_ns_ = prof_shaders_ns_ = prof_indices_ns_ = prof_streams_ns_ = 0;
+      prof_textures_ns_ = prof_states_ns_ = prof_draw_ns_ = prof_present_ns_ = prof_draws_ = 0;
+      prof_sampler_slots_ = 0;
+      prof_frame_ns_ = 0;
+      prof_sampler_slots_ = 0;
+      prof_frame_ns_ = 0;
+    }
+  }
 
   // Heartbeat so a black window is diagnosable from the log: is the guest even
   // issuing draws (draws_attempted), and are any landing (draws_submitted)?
@@ -594,6 +631,11 @@ uint64_t HashGuestUcode(const nx1::d3d9::GuestUcode& ucode) {
   // page bit + 4-align) into physical_address, so it is now a raw physical address --
   // read it exactly as Xenia's command processor does, via TranslatePhysical.
   const uint8_t* bytes = memory->TranslatePhysical<const uint8_t*>(ucode.physical_address);
+  // NOTE: a fingerprint-guarded memo was tried here and measured NO gain (shaders 4.25 ->
+  // 4.06ms, inside noise) -- so the per-draw cost is the constant upload around it, not this
+  // hash. Reverted rather than kept: the blob is NOT immutable (D3D::DirectShaderPatch rewrites
+  // vertex microcode in place to bake in the vertex declaration), so any memo risks binding a
+  // stale translated shader. Not worth a correctness footgun for an unmeasurable win.
   return XXH3_64bits(bytes, size_t(ucode.dword_count) * sizeof(uint32_t));
 }
 
@@ -805,6 +847,16 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     UploadVertexUniforms(*vs, HostConstantCount(*vs));
   }
 
+  // Latch which sampler slots these shaders can actually read, so BindTextures skips the rest.
+  // A draw with no pixel shader samples nothing at all (depth/shadow-only pass).
+  active_sampler_mask_ = 0;
+  if (ps) {
+    active_sampler_mask_ |= ps->all_samplers ? 0xFFFFu : ps->sampler_mask;
+  }
+  if (vs && vs->all_samplers) {
+    active_sampler_mask_ = 0xFFFFu;  // unwalkable VS: cannot rule out vertex-texture fetch
+  }
+
   device_->SetPixelShader(ps ? ps->ps : nullptr);
   // A draw with no pixel shader is a depth/shadow-only pass: the Xbox exports no
   // color, so nothing is written to the render target. On D3D9, SetPixelShader(null)
@@ -988,7 +1040,19 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
   //
   // Comparing texture *pointers* is sound: D3D9 holds its own reference to a bound texture,
   // so an object we release cannot be freed (and its address reused) while still bound.
+  // Only the slots the bound shaders declare. Everything else cannot be sampled, so resolving
+  // its texture (a map lookup, an LOD substitution and a clamp-mode read) is pure cost; the
+  // stale binding left in those slots is unobservable. This is the frame's single biggest win:
+  // shaders typically declare a handful of the 16 slots.
+  const uint32_t sampler_mask = active_sampler_mask_;
+  prof_sampler_slots_ += uint64_t(__builtin_popcount(sampler_mask & 0xFFFFu));
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
+    if (!(sampler_mask & (1u << sampler))) {
+      continue;
+    }
+    // NOTE: a fetch-constant memo was tried here and MEASURED NET-NEGATIVE (textures 8.05 ->
+    // 9.27ms). Consecutive draws are usually different materials, so the constant differs, the
+    // memo misses, and the compare is pure added cost. Don't re-add it without data.
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, guest_device, sampler);
     // Read the fetch constant once (needed for both the LOD substitution and the sampler state).
     TextureFetchConstant t{};
@@ -1068,25 +1132,46 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   }
   ++draws_attempted_;
 
+  // TEMP PROFILING: per-phase frame cost. ~2000 draws/frame at ~19us each says the bottleneck
+  // is our own per-draw work, not Xenia -- but which part is guesswork until measured.
+  using PClock = std::chrono::steady_clock;
+  const bool prof = REXCVAR_GET(nx1_d3d9_profile);
+  auto ptick = [&] { return prof ? PClock::now() : PClock::time_point{}; };
+  auto padd = [&](uint64_t& slot, PClock::time_point t0) {
+    if (prof) slot += uint64_t((PClock::now() - t0).count());
+  };
+
+  auto t_vp = ptick();
   ResolveViewport(base, guest_device);
-  if (!BindShadersAndConstants(base, guest_device)) {
+  padd(prof_viewport_ns_, t_vp);
+
+  auto t_sh = ptick();
+  const bool shaders_ok = BindShadersAndConstants(base, guest_device);
+  padd(prof_shaders_ns_, t_sh);
+  if (!shaders_ok) {
     return;
   }
 
   // Indices first: how far into the vertex buffer this draw actually reaches decides how
   // much of it we have to mirror. The guest's fetch constant would have us mirror the whole
   // pool the model happens to live in.
+  auto t_ib = ptick();
   uint32_t index_size = 0;
   IDirect3DIndexBuffer9* ib = ResourceTracker::Get().GetIndexBuffer(base, guest_device, &index_size);
   if (!ib) {
+    padd(prof_indices_ns_, t_ib);
     return;
   }
   const uint32_t max_index =
       ResourceTracker::Get().GetDrawMaxIndex(base, guest_device, start_index, index_count);
   const uint32_t needed_vertices = max_index ? base_vertex_index + max_index + 1 : 0;
+  padd(prof_indices_ns_, t_ib);
 
+  auto t_vb = ptick();
   uint32_t vertex_count = 0;
-  if (!BindStreams(base, guest_device, needed_vertices, &vertex_count)) {
+  const bool streams_ok = BindStreams(base, guest_device, needed_vertices, &vertex_count);
+  padd(prof_streams_ns_, t_vb);
+  if (!streams_ok) {
     return;
   }
 
@@ -1099,11 +1184,19 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   const uint64_t surface_key =
       uint64_t(ib_base) ^ (uint64_t(start_index) * 0x9E3779B185EBCA87ull) ^
       (uint64_t(index_count) << 40) ^ (uint64_t(base_vertex_index) * 0xD1B54A32D192ED03ull);
+  auto t_tex = ptick();
   BindTextures(base, guest_device, surface_key);
-  ApplyRenderStates(base, guest_device);
+  padd(prof_textures_ns_, t_tex);
 
+  auto t_rs = ptick();
+  ApplyRenderStates(base, guest_device);
+  padd(prof_states_ns_, t_rs);
+
+  auto t_dr = ptick();
   const HRESULT dhr = device_->DrawIndexedPrimitive(host_prim, int(base_vertex_index), 0,
                                                     vertex_count, start_index, prim_count);
+  padd(prof_draw_ns_, t_dr);
+  if (prof) ++prof_draws_;
   // A draw can be *submitted* and still be rejected by D3D9 -- a depth buffer smaller than
   // the render target does exactly that, silently.
   if (FAILED(dhr)) {

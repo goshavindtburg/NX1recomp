@@ -163,15 +163,24 @@ bool ReadsUndefinedConstRange(const DWORD* code, uint32_t dword_count, uint32_t 
   return false;
 }
 
-/// Collect the shader's `def` registers AND values -- see Sm3Shader::def_mask / defs.
-/// (D3DSIO_DEF's destination is always a float const register, so no type check is needed;
-/// integer/bool defs are different opcodes.)
+/// Collect, in one walk, the shader's `def` registers + values (see Sm3Shader::def_mask / defs)
+/// and the sampler slots it declares (Sm3Shader::sampler_mask).
+/// D3DSIO_DEF's destination is always a float const register, so no type check is needed there;
+/// integer/bool defs are different opcodes. A `dcl` (0x1F) with length 2 is
+/// [opcode][usage token][dst param]; sampler declarations carry dst register type
+/// D3DSPR_SAMPLER (10, split-encoded across bits 28..30 and 11..12) and the slot in bits 0..10.
+/// Walk validated against fxc reference bytecode (sampler dcl -> type=10 reg=N; inputs type=1).
 void CollectDefs(const DWORD* code, uint32_t dword_count, Sm3Shader& out) {
-  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51;
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51, kDcl = 0x1F;
+  constexpr uint32_t kSamplerRegType = 10;
+  bool walked_to_end = false;
   for (uint32_t i = 1; i < dword_count;) {
     const DWORD tok = code[i];
     const uint32_t op = tok & 0xFFFF;
-    if (op == kEnd) break;
+    if (op == kEnd) {
+      walked_to_end = true;
+      break;
+    }
     if (op == kComment) {
       i += 1 + ((tok >> 16) & 0x7FFF);
       continue;
@@ -188,9 +197,19 @@ void CollectDefs(const DWORD* code, uint32_t dword_count, Sm3Shader& out) {
           std::memcpy(d.v, &code[i + 2], 16);
         }
       }
+    } else if (op == kDcl && len == 2 && i + 2 < dword_count) {
+      const DWORD dst = code[i + 2];
+      const uint32_t type = ((dst >> 28) & 7) | ((dst >> 8) & 0x18);
+      const uint32_t reg = dst & 0x7FF;
+      if (type == kSamplerRegType && reg < 16) {
+        out.sampler_mask |= uint16_t(1u << reg);
+      }
     }
     i += 1 + len;
   }
+  // Only trust the mask if the walk reached D3DSIO_END; anything else means we may have
+  // stopped early and missed declarations, so fall back to binding every slot.
+  out.all_samplers = !walked_to_end;
 }
 #endif
 

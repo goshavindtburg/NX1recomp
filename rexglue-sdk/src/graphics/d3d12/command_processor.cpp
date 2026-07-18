@@ -3780,6 +3780,24 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  // When another renderer owns the output (nx1_d3d9), this backend's raster work is pure
+  // waste: the frame it produces is never presented, yet every draw still costs a pipeline
+  // lookup, descriptor/EDRAM setup and a D3D12 submit -- the game was rendering itself twice.
+  // Skip geometry here, as late as possible so everything with guest-visible side effects is
+  // already preserved:
+  //   - resolves (EdramMode::kCopy -> IssueCopy) returned above, so EDRAM writebacks still land
+  //   - MEMEXPORT draws fall through and execute: their shaders write guest memory the CPU reads
+  //   - packet execution, registers, fences, interrupts and swap bookkeeping are untouched
+  //     (this is inside IssueDraw only), so the guest never notices and cannot deadlock
+  if (gpu_disabled_.load(std::memory_order_relaxed) && !memexport_used) {
+    static std::atomic<uint64_t> nx1_skipped{0};
+    const uint64_t n = ++nx1_skipped;
+    if ((n % 100000) == 1) {
+      REXGPU_INFO("nx1_d3d9: Xenia raster skipped (owned by D3D9): {} draws so far", n);
+    }
+    return true;
+  }
+
   if (!BeginSubmission(true)) {
     return nx1_log_draw_drop("BeginSubmission failed");
   }

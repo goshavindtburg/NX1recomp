@@ -23,6 +23,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 #include <rex/hook.h>
@@ -84,6 +85,25 @@ void DisableCmdBufWorkerDvar(uint8_t* base) {
 #endif
 }
 
+/// TEMP PROFILING: accumulated nanoseconds spent inside the guest's own D3D library on draw
+/// paths, reported once a second. This is the ceiling on what bypassing `__imp__` could save.
+std::atomic<uint64_t> g_imp_ns{0};
+std::atomic<uint64_t> g_imp_calls{0};
+
+#define NX1_TIME_IMP(call)                                                              \
+  do {                                                                                  \
+    if (!nx1::d3d9::IsEnabled()) {                                                      \
+      call;                                                                             \
+    } else {                                                                            \
+      const auto _t0 = std::chrono::steady_clock::now();                                \
+      call;                                                                             \
+      g_imp_ns.fetch_add(                                                               \
+          uint64_t((std::chrono::steady_clock::now() - _t0).count()),                   \
+          std::memory_order_relaxed);                                                   \
+      g_imp_calls.fetch_add(1, std::memory_order_relaxed);                              \
+    }                                                                                   \
+  } while (0)
+
 void RetireRingConstants(const uint8_t* base, uint32_t device) {
 #ifdef _WIN32
   if (!nx1::d3d9::IsEnabled() || !device) {
@@ -140,7 +160,11 @@ REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVertices) {
                  start_index = ctx.r6.u32, index_count = ctx.r7.u32;
   RetireRingConstants(base, device);
 #endif
-  __imp__rex_D3DDevice_DrawIndexedVertices(ctx, base);
+  // TEMP PROFILING: what the guest's own D3D library costs per draw -- i.e. exactly the work
+  // that "taking over the ring" would delete. Everything it does here is PM4 construction for
+  // a stream nobody consumes any more (Xenia's raster is already skipped), plus the CPU-side
+  // fence/KickOff bookkeeping the guest genuinely needs. Measure before removing.
+  NX1_TIME_IMP(__imp__rex_D3DDevice_DrawIndexedVertices(ctx, base));
 #ifdef _WIN32
   if (EnsureRenderer()) {
     nx1::d3d9::Renderer::Get().DrawIndexed(base, device, prim, base_vtx, start_index, index_count);
@@ -155,7 +179,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawVertices) {
                  vtx_count = ctx.r6.u32;
   RetireRingConstants(base, device);
 #endif
-  __imp__rex_D3DDevice_DrawVertices(ctx, base);
+  NX1_TIME_IMP(__imp__rex_D3DDevice_DrawVertices(ctx, base));
 #ifdef _WIN32
   if (EnsureRenderer()) {
     nx1::d3d9::Renderer::Get().Draw(base, device, prim, start_vtx, vtx_count);
@@ -180,7 +204,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVerticesUP) {
   const uint32_t stride = nx1::d3d9::GuestRead32(base, ctx.r1.u32 + 0x54);
   RetireRingConstants(base, device);
 #endif
-  __imp__rex_D3DDevice_DrawIndexedVerticesUP(ctx, base);
+  NX1_TIME_IMP(__imp__rex_D3DDevice_DrawIndexedVerticesUP(ctx, base));
 #ifdef _WIN32
   if (EnsureRenderer()) {
     nx1::d3d9::Renderer::Get().DrawIndexedUP(base, device, prim, num_verts, index_count, indices,
@@ -197,7 +221,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawVerticesUP) {
                  stride = ctx.r7.u32;
   RetireRingConstants(base, device);
 #endif
-  __imp__rex_D3DDevice_DrawVerticesUP(ctx, base);
+  NX1_TIME_IMP(__imp__rex_D3DDevice_DrawVerticesUP(ctx, base));
 #ifdef _WIN32
   if (EnsureRenderer()) {
     nx1::d3d9::Renderer::Get().DrawUP(base, device, prim, vtx_count, verts, stride);
@@ -320,6 +344,19 @@ REX_HOOK_RAW(rex_D3DDevice_Swap) {
   if (EnsureRenderer()) {
     nx1::d3d9::Renderer::Get().Present();
     nx1::d3d9::Renderer::Get().BeginFrame();
+  }
+  // TEMP PROFILING: the guest D3D library's own per-frame cost on the draw paths -- the exact
+  // prize for bypassing __imp__. Reported next to PROF/frame so it can be read against
+  // `outside` (which is guest game logic + this).
+  {
+    static uint32_t frames = 0;
+    if (++frames >= 60) {
+      const uint64_t ns = g_imp_ns.exchange(0, std::memory_order_relaxed);
+      const uint64_t calls = g_imp_calls.exchange(0, std::memory_order_relaxed);
+      REXGPU_INFO("nx1_d3d9: PROF/imp guest-D3D-library {:.2f} ms/frame over {} draws/frame",
+                  double(ns) / (1e6 * frames), calls / frames);
+      frames = 0;
+    }
   }
 #endif
 }

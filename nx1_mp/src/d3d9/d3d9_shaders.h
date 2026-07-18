@@ -60,6 +60,14 @@ struct Sm3Shader {
   };
   uint16_t def_count = 0;
   DefLiteral defs[16];
+
+  /// One bit per sampler slot the compiled shader actually `dcl`s. Binding textures for the
+  /// other slots is pure waste -- the shader can never read them -- and that waste dominated
+  /// the frame (16 slots x ~5000 draws = ~82k GetTexture/LOD/clamp resolutions per frame).
+  /// `all_samplers` is the fail-safe: set when the bytecode could not be walked, meaning
+  /// "assume every slot" so a walk failure can never silently drop a texture.
+  uint16_t sampler_mask = 0;
+  bool all_samplers = true;
 };
 
 class ShaderCache {
