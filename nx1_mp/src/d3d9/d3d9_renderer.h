@@ -197,6 +197,25 @@ class Renderer {
   /// BindShadersAndConstants for BindTextures. 0xFFFF = "unknown, bind everything".
   uint32_t active_sampler_mask_ = 0xFFFFu;
 
+  /// Signature of the last draw's texture binding: the raw fetch constants of the slots the
+  /// shaders declare, plus the declared-slot mask and the LOD surface key. When a draw matches
+  /// the one before it, every texture and sampler state it would bind is already on the device,
+  /// so the whole per-slot loop -- a best-texture map lookup, the clamp-mode reads, the filter
+  /// derivation and eight state compares per slot -- is skipped.
+  ///
+  /// Safe against the age sweep: a skip only ever chains back to a draw that DID bind, in this
+  /// same frame, which refreshed the cache entries' last_frame. Reset every frame so that chain
+  /// always starts with a real bind. Safe against mid-frame rebuilds too: entries are dirtied by
+  /// DrainMemoryWrites at the frame boundary, never between two draws.
+  static constexpr uint32_t kSigMaxDwords = 16 * 6;
+  uint32_t last_sig_[kSigMaxDwords] = {};
+  uint32_t last_sig_dwords_ = 0;
+  uint32_t last_sig_mask_ = 0;
+  uint64_t last_sig_surface_ = 0;
+  bool last_sig_valid_ = false;
+  uint64_t prof_bind_skips_ = 0;
+  uint64_t prof_bind_calls_ = 0;
+
   /// TEMP PROFILING (nx1_d3d9_profile): per-phase nanoseconds accumulated over a frame,
   /// reported and reset in Present. Measures where the ~19us/draw actually goes.
   uint64_t prof_viewport_ns_ = 0;

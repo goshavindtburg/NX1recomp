@@ -136,7 +136,12 @@ class ResourceTracker {
 
   /// Untile + upload the texture bound to `sampler`, or nullptr if that fetch
   /// constant holds no texture or an unsupported format.
-  IDirect3DBaseTexture9* GetTexture(const uint8_t* base, uint32_t guest_device, uint32_t sampler);
+  ///
+  /// `out_fetch`, when given, receives the fetch constant this call already had to read.
+  /// The caller needs it for the LOD substitution and the sampler state, and re-reading it
+  /// meant six byte-swapped guest dwords twice per bound slot, ~15k slots a frame.
+  IDirect3DBaseTexture9* GetTexture(const uint8_t* base, uint32_t guest_device, uint32_t sampler,
+                                    TextureFetchConstant* out_fetch = nullptr);
 
   /// Prefer-largest-resolution substitution, keyed on a draw's STABLE geometry surface. The engine
   /// streams world textures at CPU-side LODs: as a surface recedes it binds sampler 0/4/5 to a
@@ -290,6 +295,52 @@ class ResourceTracker {
   uint64_t unsupported_formats_ = 0;
   uint64_t unsupported_texture_formats_ = 0;
   uint64_t frame_ = 0;  ///< bumped by AdvanceFrame; gates frame-coherent resource reuse
+  /// TEMP PROFILING: split the textures phase into "resolved from cache" vs "actually rebuilt".
+  /// The phase total tracks neither draw count nor upload count, so which of the two dominates
+  /// has to be measured rather than reasoned about. Drained by TakeTextureProfile.
+ public:
+  /// Driven from the renderer's nx1_d3d9_profile cvar. Gating matters: the clock reads would
+  /// otherwise cost ~0.5 ms/frame across ~11k GetTexture calls and perturb what they measure.
+  bool prof_enabled_ = false;
+
+  /// Per-frame texture cost breakdown, drained and reset by the reporter.
+  struct TextureProfile {
+    uint64_t lookup_ns = 0;   ///< binds resolved from cache
+    uint64_t upload_ns = 0;   ///< total rebuild cost
+    uint64_t uploads = 0;     ///< rebuilds entered
+    uint64_t stage_ns = 0;    ///< staging CreateTexture + LockRect
+    uint64_t decode_ns = 0;   ///< detile + format decode of level 0
+    uint64_t mipgen_ns = 0;   ///< CPU BC mip chain (decode/filter/encode per level)
+    uint64_t commit_ns = 0;   ///< DEFAULT CreateTexture + UpdateTexture (driver/VRAM)
+    /// Why each rebuild happened. A rebuild costs ~500 us and is memory-bound (it streams the
+    /// source out of the mirror), so it cannot get much cheaper -- the only remaining lever is
+    /// doing fewer, and that needs the cause named rather than guessed.
+    uint64_t why_new = 0;      ///< no host texture yet (first sight, or evicted and re-bound)
+    uint64_t why_layout = 0;   ///< layout_key changed under the same base address
+    uint64_t why_dirty = 0;    ///< write-watch dirtied it before it could commit
+    uint64_t why_zero = 0;     ///< never-resident broadcast-swizzle sprite, on its backoff retry
+    uint64_t decode_bytes = 0; ///< source bytes streamed out of the mirror, to check the
+                               ///< memory-bound theory against real bandwidth
+  };
+  TextureProfile TakeTextureProfile() {
+    TextureProfile p = prof_tex_;
+    prof_tex_ = {};
+    return p;
+  }
+
+ private:
+  TextureProfile prof_tex_;
+
+  /// Detile scratch for the CPU-decode formats, reused across rebuilds. It was a local
+  /// std::vector, which malloc'd AND zero-filled up to a texture's worth of bytes on every
+  /// rebuild only for DetileMip2D to overwrite every one of them. Grow-only, never shrunk, so
+  /// after warm-up the resize is a no-op.
+  std::vector<uint8_t> detile_scratch_;
+  uint8_t* DetileScratch(size_t bytes) {
+    if (detile_scratch_.size() < bytes) detile_scratch_.resize(bytes);
+    return detile_scratch_.data();
+  }
+
   uint64_t tex_uploads_ = 0;    ///< level-0 uploads (new texture or content changed)
   uint64_t tex_rebuilds_ = 0;   ///< layout changed -> host texture recreated
   uint64_t tex_failures_ = 0;   ///< CreateTexture/UpdateTexture failed

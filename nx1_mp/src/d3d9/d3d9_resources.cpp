@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <mutex>
@@ -28,6 +29,7 @@
 #include <d3dcompiler.h>
 #include <xxhash.h>
 
+#include "d3d9_flat_map.h"
 #include "d3d9_resources.h"
 #include "guest_d3d.h"
 
@@ -497,7 +499,7 @@ struct IndexBufferEntry {
 
 /// Memoized "highest index this draw range references", so the scan happens once per
 /// distinct draw rather than once per frame per draw.
-using IndexRangeMap = std::unordered_map<uint64_t, uint32_t>;
+using IndexRangeMap = FlatMap<uint32_t>;
 
 struct TextureEntry {
   IDirect3DTexture9* tex = nullptr;
@@ -525,6 +527,14 @@ struct TextureEntry {
   /// it: stop honouring writes and hold the good decode. good_frames counts frames it has been drawn.
   uint32_t good_frames = 0;
   bool committed = false;
+  /// Consecutive fully-transparent decodes of a broadcast-swizzle sprite, and the frame before
+  /// which not to bother trying again. A sprite whose texel pool never streams in (this build has
+  /// no imagefile for some of them -- live RAM reads 0) would otherwise be held dirty and
+  /// re-decoded EVERY frame forever: measured as a steady 7-8 rebuilds/frame, ~4 ms, all of it
+  /// spent producing the same blank image. Back off exponentially instead, capped so a pool that
+  /// does eventually arrive is still picked up within ~1 second.
+  uint32_t zero_retries = 0;
+  uint64_t retry_frame = 0;
 };
 
 struct ResolvedTarget {
@@ -556,15 +566,15 @@ struct HostTarget {
 #endif
 
 using LayoutMap = std::unordered_map<uint64_t, VertexLayout>;
-using VertexBufferMap = std::unordered_map<uint64_t, VertexBufferEntry>;
+using VertexBufferMap = FlatMap<VertexBufferEntry>;
 /// Guest-memory hash of a vertex buffer, memoized for the frame it was taken in.
 struct VertexHash {
   uint64_t frame = 0;  ///< frame_ + 1, so a default-constructed entry never matches frame 0
   uint64_t hash = 0;
 };
-using VertexHashMap = std::unordered_map<uint64_t, VertexHash>;
-using IndexBufferMap = std::unordered_map<uint64_t, IndexBufferEntry>;
-using TextureMap = std::unordered_map<uint64_t, TextureEntry>;
+using VertexHashMap = FlatMap<VertexHash>;
+using IndexBufferMap = FlatMap<IndexBufferEntry>;
+using TextureMap = FlatMap<TextureEntry>;
 
 /// The largest-resolution texture a geometry surface has bound on a given sampler. `tex` is AddRef'd
 /// so it outlives eviction of the base-keyed TextureMap entry it came from. See PreferLargestForSurface.
@@ -573,9 +583,9 @@ struct BestTexture {
   uint32_t area = 0;  ///< width * height of the retained texture
   uint64_t last_frame = 0;
 };
-using BestTextureMap = std::unordered_map<uint64_t, BestTexture>;
+using BestTextureMap = FlatMap<BestTexture>;
 
-using ResolveMap = std::unordered_map<uint64_t, ResolvedTarget>;
+using ResolveMap = FlatMap<ResolvedTarget>;
 /// Keyed by EDRAM region, not by D3DSurface pointer -- see ReadSurfaceEdramKey.
 using TargetMap = std::unordered_map<uint64_t, HostTarget>;
 
@@ -609,13 +619,54 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
   if (tiled) {
     const uint32_t pitch_blocks = extent.block_pitch_h;
     const uint32_t bpb_log2 = Log2Exact(bytes_per_block);
-    for (uint32_t by = 0; by < blocks_high; ++by) {
-      uint8_t* dst_row = dst + size_t(by) * dst_row_bytes;
-      for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
-        const int32_t src_off = tu::GetTiledOffset2D(int32_t(offset_x + bx), int32_t(offset_y + by),
-                                                     pitch_blocks, bpb_log2);
-        tc::CopySwapBlock(xe_endian, dst_row + size_t(bx) * bytes_per_block, src + src_off,
-                          bytes_per_block);
+    // Detiling was the single most expensive thing the renderer did: GetTiledOffset2D ran once per
+    // block (16k times for a 512x512 DXT1) and its bit-mixing dominated a ~673 us texture rebuild.
+    //
+    // The address is periodic in x and y with period 32 apart from the macro-tile term: micro uses
+    // only x&7, and the (x>>3)&3 term is invariant mod 32 because x>>3 = 4*(x>>5) + ((x&31)>>3).
+    // The macro delta is ((x>>5) + (y>>5)*(aligned_pitch>>5)) << (bpb_log2+7); when that is a
+    // multiple of 512 it clears the final mix's low fields entirely and simply adds, scaled by 8:
+    //
+    //   offset(x,y) = table[y&31][x&31] + ((x>>5) + (y>>5)*(ap>>5)) * (1 << (bpb_log2+10))
+    //
+    // That holds only for blocks of 4 bytes or more (for 1- and 2-byte blocks the stride is 128 or
+    // 256 and leaks into the mixed bits). Verified exhaustively against GetTiledOffset2D across
+    // pitches 32..512 for bpb_log2 0..4: exact for 2..4, mismatching for 0..1 -- hence the guard.
+    if (bpb_log2 >= 2) {
+      const uint32_t ap_tiles = ((pitch_blocks + 31u) & ~31u) >> 5;
+      const uint32_t macro_stride = 1u << (bpb_log2 + 10);
+      int32_t table[32][32];
+      for (uint32_t ty = 0; ty < 32; ++ty) {
+        for (uint32_t tx = 0; tx < 32; ++tx) {
+          table[ty][tx] = tu::GetTiledOffset2D(int32_t(tx), int32_t(ty), pitch_blocks, bpb_log2);
+        }
+      }
+      const bool swap = xe_endian != rex::graphics::xenos::Endian::kNone;
+      for (uint32_t by = 0; by < blocks_high; ++by) {
+        const uint32_t y = offset_y + by;
+        const int32_t* row_tab = table[y & 31];
+        const uint32_t row_macro = (y >> 5) * ap_tiles * macro_stride;
+        uint8_t* dst_row = dst + size_t(by) * dst_row_bytes;
+        for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
+          const uint32_t x = offset_x + bx;
+          const uint32_t src_off = uint32_t(row_tab[x & 31]) + (x >> 5) * macro_stride + row_macro;
+          uint8_t* d = dst_row + size_t(bx) * bytes_per_block;
+          if (swap) {
+            tc::CopySwapBlock(xe_endian, d, src + src_off, bytes_per_block);
+          } else {
+            std::memcpy(d, src + src_off, bytes_per_block);
+          }
+        }
+      }
+    } else {
+      for (uint32_t by = 0; by < blocks_high; ++by) {
+        uint8_t* dst_row = dst + size_t(by) * dst_row_bytes;
+        for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
+          const int32_t src_off = tu::GetTiledOffset2D(
+              int32_t(offset_x + bx), int32_t(offset_y + by), pitch_blocks, bpb_log2);
+          tc::CopySwapBlock(xe_endian, dst_row + size_t(bx) * bytes_per_block, src + src_off,
+                            bytes_per_block);
+        }
       }
     }
   } else {
@@ -1240,7 +1291,7 @@ void ResourceTracker::Shutdown() {
   }
   if (layouts_) {
     auto* map = static_cast<LayoutMap*>(layouts_);
-    for (auto& [key, layout] : *map) {
+    for (const auto& [key, layout] : *map) {
       if (layout.decl) layout.decl->Release();
     }
     delete map;
@@ -1248,7 +1299,7 @@ void ResourceTracker::Shutdown() {
   }
   if (vertex_buffers_) {
     auto* map = static_cast<VertexBufferMap*>(vertex_buffers_);
-    for (auto& [key, entry] : *map) {
+    for (auto [key, entry] : *map) {
       if (entry.vb) entry.vb->Release();
     }
     delete map;
@@ -1264,7 +1315,7 @@ void ResourceTracker::Shutdown() {
   }
   if (index_buffers_) {
     auto* map = static_cast<IndexBufferMap*>(index_buffers_);
-    for (auto& [key, entry] : *map) {
+    for (auto [key, entry] : *map) {
       if (entry.ib) entry.ib->Release();
     }
     delete map;
@@ -1272,7 +1323,7 @@ void ResourceTracker::Shutdown() {
   }
   if (textures_) {
     auto* map = static_cast<TextureMap*>(textures_);
-    for (auto& [key, entry] : *map) {
+    for (auto [key, entry] : *map) {
       if (entry.tex) entry.tex->Release();
       if (entry.vol) entry.vol->Release();
       if (entry.cube) entry.cube->Release();
@@ -1282,7 +1333,7 @@ void ResourceTracker::Shutdown() {
   }
   if (best_textures_) {
     auto* map = static_cast<BestTextureMap*>(best_textures_);
-    for (auto& [key, b] : *map) {
+    for (auto [key, b] : *map) {
       if (b.tex) b.tex->Release();
     }
     delete map;
@@ -1290,7 +1341,7 @@ void ResourceTracker::Shutdown() {
   }
   if (resolves_) {
     auto* map = static_cast<ResolveMap*>(resolves_);
-    for (auto& [key, entry] : *map) {
+    for (auto [key, entry] : *map) {
       // Non-owned entries alias a depth target released with render_targets_ below.
       if (entry.tex && entry.owned) entry.tex->Release();
     }
@@ -1299,7 +1350,7 @@ void ResourceTracker::Shutdown() {
   }
   if (render_targets_) {
     auto* map = static_cast<TargetMap*>(render_targets_);
-    for (auto& [key, t] : *map) {
+    for (const auto& [key, t] : *map) {
       if (t.surface && !t.is_backbuffer) t.surface->Release();
       if (t.tex) t.tex->Release();
     }
@@ -1744,7 +1795,7 @@ void ResourceTracker::DrainMemoryWrites() {
   }
   auto* textures = static_cast<TextureMap*>(textures_);
   if (!textures) return;
-  for (auto& [key, entry] : *textures) {
+  for (auto [key, entry] : *textures) {
     if (!entry.watch_size) continue;
     const uint32_t a0 = entry.watch_addr;
     const uint32_t a1 = entry.watch_addr + entry.watch_size;
@@ -2015,11 +2066,35 @@ bool ResourceTracker::ConvertInlineIndices(uint32_t indices_addr, uint32_t index
 }
 
 IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t guest_device,
-                                                   uint32_t sampler) {
+                                                   uint32_t sampler,
+                                                   TextureFetchConstant* out_fetch) {
   if (!device_ || !textures_) {
     return nullptr;
   }
+  // TEMP PROFILING: attribute this call to either "resolved from cache" or "rebuilt". Both
+  // timers fire on whichever return is taken; the upload one stays disarmed until the rebuild
+  // decision below actually commits to re-decoding.
+  struct ScopeNs {
+    bool on = false;
+    std::chrono::steady_clock::time_point t0;
+    uint64_t* sink = nullptr;
+    ~ScopeNs() {
+      if (on && sink) {
+        *sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
+      }
+    }
+  };
+  ScopeNs prof_lookup, prof_upload;
+  if (prof_enabled_) {
+    prof_lookup.on = true;
+    prof_lookup.t0 = std::chrono::steady_clock::now();
+    prof_lookup.sink = &prof_tex_.lookup_ns;
+  }
+
   const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, sampler);
+  if (out_fetch) {
+    *out_fetch = t;
+  }
   if (!t.valid || !t.base_address || !t.width || !t.height) {
     return nullptr;
   }
@@ -2085,9 +2160,24 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       !entry.committed && ++entry.good_frames >= kCommitFrames) {
     entry.committed = true;
   }
-  // Frame-coherent reuse: same texture already uploaded/validated this frame ->
-  // reuse it without re-hashing megabytes of guest memory (the dominant per-draw cost).
-  if (entry.tex && entry.last_frame == frame_ && entry.layout_key == layout_key) {
+  // Valid-texture early-out. A built texture whose layout still matches and that the write-watch
+  // has not dirtied IS the answer -- nothing below can change that, so none of it needs to run.
+  //
+  // This deliberately does NOT require last_frame == frame_. It used to, which meant the FIRST
+  // bind of every distinct texture each frame fell through into the whole preamble below --
+  // extent math, mip-level selection and above all MirrorSnapshot, which walks a page bit per
+  // 4 KB (1024 iterations for a 4 MB surface) -- only to reach the identical `layout_key match &&
+  // !dirty` test further down and return the same pointer. At ~1500 distinct textures a frame
+  // that preamble was the single largest cost in the renderer (measured: the textures phase was
+  // ~9 ms of a ~24 ms frame).
+  //
+  // Skipping MirrorSnapshot here cannot miss a guest write: the write-watch is armed when a page
+  // is CAPTURED, not per call, and DrainMemoryWrites both invalidates the mirror page and sets
+  // entry.dirty -- and a dirty entry fails this test and takes the full path, re-snapshotting then.
+  // `frame_ < entry.retry_frame` holds only for a sprite that keeps decoding to nothing; it is
+  // what stops the never-streamed ones re-decoding every frame in perpetuity.
+  if (entry.tex && entry.layout_key == layout_key && (!entry.dirty || frame_ < entry.retry_frame)) {
+    entry.last_frame = frame_;
     return entry.tex;
   }
 
@@ -2188,10 +2278,28 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // streaming pool's transient fill by now, which is the confetti. entry.dirty (set by the write-
   // watch, via DrainMemoryWrites, when the guest rewrites this texture) is what forces a fresh
   // decode from the re-snapshotted mirror.
-  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
-  if (entry.tex && entry.layout_key == layout_key && !entry.dirty) {
-    return entry.tex;
+  // Reaching here means the early-out above declined: no texture yet, a changed layout, or the
+  // write-watch dirtied this one. All three want fresh bytes, so the snapshot is never wasted.
+  // Everything from here on is the rebuild; charge it to the upload timer instead of the lookup.
+  if (prof_enabled_) {
+    const auto now = std::chrono::steady_clock::now();
+    prof_tex_.lookup_ns += uint64_t((now - prof_lookup.t0).count());
+    prof_lookup.sink = nullptr;
+    prof_upload.on = true;
+    prof_upload.t0 = now;
+    prof_upload.sink = &prof_tex_.upload_ns;
+    ++prof_tex_.uploads;
+    if (!entry.tex) {
+      ++prof_tex_.why_new;
+    } else if (entry.layout_key != layout_key) {
+      ++prof_tex_.why_layout;
+    } else if (entry.zero_retries) {
+      ++prof_tex_.why_zero;  // never-resident sprite retrying; should now be rare, not every frame
+    } else {
+      ++prof_tex_.why_dirty;
+    }
   }
+  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
   if (entry.tex && entry.layout_key != layout_key) {
     entry.tex->Release();
     entry.tex = nullptr;
@@ -2204,6 +2312,17 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // Set when a broadcast-swizzle sprite decodes to a fully transparent (unstreamed) image, so it is
   // not committed and keeps re-decoding until its texel pool is resident.
   bool swizzle_all_zero = false;
+
+  // TEMP PROFILING: stage boundaries inside the rebuild. A rebuild costs ~673 us; whether that
+  // is the CPU BC encoder or the driver stalling at a saturated 4 GB of texture memory decides
+  // which fix is the right one, so measure the four stages separately.
+  auto stage_mark = [this] {
+    return prof_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  };
+  auto stage_add = [this](uint64_t& sink, std::chrono::steady_clock::time_point t0) {
+    if (prof_enabled_) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
+  };
+  const auto t_stage = stage_mark();
 
   // IDirect3DDevice9Ex has no D3DPOOL_MANAGED. Fill a lockable SYSTEMMEM staging
   // texture with level 0 and UpdateTexture it into a DEFAULT texture that can be sampled.
@@ -2223,6 +2342,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // The runtime's pitch for a block format it does not recognise counts texels, not the block
   // row it actually has to hold -- 4x too small for BC5. The driver reads such a level as
   // tightly packed block rows, which is exactly what its `width * height` bytes hold.
+  stage_add(prof_tex_.stage_ns, t_stage);
+  if (prof_enabled_) prof_tex_.decode_bytes += guest_bytes;
+  const auto t_decode = stage_mark();
   const uint32_t dst_row_bytes =
       host.opaque_block ? extent.block_width * bpb : uint32_t(locked.Pitch);
   auto* dst = static_cast<uint8_t*>(locked.Pitch >= 0 ? locked.pBits : nullptr);
@@ -2230,9 +2352,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     if (host.decode == TexDecode::kColorSwizzle) {
       // Detile the compressed colour blocks, then decode to A8R8G8B8 applying the channel swizzle
       // (the compressed host format cannot honour a broadcast swizzle) -- see src_bc above.
-      std::vector<uint8_t> scratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch.data(), extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
-      DecodeBcColorSwizzledToArgb(dst, uint32_t(locked.Pitch), scratch.data(), extent.block_width,
+      uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DecodeBcColorSwizzledToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                                   extent.block_height, t.width, height, src_bc, bpb, t.swizzle);
       // A broadcast-swizzle sprite that decodes to all zero is not resident yet: its texel pool has
       // not been streamed in (the same residency gap behind the distant-surface confetti). Caching
@@ -2246,16 +2368,16 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       swizzle_all_zero = sa == 0;
     } else if (host.decode == TexDecode::kDXN) {
       // CPU-decode DXN normal maps with the hardware RGGG swizzle (see PickHostTextureFormat).
-      std::vector<uint8_t> scratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch.data(), extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
-      DecodeDXNToArgb(dst, uint32_t(locked.Pitch), scratch.data(), extent.block_width,
+      uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DecodeDXNToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                       extent.block_height, t.width, height);
     } else if (host.decode != TexDecode::kNone) {
       // CPU-decode single-channel BC-alpha: detile the compressed 8-byte blocks
       // into a linear scratch buffer, then expand each block to A8R8G8B8 (v,v,v,v).
-      std::vector<uint8_t> scratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch.data(), extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
-      DecodeBCAlphaToArgb(dst, uint32_t(locked.Pitch), scratch.data(), extent.block_width,
+      uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DecodeBCAlphaToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                           extent.block_height, t.width, height,
                           host.decode == TexDecode::kDXT5A);
     } else {
@@ -2272,6 +2394,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // Filter the chain down from the level 0 we just wrote, while it is still mapped: decode it
   // once, then halve-and-re-encode into each level below. UpdateTexture carries the whole
   // staging chain across, so the levels have to be in place before the unlock.
+  stage_add(prof_tex_.decode_ns, t_decode);
+  const auto t_mip = stage_mark();
   if (build_mips && dst) {
     std::vector<Rgba8> cur, next;
     DecodeBcImage(host.d3d, dst, dst_row_bytes, t.width, height, cur);
@@ -2293,6 +2417,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     }
   }
   staging->UnlockRect(0);
+  stage_add(prof_tex_.mipgen_ns, t_mip);
+  const auto t_commit = stage_mark();
 
   // D3DUSAGE_AUTOGENMIPMAP reports a single level and keeps its sub-levels to itself: the
   // driver filters them down from the level 0 UpdateTexture writes. A chain we built ourselves
@@ -2319,6 +2445,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     entry.tex->SetAutoGenFilterType(D3DTEXF_LINEAR);
     entry.tex->GenerateMipSubLevels();
   }
+  stage_add(prof_tex_.commit_ns, t_commit);
 
   entry.layout_key = layout_key;
   entry.dirty = false;
@@ -2328,6 +2455,14 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     entry.dirty = true;
     entry.good_frames = 0;
     entry.committed = false;
+    // 2, 4, 8 ... 64 frames between attempts. Deliberately not reset by DrainMemoryWrites: the
+    // streaming pool rewrites these pages with zeros every frame, so "the guest wrote it" is not
+    // evidence that content arrived, and honouring it would defeat the backoff entirely.
+    ++entry.zero_retries;
+    entry.retry_frame = frame_ + (1ull << (entry.zero_retries < 6 ? entry.zero_retries : 6));
+  } else {
+    entry.zero_retries = 0;
+    entry.retry_frame = 0;
   }
   // Record the guest byte range so DrainMemoryWrites can dirty this entry when the guest rewrites
   // it. The mirror itself armed the write-watch when it captured these pages in MirrorSnapshot.

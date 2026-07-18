@@ -351,9 +351,36 @@ void Renderer::Present() {
   // TEMP PROFILING: report the frame's phase breakdown. Present is timed too -- if the frame
   // is GPU-bound (or vsync-blocked) the cost lands there, not in our CPU-side setup, and that
   // distinction decides whether to optimise our per-draw work or the GPU workload itself.
-  if (REXCVAR_GET(nx1_d3d9_profile)) {
+  // Start every frame with a real bind, so a skip chain always descends from a draw that
+  // refreshed the cache entries' last_frame within this frame.
+  last_sig_valid_ = false;
+
+  const bool prof_on = REXCVAR_GET(nx1_d3d9_profile);
+  ResourceTracker::Get().prof_enabled_ = prof_on;
+  if (prof_on) {
     static uint32_t prof_frames = 0;
     if (++prof_frames >= 60) {
+      const auto tp = ResourceTracker::Get().TakeTextureProfile();
+      const double tf = 1.0 / (1e6 * prof_frames);
+      // Splits the textures phase: cache resolution vs rebuild, and the rebuild into its stages.
+      REXGPU_INFO("nx1_d3d9: PROF/tex lookup={:.2f} upload={:.2f} ms/frame over {:.1f} rebuilds/frame "
+                  "| stage={:.2f} decode={:.2f} mipgen={:.2f} commit={:.2f} ms | {:.0f} us/rebuild",
+                  tp.lookup_ns * tf, tp.upload_ns * tf, double(tp.uploads) / prof_frames,
+                  tp.stage_ns * tf, tp.decode_ns * tf, tp.mipgen_ns * tf, tp.commit_ns * tf,
+                  tp.uploads ? double(tp.upload_ns) / (1e3 * tp.uploads) : 0.0);
+      // Why the rebuilds happen, and at what memory cost -- the two numbers that decide whether
+      // the fix is the commit policy, the eviction policy, or the streaming pool.
+      REXGPU_INFO("nx1_d3d9: PROF/tex why: new={:.1f} layout={:.1f} dirty={:.1f} zero={:.1f} per "
+                  "frame | {:.2f} MB/frame decoded ({:.1f} GB/s effective)",
+                  double(tp.why_new) / prof_frames, double(tp.why_layout) / prof_frames,
+                  double(tp.why_dirty) / prof_frames, double(tp.why_zero) / prof_frames,
+                  double(tp.decode_bytes) / (1024.0 * 1024.0 * prof_frames),
+                  tp.decode_ns ? double(tp.decode_bytes) / double(tp.decode_ns) : 0.0);
+      REXGPU_INFO("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
+                  prof_bind_calls_ ? 100.0 * double(prof_bind_skips_) / double(prof_bind_calls_)
+                                   : 0.0,
+                  double(prof_bind_calls_) / prof_frames);
+      prof_bind_skips_ = prof_bind_calls_ = 0;
       const double f = 1.0 / (1e6 * prof_frames);  // ns totals -> ms per frame
       REXGPU_INFO("nx1_d3d9: PROF/frame draws={} | viewport={:.2f} shaders={:.2f} indices={:.2f} "
                   "streams={:.2f} textures={:.2f} states={:.2f} draw={:.2f} present={:.2f} ms "
@@ -1046,6 +1073,42 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
   // shaders typically declare a handful of the 16 slots.
   const uint32_t sampler_mask = active_sampler_mask_;
   prof_sampler_slots_ += uint64_t(__builtin_popcount(sampler_mask & 0xFFFFu));
+
+  // Draw-signature skip. The fetch constants are compared as raw bytes -- no byte swap, since
+  // only "did this change" matters -- so the check is a handful of 24-byte memcmps against the
+  // previous draw, far cheaper than the per-slot work it elides.
+  ++prof_bind_calls_;
+  uint32_t sig[kSigMaxDwords];
+  uint32_t sig_n = 0;
+  for (uint32_t sampler = 0; sampler < 16; ++sampler) {
+    if (!(sampler_mask & (1u << sampler))) {
+      continue;
+    }
+    const uint32_t addr = FetchConstantAddr(guest_device, sampler);
+    const uint8_t* fc = addr >= 0xA0000000u ? GuestTranslatePhysical(addr) : base + addr;
+    if (!fc) {
+      sig_n = 0;  // cannot characterise this draw: fall through and bind it properly
+      break;
+    }
+    std::memcpy(&sig[sig_n], fc, 6 * sizeof(uint32_t));
+    sig_n += 6;
+  }
+  if (sig_n && last_sig_valid_ && last_sig_dwords_ == sig_n && last_sig_mask_ == sampler_mask &&
+      last_sig_surface_ == surface_key &&
+      std::memcmp(last_sig_, sig, sig_n * sizeof(uint32_t)) == 0) {
+    ++prof_bind_skips_;
+    return;
+  }
+  if (sig_n) {
+    std::memcpy(last_sig_, sig, sig_n * sizeof(uint32_t));
+    last_sig_dwords_ = sig_n;
+    last_sig_mask_ = sampler_mask;
+    last_sig_surface_ = surface_key;
+    last_sig_valid_ = true;
+  } else {
+    last_sig_valid_ = false;
+  }
+
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
     if (!(sampler_mask & (1u << sampler))) {
       continue;
@@ -1053,11 +1116,11 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
     // NOTE: a fetch-constant memo was tried here and MEASURED NET-NEGATIVE (textures 8.05 ->
     // 9.27ms). Consecutive draws are usually different materials, so the constant differs, the
     // memo misses, and the compare is pure added cost. Don't re-add it without data.
-    IDirect3DBaseTexture9* tex = tracker.GetTexture(base, guest_device, sampler);
-    // Read the fetch constant once (needed for both the LOD substitution and the sampler state).
+    // GetTexture hands back the fetch constant it already read; re-reading it here cost six
+    // byte-swapped guest dwords a second time on every bound slot.
     TextureFetchConstant t{};
+    IDirect3DBaseTexture9* tex = tracker.GetTexture(base, guest_device, sampler, &t);
     if (tex) {
-      t = ReadTextureFetchConstant(base, guest_device, sampler);
       // For a static-geometry world draw, hold the highest-res texture this surface has shown and
       // substitute it when the engine swaps sampler to a receding (garbage) LOD -- see
       // PreferLargestForSurface. surface_key 0 (UI / inline draws) leaves the binding untouched.
