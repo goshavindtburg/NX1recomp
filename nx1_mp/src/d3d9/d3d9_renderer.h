@@ -324,6 +324,20 @@ class Renderer {
   float last_ps_dims_[16 * 4] = {};
   uint32_t last_ps_dims_mask_ = 0;
 
+  /// Shadowed D3DRS_* values. ApplyRenderStates issued twelve SetRenderState calls on EVERY
+  /// draw with no change detection -- ~70k of the ~85k D3D calls a frame, and consecutive
+  /// draws overwhelmingly share depth/blend/cull state. Same treatment as the sampler, shader
+  /// and stream shadows. Indexed by D3DRENDERSTATETYPE, which is < 256 for everything we set.
+  static constexpr uint32_t kMaxRenderState = 256;
+  static constexpr uint32_t kRenderStateUnset = ~0u;
+  uint32_t render_state_[kMaxRenderState];
+
+  /// Set a render state only when it differs from what the device already has.
+  void SetRenderStateCached(D3DRENDERSTATETYPE state, uint32_t value);
+
+  /// Forget the shadowed render states, so the next draw re-issues them all.
+  void InvalidateRenderStateShadow();
+
   /// Forget the vertex declaration and stream sources only. Split out because the UP draw
   /// paths disturb exactly those and nothing else.
   void InvalidateVertexShadow();

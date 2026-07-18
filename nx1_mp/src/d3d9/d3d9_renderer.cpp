@@ -39,6 +39,8 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_profile, false, "GPU",
 
 namespace nx1::d3d9 {
 
+
+
 bool IsEnabled() {
   // Read live rather than caching in a static: a static local would latch
   // whatever the flag was on the very first call, which can precede config load.
@@ -545,7 +547,7 @@ void Renderer::SetRenderTarget(const uint8_t* base, uint32_t index, uint32_t gue
       // leaves the whole frame a gamma curve darker -- a permanent dusk.
       const uint32_t color_fmt =
           (GuestRead32(base, guest_surface + kSurfaceColorInfoOffset) >> 16) & 0xF;
-      device_->SetRenderState(D3DRS_SRGBWRITEENABLE, color_fmt == 1 ? TRUE : FALSE);
+      SetRenderStateCached(D3DRS_SRGBWRITEENABLE, color_fmt == 1 ? TRUE : FALSE);
       uint32_t w = 0, h = 0;
       if (ReadSurfaceSize(base, guest_surface, &w, &h)) {
         current_rt_width_ = w;
@@ -1018,7 +1020,7 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   // alone (see ReadColorWriteMask).
   const uint32_t want_color_write = ps ? ReadColorWriteMask(base, guest_device) : 0;
   if (want_color_write != bound_color_write_) {
-    device_->SetRenderState(D3DRS_COLORWRITEENABLE, want_color_write);
+    SetRenderStateCached(D3DRS_COLORWRITEENABLE, want_color_write);
     bound_color_write_ = want_color_write;
   }
   if (ps) {
@@ -1171,24 +1173,36 @@ D3DBLENDOP HostBlendOp(uint32_t op) {
 
 }  // namespace
 
+
+void Renderer::SetRenderStateCached(D3DRENDERSTATETYPE state, uint32_t value) {
+  const uint32_t idx = uint32_t(state);
+  if (idx < kMaxRenderState) {
+    if (render_state_[idx] == value) {
+      return;
+    }
+    render_state_[idx] = value;
+  }
+  device_->SetRenderState(state, value);
+}
+
 void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device) {
   // Depth. NX1 renders reverse-Z, so the guest's stored zfunc is GREATER_EQUAL --
   // we read it rather than hardcoding, so a draw that flips the test still works.
   const DepthState depth = ReadDepthState(base, guest_device);
-  device_->SetRenderState(D3DRS_ZENABLE, depth.test_enabled ? D3DZB_TRUE : D3DZB_FALSE);
-  device_->SetRenderState(D3DRS_ZWRITEENABLE, depth.write_enabled ? TRUE : FALSE);
-  device_->SetRenderState(D3DRS_ZFUNC, HostCompare(depth.compare_function));
+  SetRenderStateCached(D3DRS_ZENABLE, depth.test_enabled ? D3DZB_TRUE : D3DZB_FALSE);
+  SetRenderStateCached(D3DRS_ZWRITEENABLE, depth.write_enabled ? TRUE : FALSE);
+  SetRenderStateCached(D3DRS_ZFUNC, HostCompare(depth.compare_function));
 
   // Blend. Separate color/alpha factors, exactly as Xenos stores them.
   const BlendState blend = ReadBlendState(base, guest_device);
-  device_->SetRenderState(D3DRS_ALPHABLENDENABLE, blend.enabled ? TRUE : FALSE);
-  device_->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
-  device_->SetRenderState(D3DRS_SRCBLEND, HostBlendFactor(blend.color_src));
-  device_->SetRenderState(D3DRS_DESTBLEND, HostBlendFactor(blend.color_dst));
-  device_->SetRenderState(D3DRS_BLENDOP, HostBlendOp(blend.color_op));
-  device_->SetRenderState(D3DRS_SRCBLENDALPHA, HostBlendFactor(blend.alpha_src));
-  device_->SetRenderState(D3DRS_DESTBLENDALPHA, HostBlendFactor(blend.alpha_dst));
-  device_->SetRenderState(D3DRS_BLENDOPALPHA, HostBlendOp(blend.alpha_op));
+  SetRenderStateCached(D3DRS_ALPHABLENDENABLE, blend.enabled ? TRUE : FALSE);
+  SetRenderStateCached(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+  SetRenderStateCached(D3DRS_SRCBLEND, HostBlendFactor(blend.color_src));
+  SetRenderStateCached(D3DRS_DESTBLEND, HostBlendFactor(blend.color_dst));
+  SetRenderStateCached(D3DRS_BLENDOP, HostBlendOp(blend.color_op));
+  SetRenderStateCached(D3DRS_SRCBLENDALPHA, HostBlendFactor(blend.alpha_src));
+  SetRenderStateCached(D3DRS_DESTBLENDALPHA, HostBlendFactor(blend.alpha_dst));
+  SetRenderStateCached(D3DRS_BLENDOPALPHA, HostBlendOp(blend.alpha_op));
 
   // Cull. D3D9 folds the front-face winding into the cull direction (it has no
   // separate "front face" state), so resolve the Xenos (cull, winding) pair here.
@@ -1199,7 +1213,13 @@ void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device) {
   } else if (cull.cull_front) {
     mode = cull.front_is_cw ? D3DCULL_CW : D3DCULL_CCW;
   }
-  device_->SetRenderState(D3DRS_CULLMODE, mode);
+  SetRenderStateCached(D3DRS_CULLMODE, mode);
+}
+
+void Renderer::InvalidateRenderStateShadow() {
+  for (uint32_t i = 0; i < kMaxRenderState; ++i) {
+    render_state_[i] = kRenderStateUnset;
+  }
 }
 
 void Renderer::InvalidateVertexShadow() {
@@ -1221,6 +1241,7 @@ void Renderer::InvalidateStateShadow() {
   bound_ps_ = kPixelShaderUnknown;
   bound_color_write_ = kColorWriteUnset;
   InvalidateVertexShadow();
+  InvalidateRenderStateShadow();
   last_vs_uniform_shader_ = nullptr;
   last_ps_uniform_shader_ = nullptr;
   last_ps_dims_mask_ = 0;
