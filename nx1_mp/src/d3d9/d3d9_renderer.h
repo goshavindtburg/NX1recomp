@@ -333,6 +333,16 @@ class Renderer {
     ProbeKind kind;
   };
   std::vector<StabilityProbe> prof_stability_;
+  /// The PREVIOUS frame's probes, re-checked one frame late.
+  ///
+  /// Every stability number so far is WITHIN a frame, because the drain barrier means the worker
+  /// never reads anything older than that. Frame-level pipelining would break exactly that
+  /// property -- the worker would still be consuming frame N while the guest records N+1 -- so
+  /// the within-frame result licenses nothing about it. This measures the actual question before
+  /// any of that gets written.
+  std::vector<StabilityProbe> prof_stability_prev_;
+  uint64_t prof_xframe_ok_[3] = {};
+  uint64_t prof_xframe_changed_[3] = {};
   uint64_t prof_stable_ok_ = 0;
   uint64_t prof_stable_changed_ = 0;
   /// Per-class tallies, so "index data is stable" is a number rather than an assumption.

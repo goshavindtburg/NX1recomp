@@ -407,6 +407,21 @@ void Renderer::Present() {
       (same ? prof_stable_ok_ : prof_stable_changed_) += 1;
       (same ? prof_stable_ok_kind_[k] : prof_stable_changed_kind_[k]) += 1;
     }
+    // The PREVIOUS frame's probes, re-checked a full frame late. This is the question frame-level
+    // pipelining actually asks -- would data still be valid if the worker were consuming frame N
+    // while the guest records N+1 -- and it is NOT what the within-frame number above answers.
+    for (const auto& probe : prof_stability_prev_) {
+      const uint8_t* pp = probe.kind == ProbeKind::kUcode
+                              ? GuestTranslateGpuPhysical(probe.addr)
+                              : tracker_probe.PhysicalPointer(probe.addr);
+      if (!pp) {
+        continue;
+      }
+      const uint32_t k = uint32_t(probe.kind);
+      (XXH3_64bits(pp, probe.bytes) == probe.hash ? prof_xframe_ok_[k]
+                                                  : prof_xframe_changed_[k]) += 1;
+    }
+    prof_stability_prev_ = prof_stability_;
     prof_stability_.clear();
     for (uint32_t k = 0; k < 3; ++k) {
       prof_probe_offered_[k] += prof_probe_seen_[k];
@@ -589,12 +604,16 @@ void Renderer::Present() {
       static const char* const kKindName[3] = {"vertex", "index", "ucode"};
       for (uint32_t k = 0; k < 3; ++k) {
         const uint64_t total = prof_stable_ok_kind_[k] + prof_stable_changed_kind_[k];
-        REXGPU_INFO("nx1_d3d9: PROF/stability {:<6} {:.2f}% unchanged, {} changed of {} probed "
-                    "(strided sample of {} candidates)",
+        const uint64_t xtotal = prof_xframe_ok_[k] + prof_xframe_changed_[k];
+        REXGPU_INFO("nx1_d3d9: PROF/stability {:<6} in-frame {:.2f}% unchanged ({} of {}) | "
+                    "CROSS-FRAME {:.2f}% unchanged ({} changed of {})",
                     kKindName[k],
                     total ? 100.0 * double(prof_stable_ok_kind_[k]) / double(total) : 0.0,
-                    prof_stable_changed_kind_[k], total, prof_probe_offered_[k]);
+                    prof_stable_changed_kind_[k], total,
+                    xtotal ? 100.0 * double(prof_xframe_ok_[k]) / double(xtotal) : 0.0,
+                    prof_xframe_changed_[k], xtotal);
         prof_stable_ok_kind_[k] = prof_stable_changed_kind_[k] = 0;
+        prof_xframe_ok_[k] = prof_xframe_changed_[k] = 0;
         prof_probe_offered_[k] = 0;
       }
       prof_gap_before_first_ns_ = prof_gap_between_ns_ = prof_gap_after_last_ns_ = 0;
