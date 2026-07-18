@@ -43,6 +43,14 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_lod, 0, "GPU",
                       "Debug: paint one prefer-largest LOD branch white (1=substitute, "
                       "2=equal, 3=adopt)");
 
+/// Diagnostic: paint textures white by how their mip chain was provided.
+///   1 = CPU-built (block compressed)   2 = driver auto-generated   3 = no chain at all
+/// The remaining speckled surfaces will be one of these three, and each implicates something
+/// different: our encoder, the driver's minification of our level 0, or plain aliasing.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipsrc, 0, "GPU",
+                      "Debug: paint textures white by mip source (1=cpu-built, 2=driver, "
+                      "3=none)");
+
 /// Diagnostic: drop ONLY the CPU-built block-compressed mip chain, leaving the driver's
 /// auto-generated chains alone. nx1_d3d9_mips 0 disables both at once, which cannot tell our
 /// BC encoder apart from the driver's minification -- and with mips off entirely a minified
@@ -561,6 +569,11 @@ struct TextureEntry {
   /// does eventually arrive is still picked up within ~1 second.
   uint32_t zero_retries = 0;
   uint64_t retry_frame = 0;
+  /// How this texture's mip chain was actually provided: 0 = none, 1 = CPU-built (block
+  /// compressed), 2 = driver auto-generated. Classified by OUTCOME, not by intent, so the
+  /// nx1_d3d9_bc_mips diagnostic cannot mislabel a BC texture as auto-mipped when it in fact
+  /// ended up with no chain at all.
+  uint8_t mip_source = 0;
 };
 
 struct ResolvedTarget {
@@ -2269,6 +2282,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // what stops the never-streamed ones re-decoding every frame in perpetuity.
   if (entry.tex && entry.layout_key == layout_key && (!entry.dirty || frame_ < entry.retry_frame)) {
     entry.last_frame = frame_;
+    const uint32_t dbg_mip = REXCVAR_GET(nx1_d3d9_dbg_mipsrc);
+    if (dbg_mip && white_ && entry.mip_source == (dbg_mip == 3 ? 0 : dbg_mip)) {
+      return white_;
+    }
     return entry.tex;
   }
 
@@ -2353,6 +2370,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
 
   // Track how each texture's mip chain is provided (built here / driver auto-gen / skipped), so the
   // periodic "mipgen" stats line can show the split across the whole run.
+  const bool driver_mips = auto_mips && want_mips;
+  entry.mip_source = build_mips ? 1 : (driver_mips ? 2 : 0);
   if (build_mips) {
     ++mips_built_;
   } else if (want_mips) {

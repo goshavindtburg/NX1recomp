@@ -19,6 +19,7 @@
 
 #include <xxhash.h>
 
+#include "d3d9_overlay.h"
 #include "d3d9_renderer.h"
 #include "d3d9_constants.h"
 #include "d3d9_resources.h"
@@ -211,6 +212,9 @@ bool Renderer::Initialize(HWND output_window) {
   }
 
   hwnd_ = hwnd;
+  // Our own ImGui context on this device. The SDK's overlay renders through a D3D12
+  // ImmediateDrawer into a swapchain our PresentEx covers, so it can never be seen.
+  Overlay::Get().Initialize(device_, hwnd);
   backbuffer_width_ = pp.BackBufferWidth;
   backbuffer_height_ = pp.BackBufferHeight;
   current_rt_width_ = pp.BackBufferWidth;
@@ -275,6 +279,9 @@ void Renderer::Shutdown() {
   shutting_down_.store(true, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(render_mutex_);
+    // Before the device goes: imgui holds device objects, and the WndProc subclass must be
+    // unhooked while the window is still ours to unhook from.
+    Overlay::Get().Shutdown();
     ResourceTracker::Get().Shutdown();
     ShaderCache::Get().Shutdown();
     if (device_) {
@@ -345,6 +352,8 @@ void Renderer::Present() {
   const auto t_present = std::chrono::steady_clock::now();
   prof_frame_ns_ += uint64_t((t_present - last_present).count());
   last_present = t_present;
+  // Last thing before the flip, so it sits on top of the finished frame.
+  Overlay::Get().Render();
   device_->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
   prof_present_ns_ += uint64_t((std::chrono::steady_clock::now() - t_present).count());
 

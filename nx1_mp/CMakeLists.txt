@@ -41,8 +41,19 @@ set(NX1MP_SOURCES
     src/d3d9/d3d9_hooks.cpp
     src/d3d9/d3d9_resources.cpp
     src/d3d9/d3d9_shaders.cpp
+    src/d3d9/d3d9_overlay.cpp
     src/d3d9/guest_d3d.cpp
 )
+
+# Dear ImGui backends for the native renderer's own overlay. The `imgui` target builds only
+# the core library -- the SDK never needed a backend because it renders the UI through its own
+# D3D12 ImmediateDrawer, and that path draws into a swapchain our D3D9 present covers up.
+if(WIN32)
+    list(APPEND NX1MP_SOURCES
+        "${CMAKE_CURRENT_LIST_DIR}/../rexglue-sdk/thirdparty/imgui/backends/imgui_impl_dx9.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/../rexglue-sdk/thirdparty/imgui/backends/imgui_impl_win32.cpp"
+    )
+endif()
 
 # Shader Model 3.0 cache for the native D3D9 renderer, emitted by
 #   XenosRecomp <dumps> <dxil.cpp> <shader_common.h> --sm3 <this file>
