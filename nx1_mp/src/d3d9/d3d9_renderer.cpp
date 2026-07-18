@@ -47,6 +47,10 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_async, false, "GPU",
                     "Translate recorded GPU commands on a worker thread, overlapping our "
                     "translation with the guest's own between-draw logic");
 
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_blend_log, false, "GPU",
+                    "Log every distinct blend configuration the guest asks for, once each "
+                    "(glass-transparency hunt)");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_skip_clean_constants, true, "GPU",
                     "Skip the shader constant upload when the guest's dirty mask, the PM4 "
                     "ring generation and the bound shader all say nothing changed");
@@ -574,9 +578,6 @@ void Renderer::Present() {
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
-      REXGPU_INFO("nx1_d3d9: PROF/constblend {:.1f} draws/frame use a constant blend factor",
-                  double(prof_const_blend_draws_) / prof_frames);
-      prof_const_blend_draws_ = 0;
       // Report the hit rate, not just the timing. Several shadows in this renderer measured
       // exactly zero benefit and were only caught by a counter -- a memo that never hits is pure
       // added cost, and the phase timing alone cannot tell the difference.
@@ -1580,31 +1581,34 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   SetRenderStateCached(D3DRS_DESTBLENDALPHA, HostBlendFactor(blend.alpha_dst));
   SetRenderStateCached(D3DRS_BLENDOPALPHA, HostBlendOp(blend.alpha_op));
 
-  // GLASS HUNT. HostBlendFactor maps Xenos factors 12..15 (constant colour / constant alpha) to
-  // D3DBLEND_BLENDFACTOR, but nothing here ever sets D3DRS_BLENDFACTOR -- so those draws blend
-  // against D3D9's default of opaque white. A material blending against a constant would then
-  // render fully opaque, which is exactly what intact glass does (broken glass, a different
-  // material, is correctly transparent).
+  // GLASS HUNT, round 2. Constant blend factors were the first theory and PROF/constblend
+  // measured them at exactly 0 draws/frame, so D3DRS_BLENDFACTOR is not it.
   //
-  // That is a hypothesis, not a finding. Count the draws that actually use those factors before
-  // going looking for the guest's RB_BLEND_RGBA offset: if nothing uses them, the theory is dead
-  // and the offset hunt would have been wasted work.
-  if (REXCVAR_GET(nx1_d3d9_profile) && blend.enabled) {
-    const auto is_const = [](uint32_t f) { return f >= 12 && f <= 15; };
-    if (is_const(blend.color_src) || is_const(blend.color_dst) || is_const(blend.alpha_src) ||
-        is_const(blend.alpha_dst)) {
-      ++prof_const_blend_draws_;
-      static std::mutex m;
-      static std::vector<uint32_t> seen;
-      const uint32_t sig = blend.color_src | (blend.color_dst << 8) | (blend.alpha_src << 16) |
-                           (blend.alpha_dst << 24);
-      std::lock_guard<std::mutex> lk(m);
-      if (std::find(seen.begin(), seen.end(), sig) == seen.end() && seen.size() < 16) {
-        seen.push_back(sig);
-        REXGPU_INFO("nx1_d3d9: CONSTBLEND src={} dst={} asrc={} adst={} -- blends against "
-                    "D3DRS_BLENDFACTOR, which we never set",
-                    blend.color_src, blend.color_dst, blend.alpha_src, blend.alpha_dst);
-      }
+  // Enumerate what the guest ACTUALLY asks for instead of guessing again: every distinct blend
+  // configuration, with a draw count. If intact glass turns out to be drawn with blending
+  // DISABLED, the fault is upstream of blending entirely (the material, or our reading of the
+  // register). If it is enabled with SRCALPHA/INVSRCALPHA, then the source alpha is arriving as
+  // 1.0 and the fault is in the pixel shader's alpha or the texture's alpha channel -- two very
+  // different investigations, and this says which.
+  if (REXCVAR_GET(nx1_d3d9_dbg_blend_log)) {
+    const uint64_t sig = uint64_t(blend.enabled) | (uint64_t(blend.color_src) << 1) |
+                         (uint64_t(blend.color_dst) << 7) | (uint64_t(blend.color_op) << 13) |
+                         (uint64_t(blend.alpha_src) << 17) | (uint64_t(blend.alpha_dst) << 23) |
+                         (uint64_t(blend.alpha_op) << 29) | (uint64_t(d.color_write_mask) << 33);
+    static std::mutex m;
+    static std::vector<std::pair<uint64_t, uint64_t>> seen;  // sig -> draw count
+    std::lock_guard<std::mutex> lk(m);
+    auto it = std::find_if(seen.begin(), seen.end(),
+                           [sig](const auto& e) { return e.first == sig; });
+    if (it != seen.end()) {
+      ++it->second;
+    } else if (seen.size() < 32) {
+      seen.push_back({sig, 1});
+      REXGPU_INFO("nx1_d3d9: BLENDCFG #{} enabled={} colour {}->{} op={} alpha {}->{} op={} "
+                  "writemask={:#x}",
+                  seen.size() - 1, blend.enabled ? 1 : 0, blend.color_src, blend.color_dst,
+                  blend.color_op, blend.alpha_src, blend.alpha_dst, blend.alpha_op,
+                  d.color_write_mask);
     }
   }
 

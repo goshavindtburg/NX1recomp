@@ -363,7 +363,6 @@ class Renderer {
   /// Bottleneck attribution: guest time blocked in DrainWorker vs worker time starved waiting
   /// for work. Whichever is large names the limiting side; both near zero means the two are
   /// balanced and the remainder is GPU or present.
-  uint64_t prof_const_blend_draws_ = 0;
   uint64_t prof_drain_wait_ns_ = 0;
   /// Worst frame in the reporting window, and how much of it was spent blocked on the worker.
   /// A hitch does not show up in a mean -- that pair says whether a spike is our queue stalling
