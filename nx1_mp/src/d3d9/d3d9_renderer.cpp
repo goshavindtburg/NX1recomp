@@ -387,6 +387,18 @@ void Renderer::Present() {
                   double(sp.calls) / prof_frames,
                   sp.calls ? double(sp.registers) / double(sp.calls) : 0.0,
                   sp.calls ? double(sp.def_writes) / double(sp.calls) : 0.0);
+      const auto vp = ResourceTracker::Get().TakeVertexProfile();
+      REXGPU_INFO("nx1_d3d9: PROF/vb layout={:.2f} buffer={:.2f} ms/frame | inside buffer: "
+                  "fast={:.2f} hash={:.2f} convert={:.2f} ms over {:.0f} calls, "
+                  "{:.1f} hashes ({:.2f} MB) {:.1f} converts ({:.2f} MB) per frame",
+                  prof_vlayout_ns_ * tf, prof_vbuffer_ns_ * tf,
+                  vp.fast_ns * tf, vp.hash_ns * tf, vp.convert_ns * tf,
+                  double(vp.calls) / prof_frames,
+                  double(vp.hashes) / prof_frames,
+                  double(vp.hash_bytes) / (1024.0 * 1024.0 * prof_frames),
+                  double(vp.converts) / prof_frames,
+                  double(vp.convert_bytes) / (1024.0 * 1024.0 * prof_frames));
+      prof_vlayout_ns_ = prof_vbuffer_ns_ = 0;
       REXGPU_INFO("nx1_d3d9: PROF/vtx decl skipped {:.1f}% of {:.0f} | stream skipped {:.1f}% of {:.0f} per frame",
                   prof_decl_calls_ ? 100.0 * double(prof_decl_skips_) / double(prof_decl_calls_) : 0.0,
                   double(prof_decl_calls_) / prof_frames,
@@ -988,10 +1000,19 @@ bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t 
   auto& tracker = ResourceTracker::Get();
   // NX1 binds no CVertexDeclaration; for bound-buffer draws derive the multi-stream
   // layout from the vertex shader's vfetch (stream0_stride=0 selects bound mode).
+  const bool vprof = REXCVAR_GET(nx1_d3d9_profile);
+  const auto vmark = [vprof] {
+    return vprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  };
+  const auto vadd = [vprof](uint64_t& sink, std::chrono::steady_clock::time_point t0) {
+    if (vprof) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
+  };
+  const auto t_layout = vmark();
   const VertexLayout* layout = tracker.GetVertexLayout(base, guest_device);
   if (!layout) {
     layout = tracker.GetShaderVertexLayout(base, guest_device, /*stream0_stride=*/0);
   }
+  vadd(prof_vlayout_ns_, t_layout);
   if (!layout) {
     return false;
   }
@@ -1006,11 +1027,13 @@ bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t 
   *vertex_count = 0;
   for (uint32_t stream = 0; stream < layout->stream_count; ++stream) {
     uint32_t count = 0;
+    const auto t_vb = vmark();
     IDirect3DVertexBuffer9* vb =
         tracker.GetVertexBuffer(base, guest_device, stream, *layout, needed_vertices, &count);
     if (!vb) {
       return false;
     }
+    vadd(prof_vbuffer_ns_, t_vb);
     ++prof_stream_calls_;
     if (vb != bound_stream_vb_[stream] ||
         layout->host_stride[stream] != bound_stream_stride_[stream]) {

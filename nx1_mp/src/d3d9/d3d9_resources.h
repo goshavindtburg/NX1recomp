@@ -331,6 +331,29 @@ class ResourceTracker {
  private:
   TextureProfile prof_tex_;
 
+ public:
+  /// TEMP PROFILING: the streams phase has resisted two optimisations (eliding ~9100 D3D
+  /// calls a frame, and memoizing the layout lookup) with no measurable change, so where its
+  /// ~2.2 ms actually goes has to be measured rather than reasoned about.
+  struct VertexProfile {
+    uint64_t fast_ns = 0;      ///< fetch-constant read, key, map probe, frame-coherent early-out
+    uint64_t hash_ns = 0;      ///< XXH3 over the guest vertices (memoized per buffer per frame)
+    uint64_t convert_ns = 0;   ///< CreateVertexBuffer + Lock + byteswap/convert + Unlock
+    uint64_t calls = 0;
+    uint64_t hashes = 0;       ///< buffers actually hashed (memo misses)
+    uint64_t converts = 0;     ///< buffers actually rebuilt
+    uint64_t hash_bytes = 0;
+    uint64_t convert_bytes = 0;
+  };
+  VertexProfile TakeVertexProfile() {
+    VertexProfile p = prof_vtx_;
+    prof_vtx_ = {};
+    return p;
+  }
+
+ private:
+  VertexProfile prof_vtx_;
+
   /// Last layout GetVertexLayout resolved, memoized so a repeat draw skips the map probe.
   /// See the comment there for why holding this pointer is safe.
   uint64_t last_layout_key_ = 0;

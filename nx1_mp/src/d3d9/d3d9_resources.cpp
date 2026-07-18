@@ -1623,6 +1623,15 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   if (!device_ || !vertex_buffers_ || stream >= kMaxHostStreams) {
     return nullptr;
   }
+  const auto vmark = [this] {
+    return prof_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  };
+  const auto vadd = [this](uint64_t& sink, std::chrono::steady_clock::time_point t0) {
+    if (prof_enabled_) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
+  };
+  const auto t_fast = vmark();
+  if (prof_enabled_) ++prof_vtx_.calls;
+
   const uint32_t guest_stride = layout.guest_stride[stream];
   const uint32_t host_stride = layout.host_stride[stream];
   const VertexFetchConstant fetch = ReadVertexFetchConstant(base, guest_device, stream);
@@ -1655,8 +1664,10 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   // Frame-coherent reuse: already validated this frame -> skip the content hash.
   if (entry.vb && entry.last_frame == frame_ && entry.bytes == host_bytes) {
     *vertex_count = entry.vertex_count;
+    vadd(prof_vtx_.fast_ns, t_fast);
     return entry.vb;
   }
+  vadd(prof_vtx_.fast_ns, t_fast);
   entry.last_frame = frame_;
 
   const uint8_t* src = TranslatePhysical(fetch.base_address);
@@ -1668,13 +1679,19 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   const size_t guest_bytes = size_t(count) * guest_stride;
   uint64_t content_hash = 0;
   {
+    const auto t_hash = vmark();
     auto* hashes = static_cast<VertexHashMap*>(vertex_hashes_);
     auto& cached = (*hashes)[MixKey(fetch.base_address, guest_bytes)];
     if (cached.frame != frame_ + 1) {  // +1: a default-constructed entry must not match frame 0
       cached.frame = frame_ + 1;
       cached.hash = XXH3_64bits(src, guest_bytes);
+      if (prof_enabled_) {
+        ++prof_vtx_.hashes;
+        prof_vtx_.hash_bytes += guest_bytes;
+      }
     }
     content_hash = cached.hash;
+    vadd(prof_vtx_.hash_ns, t_hash);
   }
   if (entry.vb && entry.bytes == host_bytes && entry.content_hash == content_hash) {
     return entry.vb;
@@ -1691,6 +1708,11 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
     return nullptr;
   }
 
+  const auto t_conv = vmark();
+  if (prof_enabled_) {
+    ++prof_vtx_.converts;
+    prof_vtx_.convert_bytes += host_bytes;
+  }
   void* mapped = nullptr;
   if (FAILED(entry.vb->Lock(0, 0, &mapped, 0))) {
     return nullptr;
@@ -1700,13 +1722,21 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   if (layout.bulk_swap[stream]) {
     SwapDwords(dst, src, size_t(count) * guest_stride);
   } else {
+    // Select this stream's ops ONCE. The filter used to sit inside the per-vertex loop, so a
+    // multi-stream layout re-scanned every other stream's ops for every vertex converted --
+    // pure overhead multiplied by the vertex count, and the reason this path ran at 0.37 GB/s.
+    const ConvertOp* stream_ops[MAXD3DDECLLENGTH];
+    uint32_t stream_op_count = 0;
+    for (const ConvertOp& op : layout.ops) {
+      if (op.stream == stream && stream_op_count < MAXD3DDECLLENGTH) {
+        stream_ops[stream_op_count++] = &op;
+      }
+    }
     for (uint32_t v = 0; v < count; ++v) {
       const uint8_t* sv = src + size_t(v) * guest_stride;
       uint8_t* dv = dst + size_t(v) * host_stride;
-      for (const ConvertOp& op : layout.ops) {
-        if (op.stream != stream) {
-          continue;
-        }
+      for (uint32_t oi = 0; oi < stream_op_count; ++oi) {
+        const ConvertOp& op = *stream_ops[oi];
         if (op.expand) {
           float decoded[4];
           Expand(sv + op.src_offset, op, decoded);
@@ -1718,6 +1748,7 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
     }
   }
   entry.vb->Unlock();
+  vadd(prof_vtx_.convert_ns, t_conv);
 
   entry.bytes = host_bytes;
   entry.vertex_count = count;
@@ -1730,10 +1761,10 @@ void ResourceTracker::LogCacheStats() {
     return;
   }
   const size_t textures = textures_ ? static_cast<TextureMap*>(textures_)->size() : 0;
-  const size_t vbs = vertex_buffers_
-                         ? static_cast<std::unordered_map<uint64_t, VertexBufferEntry>*>(
-                               vertex_buffers_)->size()
-                         : 0;
+  // Must go through the VertexBufferMap alias like every other cache here. Spelling the
+  // container out longhand meant the FlatMap swap missed this cast, and it read a FlatMap as
+  // an unordered_map -- printing vb=2330591112192, which reads exactly like heap corruption.
+  const size_t vbs = vertex_buffers_ ? static_cast<VertexBufferMap*>(vertex_buffers_)->size() : 0;
   const size_t ibs = index_buffers_ ? static_cast<IndexBufferMap*>(index_buffers_)->size() : 0;
   const size_t resolves = resolves_ ? static_cast<ResolveMap*>(resolves_)->size() : 0;
   REXGPU_INFO(

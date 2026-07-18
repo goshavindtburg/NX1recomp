@@ -227,6 +227,8 @@ class Renderer {
   uint64_t prof_decl_calls_ = 0;
   uint64_t prof_stream_skips_ = 0;
   uint64_t prof_stream_calls_ = 0;
+  uint64_t prof_vlayout_ns_ = 0;
+  uint64_t prof_vbuffer_ns_ = 0;
 
   /// TEMP PROFILING (nx1_d3d9_profile): per-phase nanoseconds accumulated over a frame,
   /// reported and reset in Present. Measures where the ~19us/draw actually goes.
