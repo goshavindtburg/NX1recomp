@@ -350,6 +350,11 @@ class Renderer {
   /// Guards prof_stability_ and the sampling counters: ProbeStability is called from the guest
   /// thread (ucode) and the worker (vertex, index) simultaneously under async.
   std::mutex prof_probe_mutex_;
+  /// Bottleneck attribution: guest time blocked in DrainWorker vs worker time starved waiting
+  /// for work. Whichever is large names the limiting side; both near zero means the two are
+  /// balanced and the remainder is GPU or present.
+  uint64_t prof_drain_wait_ns_ = 0;
+  std::atomic<uint64_t> prof_worker_idle_ns_{0};
   /// Splits the shaders phase outside UploadConstants: microcode hashing, cache lookup, and the
   /// SetShader/uniform/colour-mask binding around them.
   uint64_t prof_hash_ns_ = 0;

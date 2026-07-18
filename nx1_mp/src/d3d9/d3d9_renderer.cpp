@@ -544,6 +544,20 @@ void Renderer::Present() {
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
+      if (worker_active_) {
+        // Names the limiting side outright. Guest-wait high => the worker is the bottleneck and
+        // more translation work should come off it. Worker-idle high => the guest thread is,
+        // i.e. its own game logic plus our recording tax, and shaving translation buys nothing.
+        const double drain_ms = prof_drain_wait_ns_ * tf;
+        const double idle_ms = prof_worker_idle_ns_.exchange(0, std::memory_order_relaxed) * tf;
+        REXGPU_INFO("nx1_d3d9: PROF/bound guest waited {:.2f} ms/frame for the worker, worker "
+                    "starved {:.2f} ms/frame -- limited by {}",
+                    drain_ms, idle_ms,
+                    drain_ms > idle_ms * 2.0   ? "TRANSLATION (worker)"
+                    : idle_ms > drain_ms * 2.0 ? "the GUEST THREAD (game logic + recording)"
+                                               : "both roughly equally");
+        prof_drain_wait_ns_ = 0;
+      }
       // Only meaningful synchronously. The gap timers difference a mark taken on the guest
       // thread against one taken in ExecuteDraw, which under async runs on the WORKER -- the
       // subtraction then measures the distance between two unrelated clocks and reported
@@ -1760,8 +1774,16 @@ void Renderer::DrainWorker() {
   if (!worker_active_) {
     return;
   }
-  std::unique_lock<std::mutex> lk(queue_mutex_);
-  queue_done_cv_.wait(lk, [this] { return queue_tail_ >= queue_head_ || !worker_running_; });
+  // WHO WAITS FOR WHOM is the whole bottleneck question, and it is measurable rather than
+  // arguable. Guest blocked here => the worker is the limit (our translation). Worker idle in
+  // WorkerMain => the guest is the limit (its game logic plus our recording). Neither => the two
+  // are balanced, and anything left is the GPU.
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> lk(queue_mutex_);
+    queue_done_cv_.wait(lk, [this] { return queue_tail_ >= queue_head_ || !worker_running_; });
+  }
+  prof_drain_wait_ns_ += uint64_t((std::chrono::steady_clock::now() - t0).count());
 }
 
 void Renderer::WorkerMain() {
@@ -1769,8 +1791,17 @@ void Renderer::WorkerMain() {
     size_t index = 0;
     const uint8_t* base = nullptr;
     {
+      const auto t0 = std::chrono::steady_clock::now();
       std::unique_lock<std::mutex> lk(queue_mutex_);
+      const bool had_work = queue_tail_ < queue_head_;
       queue_cv_.wait(lk, [this] { return queue_tail_ < queue_head_ || !worker_running_; });
+      if (!had_work) {
+        // Starved: the guest had nothing queued yet. Accumulated relaxed -- it is read once a
+        // second by the reporter and exactness does not matter, but tearing a 64-bit counter
+        // would.
+        prof_worker_idle_ns_.fetch_add(uint64_t((std::chrono::steady_clock::now() - t0).count()),
+                                       std::memory_order_relaxed);
+      }
       if (!worker_running_ && queue_tail_ >= queue_head_) {
         return;
       }
