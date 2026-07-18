@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <mutex>
 #include <cstdint>
 #include <utility>
 
@@ -981,6 +982,28 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   key_out.endianness = fetch.endianness;
 
   key_out.is_valid = 1;
+
+  // Ground-truth comparison for the native D3D9 renderer. This backend renders the effect
+  // sprites correctly, so whatever address it resolves for them is right by definition. Log
+  // each distinct texture once so the two sets can be diffed: a texture the native renderer
+  // decodes from an empty base_page will show up here under whatever page actually holds it.
+  {
+    static std::mutex ref_m;
+    static std::vector<uint64_t> ref_seen;
+    std::lock_guard<std::mutex> lk(ref_m);
+    const uint64_t sig = (uint64_t(key_out.base_page) << 40) ^
+                         (uint64_t(key_out.mip_page) << 20) ^
+                         (uint64_t(key_out.width_minus_1) << 8) ^ uint64_t(key_out.format);
+    if (std::find(ref_seen.begin(), ref_seen.end(), sig) == ref_seen.end() &&
+        ref_seen.size() < 300) {
+      ref_seen.push_back(sig);
+      REXGPU_INFO("REFTEX base={:08X} mip={:08X} {}x{} fmt={} tiled={} packed={} mip_max={}",
+                  key_out.base_page << 12, key_out.mip_page << 12,
+                  uint32_t(key_out.width_minus_1) + 1, uint32_t(key_out.height_minus_1) + 1,
+                  uint32_t(key_out.format), key_out.tiled ? 1 : 0, key_out.packed_mips ? 1 : 0,
+                  uint32_t(key_out.mip_max_level));
+    }
+  }
 
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);

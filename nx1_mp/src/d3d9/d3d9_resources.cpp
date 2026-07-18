@@ -2128,6 +2128,26 @@ void ResourceTracker::LearnTextureBaseline(uint32_t frames) {
 }
 
 void ResourceTracker::AdvanceFrame() {
+  // Poll the tracked address every frame and report whenever its populated-byte count changes.
+  // We only ever sampled it at bind time; if the guest fills this memory and clears it again
+  // between binds, a snapshot at bind time cannot tell that apart from "never written", and
+  // the reference backend -- which holds its own GPU-side copy of guest memory -- would keep
+  // whatever it captured while the data was live.
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track) {
+    if (const uint8_t* p = TranslatePhysical(track)) {
+      uint32_t nz = 0;
+      for (uint32_t i = 0; i < 8192; ++i) {
+        nz += p[i] != 0 ? 1 : 0;
+      }
+      static uint32_t last_nz = 0xFFFFFFFFu;
+      if (nz != last_nz) {
+        REXGPU_INFO("nx1_d3d9: TRACK {:08X} POLL frame={} nonzero={}/8192 (was {})", track, frame_,
+                    nz, last_nz == 0xFFFFFFFFu ? 0 : last_nz);
+        last_nz = nz;
+      }
+    }
+  }
+
   if (baseline_frames_ > 0 && --baseline_frames_ == 0) {
     std::sort(baseline_addrs_.begin(), baseline_addrs_.end());
     baseline_addrs_.erase(std::unique(baseline_addrs_.begin(), baseline_addrs_.end()),
@@ -2431,6 +2451,32 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // A texture whose address is a resolve destination is served by the rendered
   // image, not by untiling stale memory. This is what makes render-to-texture
   // (scene compositing, post effects) work.
+  // Hypothesis check, no cvar needed: the reference discards base_address entirely when
+  // mip_min_level != 0 and reads the texels from mip_address instead. If that is what these
+  // sprites do, their base memory will be empty while mip_address holds real data. Report each
+  // such texture once, with both populated-byte counts, so the claim stands or falls on
+  // numbers rather than on one hand-picked address.
+  if (t.valid && t.mip_min_level != 0 && t.base_address) {
+    static std::mutex mm;
+    static std::vector<uint32_t> seen_mip;
+    std::lock_guard<std::mutex> lk(mm);
+    if (std::find(seen_mip.begin(), seen_mip.end(), t.base_address) == seen_mip.end() &&
+        seen_mip.size() < 40) {
+      seen_mip.push_back(t.base_address);
+      uint32_t base_nz = 0, mip_nz = 0;
+      if (const uint8_t* bp = TranslatePhysical(t.base_address)) {
+        for (uint32_t i = 0; i < 4096; ++i) base_nz += bp[i] != 0 ? 1 : 0;
+      }
+      if (const uint8_t* mp = t.mip_address ? TranslatePhysical(t.mip_address) : nullptr) {
+        for (uint32_t i = 0; i < 4096; ++i) mip_nz += mp[i] != 0 ? 1 : 0;
+      }
+      REXGPU_INFO("nx1_d3d9: MIPBASE base={:08X} nz={}/4096 | mip={:08X} nz={}/4096 | {}x{} "
+                  "fmt={} mip_min={} mip_max={} sampler={}",
+                  t.base_address, base_nz, t.mip_address, mip_nz, t.width, t.height, t.format,
+                  t.mip_min_level, t.mip_max_level, sampler);
+    }
+  }
+
   // Trace every bind of the tracked address BEFORE any early-out, so a texture served from
   // the resolve map -- which returns below, ahead of the cache and ahead of the paint -- is
   // still visible. Without this, a render-target-backed texture looks like it is never bound.
@@ -2465,9 +2511,19 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     static uint64_t last_bind_frame = 0;
     if (frame_ != last_bind_frame) {
       last_bind_frame = frame_;
-      REXGPU_INFO("nx1_d3d9: TRACK {:08X} BIND frame={} sampler={} valid={} {}x{} fmt={} dim={}",
-                  t.base_address, frame_, sampler, t.valid ? 1 : 0, t.width, t.height, t.format,
-                  t.dimension);
+      // mip_address/mip_min_level matter here: the reference discards base_address entirely
+      // when mip_min_level != 0 and reads the texels from mip_address instead. We always read
+      // base_address, so such a texture decodes from memory nobody ever fills.
+      uint32_t mip_nz = 0;
+      if (const uint8_t* mp = t.mip_address ? TranslatePhysical(t.mip_address) : nullptr) {
+        for (uint32_t i = 0; i < 8192; ++i) {
+          mip_nz += mp[i] != 0 ? 1 : 0;
+        }
+      }
+      REXGPU_INFO("nx1_d3d9: TRACK {:08X} BIND frame={} sampler={} {}x{} fmt={} dim={} "
+                  "mip_min={} mip_max={} packed={} mip_address={:08X} mip_nonzero={}/8192",
+                  t.base_address, frame_, sampler, t.width, t.height, t.format, t.dimension,
+                  t.mip_min_level, t.mip_max_level, t.packed_mips ? 1 : 0, t.mip_address, mip_nz);
     }
   }
 

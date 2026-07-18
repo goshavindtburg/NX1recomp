@@ -599,6 +599,22 @@ void Renderer::ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t 
     return;
   }
   const TextureFetchConstant dest = ReadBaseTextureFormat(base, dest_texture);
+  // Log every distinct resolve destination once. If a texture that renders wrong never
+  // appears here, the guest is not resolving into it and it is produced some other way; if it
+  // DOES appear, the destination is reaching us and the fault is downstream in how we register
+  // or key it.
+  {
+    static std::mutex m;
+    static std::vector<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(m);
+    if (std::find(seen.begin(), seen.end(), dest.base_address) == seen.end() &&
+        seen.size() < 64) {
+      seen.push_back(dest.base_address);
+      REXGPU_INFO("nx1_d3d9: RESOLVEDST {:08X} {}x{} fmt={} tiled={} (dest_texture {:08X})",
+                  dest.base_address, dest.width, dest.height, dest.format, dest.tiled ? 1 : 0,
+                  dest_texture);
+    }
+  }
   if (!dest.base_address || !dest.width || !dest.height) {
     return;
   }
