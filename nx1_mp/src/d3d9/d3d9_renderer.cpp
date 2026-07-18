@@ -354,6 +354,26 @@ void Renderer::Present() {
     if (back) back->Release();
   }
 
+  if (REXCVAR_GET(nx1_d3d9_profile)) {
+    const auto tl_now = std::chrono::steady_clock::now();
+    if (prof_saw_draw_ && prof_last_draw_end_.time_since_epoch().count()) {
+      prof_gap_after_last_ns_ += uint64_t((tl_now - prof_last_draw_end_).count());
+    }
+    auto& tracker_probe = ResourceTracker::Get();
+    for (const auto& probe : prof_stability_) {
+      if (const uint8_t* pp = tracker_probe.PhysicalPointer(probe.addr)) {
+        if (XXH3_64bits(pp, probe.bytes) == probe.hash) {
+          ++prof_stable_ok_;
+        } else {
+          ++prof_stable_changed_;
+        }
+      }
+    }
+    prof_stability_.clear();
+    prof_saw_draw_ = false;
+    prof_frame_start_ = tl_now;
+  }
+
   static auto last_present = std::chrono::steady_clock::now();
   const auto t_present = std::chrono::steady_clock::now();
   prof_frame_ns_ += uint64_t((t_present - last_present).count());
@@ -462,6 +482,17 @@ void Renderer::Present() {
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
+      REXGPU_INFO("nx1_d3d9: PROF/defer guest work: pre-draw={:.2f} between-draws={:.2f} "
+                  "post-draw={:.2f} ms/frame | vertex ranges stable {:.1f}% of {:.0f}",
+                  prof_gap_before_first_ns_ * tf, prof_gap_between_ns_ * tf,
+                  prof_gap_after_last_ns_ * tf,
+                  (prof_stable_ok_ + prof_stable_changed_)
+                      ? 100.0 * double(prof_stable_ok_) /
+                            double(prof_stable_ok_ + prof_stable_changed_)
+                      : 0.0,
+                  double(prof_stable_ok_ + prof_stable_changed_) / prof_frames);
+      prof_gap_before_first_ns_ = prof_gap_between_ns_ = prof_gap_after_last_ns_ = 0;
+      prof_stable_ok_ = prof_stable_changed_ = 0;
       REXGPU_INFO("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
                   prof_bind_calls_ ? 100.0 * double(prof_bind_skips_) / double(prof_bind_calls_)
                                    : 0.0,
@@ -1476,6 +1507,20 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   }
   ++draws_attempted_;
 
+  if (REXCVAR_GET(nx1_d3d9_profile)) {
+    // Charge the gap before this draw to pre-draw logic or to interleaved logic. If the
+    // guest's time all lands in "pre-draw", within-frame deferral has nothing to overlap.
+    const auto tl_now = std::chrono::steady_clock::now();
+    if (!prof_saw_draw_) {
+      prof_saw_draw_ = true;
+      if (prof_frame_start_.time_since_epoch().count()) {
+        prof_gap_before_first_ns_ += uint64_t((tl_now - prof_frame_start_).count());
+      }
+    } else if (prof_last_draw_end_.time_since_epoch().count()) {
+      prof_gap_between_ns_ += uint64_t((tl_now - prof_last_draw_end_).count());
+    }
+  }
+
   // MEASUREMENT, not an optimisation yet. The guest maintains its own dirty bits
   // (m_Pending.m_Mask[5]) and zeroes them when a draw flushes, and we run inside the hook
   // BEFORE the guest's draw body -- so these are still valid here. If consecutive draws leave
@@ -1536,6 +1581,17 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
     return;
   }
 
+  if (REXCVAR_GET(nx1_d3d9_profile) && prof_stability_.size() < 512) {
+    // Record the vertex range this draw read, to re-hash at Present. A mismatch means the
+    // engine rewrote memory a deferred worker would still have been consuming.
+    uint32_t probe_addr = 0, probe_bytes = 0;
+    auto& tracker_probe = ResourceTracker::Get();
+    if (tracker_probe.LastStreamRange(&probe_addr, &probe_bytes) && probe_bytes) {
+      if (const uint8_t* pp = tracker_probe.PhysicalPointer(probe_addr)) {
+        prof_stability_.push_back({probe_addr, probe_bytes, XXH3_64bits(pp, probe_bytes)});
+      }
+    }
+  }
   device_->SetIndices(ib);
   // Stable per-surface identity for prefer-largest LOD substitution: a static world surface draws
   // the same index-buffer range every frame (the index buffers plateau at a few hundred addresses),
@@ -1557,6 +1613,9 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   const HRESULT dhr = device_->DrawIndexedPrimitive(host_prim, int(base_vertex_index), 0,
                                                     vertex_count, start_index, prim_count);
   padd(prof_draw_ns_, t_dr);
+  if (prof) {
+    prof_last_draw_end_ = PClock::now();
+  }
   if (prof) ++prof_draws_;
   // A draw can be *submitted* and still be rejected by D3D9 -- a depth buffer smaller than
   // the render target does exactly that, silently.

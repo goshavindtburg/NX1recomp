@@ -134,6 +134,20 @@ class ResourceTracker {
   bool ConvertInlineIndices(uint32_t indices_addr, uint32_t index_count, uint32_t index_size,
                             std::vector<uint8_t>* out);
 
+  /// The guest vertex range the most recent GetVertexBuffer read. Used only by the deferral
+  /// feasibility probe, which re-hashes it at Present to see whether the engine rewrote memory
+  /// a worker thread would still have been consuming.
+  bool LastStreamRange(uint32_t* addr, uint32_t* bytes) const {
+    if (!last_stream_bytes_) {
+      return false;
+    }
+    *addr = last_stream_addr_;
+    *bytes = last_stream_bytes_;
+    return true;
+  }
+  /// Host pointer for a guest physical address, for the same probe.
+  const uint8_t* PhysicalPointer(uint32_t phys_addr) const;
+
   /// Untile + upload the texture bound to `sampler`, or nullptr if that fetch
   /// constant holds no texture or an unsupported format.
   ///
@@ -419,6 +433,8 @@ class ResourceTracker {
 
   /// Last layout GetVertexLayout resolved, memoized so a repeat draw skips the map probe.
   /// See the comment there for why holding this pointer is safe.
+  uint32_t last_stream_addr_ = 0;
+  uint32_t last_stream_bytes_ = 0;
   uint64_t last_layout_key_ = 0;
   const VertexLayout* last_layout_ = nullptr;
 

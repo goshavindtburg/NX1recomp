@@ -1833,6 +1833,8 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   entry.last_frame = frame_;
 
   const uint8_t* src = TranslatePhysical(fetch.base_address);
+  last_stream_addr_ = fetch.base_address;
+  last_stream_bytes_ = uint32_t(size_t(count) * guest_stride);
 
   // Hash the guest bytes at most once per buffer per frame. The hash only depends on the
   // guest memory, so every layout reading the same buffer gets the same answer -- and the
@@ -1998,6 +2000,10 @@ void ResourceTracker::RebuildResolveFlat() {
     ++resolve_flat_count_;
   }
   resolve_flat_valid_ = true;
+}
+
+const uint8_t* ResourceTracker::PhysicalPointer(uint32_t phys_addr) const {
+  return TranslatePhysical(phys_addr);
 }
 
 void ResourceTracker::ArmWriteWatch(uint32_t phys_addr, uint32_t len) {

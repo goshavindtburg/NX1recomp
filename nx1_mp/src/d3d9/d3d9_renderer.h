@@ -26,7 +26,9 @@
 
 #ifdef _WIN32
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <vector>
 #include <thread>
 
 #include <d3d9.h>
@@ -219,6 +221,33 @@ class Renderer {
   bool last_sig_valid_ = false;
   uint64_t prof_bind_skips_ = 0;
   uint64_t prof_bind_calls_ = 0;
+
+  /// FEASIBILITY MEASUREMENT for deferred translation. Two questions decide whether a worker
+  /// thread can work at all:
+  ///
+  /// 1. WHERE does the guest's ~9.5 ms live? If it is all before the first draw, deferring
+  ///    within a frame overlaps with nothing and only cross-frame pipelining would help --
+  ///    which needs draw data to survive into the next frame, a far stronger assumption.
+  /// 2. Is draw-referenced guest memory STABLE until end of frame? A worker consuming it late
+  ///    reads whatever the engine has since written. This is the assumption that kills the
+  ///    design if false.
+  std::chrono::steady_clock::time_point prof_frame_start_{};
+  std::chrono::steady_clock::time_point prof_last_draw_end_{};
+  bool prof_saw_draw_ = false;
+  uint64_t prof_gap_before_first_ns_ = 0;  ///< frame start -> first draw (pre-draw logic)
+  uint64_t prof_gap_between_ns_ = 0;       ///< summed gaps between draws (interleaved logic)
+  uint64_t prof_gap_after_last_ns_ = 0;    ///< last draw -> present (post-draw work)
+
+  /// Vertex ranges a draw referenced this frame, re-hashed at Present to see whether the
+  /// engine rewrote them behind us.
+  struct StabilityProbe {
+    uint32_t addr;
+    uint32_t bytes;
+    uint64_t hash;
+  };
+  std::vector<StabilityProbe> prof_stability_;
+  uint64_t prof_stable_ok_ = 0;
+  uint64_t prof_stable_changed_ = 0;
   /// Splits the shaders phase outside UploadConstants: microcode hashing, cache lookup, and the
   /// SetShader/uniform/colour-mask binding around them.
   uint64_t prof_hash_ns_ = 0;
