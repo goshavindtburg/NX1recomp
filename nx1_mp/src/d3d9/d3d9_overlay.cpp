@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <set>
 #include <string_view>
@@ -17,6 +18,8 @@
 
 #include "backends/imgui_impl_dx9.h"
 #include "backends/imgui_impl_win32.h"
+
+#include "d3d9_resources.h"
 
 // Defined by the renderer / resource tracker. REXCVAR_GET yields a reference to the storage,
 // so the widgets below can bind straight to it.
@@ -29,6 +32,8 @@ REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipfill);
 REXCVAR_DECLARE(bool, nx1_d3d9_fast_detile);
 REXCVAR_DECLARE(bool, nx1_d3d9_commit_textures);
 REXCVAR_DECLARE(bool, nx1_d3d9_texture_mirror);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_texdump);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam,
                                                              LPARAM lparam);
@@ -277,7 +282,7 @@ void Overlay::DrawSettings() {
     } else {
       char buf[256] = {};
       std::snprintf(buf, sizeof(buf), "%s", value.c_str());
-      ImGui::SetNextItemWidth(200.0f);
+      ImGui::SetNextItemWidth(260.0f);
       if (ImGui::InputText(e.name.c_str(), buf, sizeof(buf),
                            ImGuiInputTextFlags_EnterReturnsTrue)) {
         // Goes through SetFlagByName so the registry's own validation and range constraints
@@ -327,6 +332,67 @@ void Overlay::DrawPanels() {
     ImGui::TextUnformatted("Mip chains");
     ImGui::Checkbox("Generate mips at all", &REXCVAR_GET(nx1_d3d9_mips));
     ImGui::Checkbox("CPU-build block-compressed mips", &REXCVAR_GET(nx1_d3d9_bc_mips));
+    // Dedicated hex entry: the generic cvar editor parses a uint32 as DECIMAL, so typing a
+    // guest address there silently tracks the wrong memory.
+    ImGui::TextUnformatted("Track texture address (hex) -- traces it and paints it white");
+    static char track_buf[16] = {};
+    ImGui::SetNextItemWidth(140.0f);
+    if (ImGui::InputText("##trackaddr", track_buf, sizeof(track_buf),
+                         ImGuiInputTextFlags_CharsHexadecimal |
+                             ImGuiInputTextFlags_EnterReturnsTrue)) {
+      REXCVAR_SET(nx1_d3d9_dbg_track_addr, uint32_t(std::strtoul(track_buf, nullptr, 16)));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Set")) {
+      REXCVAR_SET(nx1_d3d9_dbg_track_addr, uint32_t(std::strtoul(track_buf, nullptr, 16)));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##track")) {
+      track_buf[0] = 0;
+      REXCVAR_SET(nx1_d3d9_dbg_track_addr, 0u);
+    }
+    // Muzzle-flash candidates: the newcomers bound exactly once per shot across 12 shots.
+    ImGui::TextDisabled("flash candidates (1 frame per shot):");
+    struct Candidate {
+      const char* label;
+      uint32_t addr;
+    };
+    static constexpr Candidate kCandidates[] = {
+        {"0EE3E000 128x128", 0x0EE3E000u},
+        {"1022E000 512x256", 0x1022E000u},
+        {"1023E000 512x512", 0x1023E000u},
+    };
+    for (const auto& c : kCandidates) {
+      if (ImGui::SmallButton(c.label)) {
+        REXCVAR_SET(nx1_d3d9_dbg_track_addr, c.addr);
+        std::snprintf(track_buf, sizeof(track_buf), "%08X", c.addr);
+      }
+      ImGui::SameLine();
+    }
+    ImGui::NewLine();
+    ImGui::Text("now: %08X  (config overrides this at launch -- re-set after loading)",
+                REXCVAR_GET(nx1_d3d9_dbg_track_addr));
+
+    ImGui::Spacing();
+    if (ImGui::Button("Learn texture baseline (3s)")) {
+      ResourceTracker::Get().LearnTextureBaseline(180);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Report effect candidates")) {
+      ResourceTracker::Get().ReportEffectCandidates();
+    }
+    ImGui::TextDisabled("Learn a baseline, fire ~12 SEPARATE shots, then report. The flash shows");
+    ImGui::TextDisabled("up with ~12 appearances; world textures have 1.");
+
+    ImGui::Spacing();
+    if (ImGui::Button("Dump next 8 texture decodes")) {
+      REXCVAR_SET(nx1_d3d9_dbg_texdump, 8u);
+    }
+    ImGui::TextDisabled("Logs the fetch constant + raw guest bytes and writes texdump/tex_*.bmp.");
+    ImGui::TextDisabled("With mirror+freeze off, sprites re-decode as they are written -- so");
+    ImGui::TextDisabled("press this, then fire, to catch the muzzle flash.");
+
+    ImGui::Spacing();
     ImGui::Checkbox("Read textures from the CPU mirror snapshot",
                     &REXCVAR_GET(nx1_d3d9_texture_mirror));
     ImGui::TextDisabled("Off = read live guest memory like the reference backend does.");

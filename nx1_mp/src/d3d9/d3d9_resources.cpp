@@ -20,8 +20,10 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <string>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +54,23 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipfill, 0, "GPU",
                       "Debug mip chain: 1=flat colour per level (tests plumbing), "
                       "2=synthetic gradient as the level-0 source (tests filter+encoder "
                       "without our BC decoder)");
+
+/// Trace everything that happens to one guest address: every guest write we are told about,
+/// every resolve that targets it, and every decode we run from it. Set it to a texture that
+/// renders as garbage and the log answers the question the screen cannot -- is this memory
+/// ever written with good data, is it a resolve destination we are failing to track, or does
+/// nothing ever touch it? Hex, e.g. 05091000.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
+                      "Debug: log every write/resolve/decode touching this guest address, and "
+                      "paint whatever samples it solid white so it can be identified on screen");
+
+/// Dump the next N texture DECODES: the full fetch constant, the first bytes of the guest
+/// source, and the decoded image. Unlike the mip dump this fires for every decode, so with
+/// the mirror off and committing off (which make a sprite re-decode whenever the guest writes
+/// it) firing a weapon will capture the muzzle flash on the spot -- the targeting problem that
+/// otherwise makes these sprites impossible to catch.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_texdump, 0, "GPU",
+                      "Debug: dump the next N texture decodes (fetch constant + image)");
 
 /// Read texture texels from the CPU mirror rather than live guest memory.
 ///
@@ -2014,23 +2033,109 @@ void ResourceTracker::DrainMemoryWrites() {
     const uint32_t p0 = addr >> 12;
     const uint32_t p1 = (addr + len - 1) >> 12;
     for (uint32_t p = p0; p <= p1; ++p) {
-      mirror_valid_[p >> 6] &= ~(uint64_t(1) << (p & 63));  // invalidate: re-copy on next request
+      const uint64_t bit = uint64_t(1) << (p & 63);
+      mirror_valid_[p >> 6] &= ~bit;  // invalidate: re-copy on next request
+      // Disarm too, so the next read RE-ARMS the callback. The guest access callback fires
+      // once and then leaves the page writable, so a watch that is armed only once catches
+      // only the FIRST write of a multi-write upload -- we decode the partially-written
+      // texture and never hear about the rest of it. MirrorSnapshot re-arms as a side effect
+      // of re-copying; the live-read path has no copy, so it needs this.
+      if ((p >> 6) < watch_armed_.size()) {
+        watch_armed_[p >> 6] &= ~bit;
+      }
     }
   }
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track) {
+    // Span of the tracked texture, so writes to ANY of its pages show up -- the base page
+    // alone tells us nothing about a texture that covers 32 of them.
+    uint32_t span = 4096;
+    if (auto* tex_map = static_cast<TextureMap*>(textures_)) {
+      for (auto [key, e] : *tex_map) {
+        if (e.watch_addr == track && e.watch_size) {
+          span = e.watch_size;
+          break;
+        }
+      }
+    }
+    for (const auto& [addr, len] : writes) {
+      if (addr < track + span && addr + len > track) {
+        REXGPU_INFO("nx1_d3d9: TRACK {:08X} WRITE frame={} range={:08X}+{} (+{} into a {} byte "
+                    "texture)",
+                    track, frame_, addr, len, addr > track ? addr - track : 0, span);
+      }
+    }
+  }
+
   auto* textures = static_cast<TextureMap*>(textures_);
   if (!textures) return;
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track) {
+    bool claimed = false;
+    for (auto [key, e] : *textures) {
+      if (e.watch_addr == track && e.watch_size) {
+        claimed = true;
+        break;
+      }
+    }
+    if (!claimed) {
+      for (const auto& [addr, len] : writes) {
+        if (addr <= track && track < addr + len) {
+          REXGPU_INFO("nx1_d3d9: TRACK {:08X} WRITE with NO cache entry watching it (frame {})",
+                      track, frame_);
+          break;
+        }
+      }
+    }
+  }
   for (auto [key, entry] : *textures) {
     if (!entry.watch_size) continue;
     const uint32_t a0 = entry.watch_addr;
     const uint32_t a1 = entry.watch_addr + entry.watch_size;
     if (entry.committed) continue;  // settled texture: frozen against the pool's later garbage
     for (const auto& [addr, len] : writes) {
-      if (addr < a1 && addr + len > a0) { entry.dirty = true; break; }
+      if (addr < a1 && addr + len > a0) {
+        entry.dirty = true;
+        if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+            track && entry.watch_addr == track) {
+          REXGPU_INFO("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} (watch {}+{})",
+                      track, frame_, addr, len, entry.watch_addr, entry.watch_size);
+        }
+        break;
+      }
     }
   }
 }
 
+void ResourceTracker::ReportEffectCandidates() {
+  std::vector<NewTex> v = baseline_new_;
+  std::sort(v.begin(), v.end(),
+            [](const NewTex& a, const NewTex& b) { return a.episodes > b.episodes; });
+  REXGPU_INFO("nx1_d3d9: EFFECTS {} newcomers since baseline, ranked by appearances",
+              v.size());
+  for (size_t i = 0; i < v.size() && i < 25; ++i) {
+    const auto& n = v[i];
+    REXGPU_INFO("nx1_d3d9: EFFECTS {:08X} {}x{} fmt={} sampler={} appearances={} frames_bound={}",
+                n.addr, n.width, n.height, n.format, n.sampler, n.episodes, n.frames_bound);
+  }
+}
+
+void ResourceTracker::LearnTextureBaseline(uint32_t frames) {
+  baseline_frames_ = frames;
+  baseline_ready_ = false;
+  baseline_addrs_.clear();
+  baseline_new_.clear();
+  REXGPU_INFO("nx1_d3d9: NEWTEX learning baseline over {} frames -- keep the effect OFF screen",
+              frames);
+}
+
 void ResourceTracker::AdvanceFrame() {
+  if (baseline_frames_ > 0 && --baseline_frames_ == 0) {
+    std::sort(baseline_addrs_.begin(), baseline_addrs_.end());
+    baseline_addrs_.erase(std::unique(baseline_addrs_.begin(), baseline_addrs_.end()),
+                          baseline_addrs_.end());
+    baseline_ready_ = true;
+    REXGPU_INFO("nx1_d3d9: NEWTEX baseline is {} addresses -- now reporting newcomers",
+                baseline_addrs_.size());
+  }
   ++frame_;
   DrainMemoryWrites();
 
@@ -2326,10 +2431,59 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // A texture whose address is a resolve destination is served by the rendered
   // image, not by untiling stale memory. This is what makes render-to-texture
   // (scene compositing, post effects) work.
+  // Trace every bind of the tracked address BEFORE any early-out, so a texture served from
+  // the resolve map -- which returns below, ahead of the cache and ahead of the paint -- is
+  // still visible. Without this, a render-target-backed texture looks like it is never bound.
+  if (t.valid && t.base_address) {
+    if (baseline_frames_ > 0) {
+      baseline_addrs_.push_back(t.base_address);
+    } else if (baseline_ready_ && !std::binary_search(baseline_addrs_.begin(),
+                                                      baseline_addrs_.end(), t.base_address)) {
+      bool found = false;
+      for (auto& n : baseline_new_) {
+        if (n.addr == t.base_address) {
+          if (n.last_frame + 2 < frame_) {
+            ++n.episodes;  // was unbound for a while, so this is a fresh appearance
+          }
+          if (n.last_frame != frame_) {
+            ++n.frames_bound;
+          }
+          n.last_frame = frame_;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        baseline_new_.push_back({t.base_address, t.width, t.height, t.format, sampler, frame_,
+                                 frame_, false, 1, 1});
+      }
+    }
+  }
+
+  const uint32_t dbg_track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+  if (dbg_track && t.base_address == dbg_track) {
+    static uint64_t last_bind_frame = 0;
+    if (frame_ != last_bind_frame) {
+      last_bind_frame = frame_;
+      REXGPU_INFO("nx1_d3d9: TRACK {:08X} BIND frame={} sampler={} valid={} {}x{} fmt={} dim={}",
+                  t.base_address, frame_, sampler, t.valid ? 1 : 0, t.width, t.height, t.format,
+                  t.dimension);
+    }
+  }
+
   if (resolves_) {
     auto* rmap = static_cast<ResolveMap*>(resolves_);
     if (auto it = rmap->find(PhysicalAddress(t.base_address));
         it != rmap->end() && it->second.tex) {
+      if (dbg_track && t.base_address == dbg_track) {
+        static uint64_t last_resolve_frame = 0;
+        if (frame_ != last_resolve_frame) {
+          last_resolve_frame = frame_;
+          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={} ({}x{}) -- this is "
+                      "a render target, not a CPU-decoded texture",
+                      t.base_address, frame_, it->second.width, it->second.height);
+        }
+      }
       return it->second.tex;
     }
   }
@@ -2376,6 +2530,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   const uint64_t key = MixKey(t.base_address, sampler);
   auto* map = static_cast<TextureMap*>(textures_);
   auto& entry = (*map)[key];
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+      track && t.base_address == track && entry.tex && entry.layout_key != layout_key) {
+    REXGPU_INFO("nx1_d3d9: TRACK {:08X} LAYOUT CHANGED frame={} sampler={} {}x{} fmt={} -- the "
+                "pool handed this address to a different texture",
+                t.base_address, frame_, sampler, t.width, height, t.format);
+  }
   // Count clean frames toward commit (once per new frame for a stable, already-decoded texture).
   // After kCommitFrames it is settled: DrainMemoryWrites stops honouring writes to it, so the
   // streaming pool's later garbage-recycle can't re-poison the decode (the confetti-on-backup).
@@ -2403,6 +2563,24 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // what stops the never-streamed ones re-decoding every frame in perpetuity.
   if (entry.tex && entry.layout_key == layout_key && (!entry.dirty || frame_ < entry.retry_frame)) {
     entry.last_frame = frame_;
+    // Painting the tracked address white answers "which surface is this texture?" without a
+    // capture tool: set the cvar, look for the white thing.
+    if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+        track && t.base_address == track) {
+      // Why a bind took the cache early-out. If this reports dirty=1 the entry was invalidated
+      // and we served the stale decode anyway, which would be the bug outright.
+      static uint64_t last_logged = 0;
+      if (frame_ != last_logged) {
+        last_logged = frame_;
+        REXGPU_INFO("nx1_d3d9: TRACK {:08X} CACHED frame={} dirty={} committed={} retry_frame={} "
+                    "layout_ok=1 good_frames={}",
+                    t.base_address, frame_, entry.dirty ? 1 : 0, entry.committed ? 1 : 0,
+                    entry.retry_frame, entry.good_frames);
+      }
+      if (white_) {
+        return white_;
+      }
+    }
     const uint32_t dbg_mip = REXCVAR_GET(nx1_d3d9_dbg_mipsrc);
     if (dbg_mip && white_ && entry.mip_source == (dbg_mip == 3 ? 0 : dbg_mip)) {
       return white_;
@@ -2669,6 +2847,104 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     }
   }
 
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+      track && t.base_address == track) {
+    // Whole-texture coverage, per 4 KB page. A texture can span 32 pages while the write
+    // notification covers one, so "the first page has data" says nothing about the rest --
+    // and a half-populated source is exactly what decodes to structured garbage.
+    uint64_t nonzero = 0;
+    uint32_t pages_total = 0, pages_empty = 0;
+    if (src) {
+      for (size_t off = 0; off < guest_bytes; off += 4096) {
+        const size_t end = (off + 4096 < guest_bytes) ? off + 4096 : guest_bytes;
+        uint32_t page_nz = 0;
+        for (size_t i = off; i < end; ++i) {
+          page_nz += src[i] != 0 ? 1 : 0;
+        }
+        nonzero += page_nz;
+        ++pages_total;
+        pages_empty += page_nz == 0 ? 1 : 0;
+      }
+    }
+    REXGPU_INFO("nx1_d3d9: TRACK {:08X} DECODE frame={} fmt={} {}x{} bytes={} nonzero={}/{} "
+                "emptypages={}/{} dirty={} committed={}",
+                t.base_address, frame_, t.format, t.width, height, guest_bytes, nonzero,
+                guest_bytes, pages_empty, pages_total, entry.dirty ? 1 : 0,
+                entry.committed ? 1 : 0);
+
+    // If the declared range is empty, the texels are not missing -- the reference backend
+    // renders this texture, so they exist. Sweep outwards to find where the data actually
+    // lives: a hit at a fixed offset means our base address is wrong, and nothing within a
+    // megabyte means we are looking in the wrong region entirely.
+    if (nonzero == 0) {
+      const uint8_t* window = TranslatePhysical(t.base_address);
+      if (window) {
+        constexpr int32_t kSweep = 1 << 20;  // +/- 1 MB
+        int32_t first_hit = INT32_MIN;
+        for (int32_t off = -kSweep; off < kSweep; off += 4096) {
+          const int64_t abs_addr = int64_t(t.base_address) + off;
+          if (abs_addr < 0 || uint64_t(abs_addr) + 4096 > (uint64_t(kMirrorPages) << 12)) {
+            continue;
+          }
+          const uint8_t* page = window + off;
+          uint32_t nz = 0;
+          for (uint32_t i = 0; i < 4096 && nz < 64; ++i) {
+            nz += page[i] != 0 ? 1 : 0;
+          }
+          if (nz >= 64) {
+            first_hit = off;
+            break;
+          }
+        }
+        if (first_hit == INT32_MIN) {
+          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SWEEP no populated page within +/-1 MB",
+                      t.base_address);
+        } else {
+          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SWEEP nearest populated page at offset {} "
+                      "({:08X})",
+                      t.base_address, first_hit, uint32_t(int64_t(t.base_address) + first_hit));
+        }
+      }
+    }
+  }
+
+  if (const uint32_t tex_dump_left = REXCVAR_GET(nx1_d3d9_dbg_texdump); tex_dump_left && dst) {
+    REXCVAR_SET(nx1_d3d9_dbg_texdump, tex_dump_left - 1);
+    // The raw guest bytes first: all-zero says the data never arrived, anything else says it
+    // is present and we are decoding it wrong. That single distinction is what separates a
+    // content gap from a renderer bug, and it cannot be read off the screen.
+    char hex[3 * 32 + 1] = {};
+    if (src) {
+      for (uint32_t i = 0; i < 32; ++i) {
+        std::snprintf(hex + i * 3, 4, "%02X ", src[i]);
+      }
+    }
+    REXGPU_INFO("nx1_d3d9: TEXDUMP addr={:08X} fmt={} {}x{} dim={} depth={} pitch={} tiled={} "
+                "endian={} swizzle=0x{:03X} mips={} packed={} host=0x{:08X} src[0..31]= {}",
+                t.base_address, t.format, t.width, height, t.dimension, t.depth, t.pitch_pixels,
+                t.tiled ? 1 : 0, t.endian, t.swizzle, t.mip_max_level, t.packed_mips ? 1 : 0,
+                uint32_t(host.d3d), src ? hex : "<null>");
+
+    std::vector<Rgba8> img;
+    if (IsBlockCompressed(host.d3d)) {
+      DecodeBcImage(host.d3d, mip_source, dst_row_bytes, t.width, height, img);
+    } else if (host.d3d == D3DFMT_A8R8G8B8) {
+      img.resize(size_t(t.width) * height);
+      for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* r = dst + size_t(y) * dst_row_bytes;
+        for (uint32_t x = 0; x < t.width; ++x) {
+          img[size_t(y) * t.width + x] = {r[x * 4 + 2], r[x * 4 + 1], r[x * 4 + 0], r[x * 4 + 3]};
+        }
+      }
+    }
+    if (!img.empty()) {
+      char path[256];
+      std::snprintf(path, sizeof(path), "texdump/tex_%08X_%ux%u_f%u.bmp", t.base_address, t.width,
+                    height, t.format);
+      DumpRgbaBmp(path, img, t.width, height);
+    }
+  }
+
   // Filter the chain down from the level 0 we just wrote, while it is still mapped: decode it
   // once, then halve-and-re-encode into each level below. UpdateTexture carries the whole
   // staging chain across, so the levels have to be in place before the unlock.
@@ -2795,6 +3071,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // it. The mirror itself armed the write-watch when it captured these pages in MirrorSnapshot.
   entry.watch_addr = t.base_address;
   entry.watch_size = uint32_t(guest_bytes);
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+      track && t.base_address == track && white_) {
+    return white_;
+  }
   return entry.tex;
 }
 
@@ -3284,6 +3564,11 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   }
 
   auto* map = static_cast<ResolveMap*>(resolves_);
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+      track && PhysicalAddress(dest_address) == PhysicalAddress(track)) {
+    REXGPU_INFO("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
+                height);
+  }
   auto& entry = (*map)[PhysicalAddress(dest_address)];
   if (entry.tex && (!entry.owned || entry.width != width || entry.height != height)) {
     if (entry.owned) {
@@ -3406,6 +3691,11 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
     return;
   }
   auto* map = static_cast<ResolveMap*>(resolves_);
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
+      track && PhysicalAddress(dest_address) == PhysicalAddress(track)) {
+    REXGPU_INFO("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
+                height);
+  }
   auto& entry = (*map)[PhysicalAddress(dest_address)];
 
   if (entry.tex && (!entry.owned || entry.width != width || entry.height != height)) {

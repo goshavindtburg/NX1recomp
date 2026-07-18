@@ -275,6 +275,38 @@ class ResourceTracker {
   uint8_t* mirror_ = nullptr;         ///< 512 MB VirtualAlloc, lazily committed
   const uint8_t* phys_base_ = nullptr;///< host pointer for guest physical 0
   std::vector<uint64_t> mirror_valid_;///< 1 bit per 4 KB page: captured and held
+ public:
+  /// Learn every texture address bound over the next `frames` frames, then report each NEW
+  /// address as it first appears. A single frame binds ~1000 textures, so a two-frame diff is
+  /// almost all noise from geometry entering view; learning a baseline while the effect is
+  /// absent and then watching for newcomers isolates it. Stand still, learn, then fire.
+  void LearnTextureBaseline(uint32_t frames);
+
+  /// Log newcomers ranked by episode count -- the repeat-appearance effects first.
+  void ReportEffectCandidates();
+
+ private:
+  uint32_t baseline_frames_ = 0;   ///< frames left to learn
+  bool baseline_ready_ = false;    ///< learning finished; report newcomers
+  std::vector<uint32_t> baseline_addrs_;  ///< sorted, for binary search on the bind path
+  /// Newcomers, with the frame span over which they stayed bound. An effect sprite is bound
+  /// for a frame or two and vanishes; world geometry persists. Reporting the SHORT-LIVED ones
+  /// separates a muzzle flash from the hundreds of materials that scroll into view when the
+  /// camera moves, which is what made the raw newcomer list unreadable.
+  struct NewTex {
+    uint32_t addr;
+    uint32_t width, height, format, sampler;
+    uint64_t first_frame, last_frame;
+    bool reported;
+    /// How many separate times this texture went from unbound to bound. THE discriminator:
+    /// fire twelve shots and the muzzle flash has twelve short episodes, while a world
+    /// material that scrolled into view has one long one. Lifetime alone cannot tell them
+    /// apart, because streaming and LOD swaps produce plenty of brief world textures too.
+    uint32_t episodes;
+    uint64_t frames_bound;
+  };
+  std::vector<NewTex> baseline_new_;
+
   /// 1 bit per 4 KB page: the guest-write callback is enabled for it. Tracked separately from
   /// mirror_valid_ because the live-read path needs the watch WITHOUT the snapshot -- the
   /// watch used to be armed only as a side effect of capturing a page into the mirror, so

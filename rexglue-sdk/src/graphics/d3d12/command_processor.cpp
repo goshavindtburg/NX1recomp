@@ -138,6 +138,11 @@ REXCVAR_DEFINE_BOOL(nx1_native_shader_cache_log, false, "GPU/D3D12",
                     "Log NX1 native shader cache hits and fallbacks")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(nx1_skip_reference_raster, true, "GPU",
+                    "Skip the reference backend's raster when the native renderer "
+                    "owns output (off = let it render, so render-to-texture "
+                    "content still reaches guest memory)");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -3789,7 +3794,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   //   - MEMEXPORT draws fall through and execute: their shaders write guest memory the CPU reads
   //   - packet execution, registers, fences, interrupts and swap bookkeeping are untouched
   //     (this is inside IssueDraw only), so the guest never notices and cannot deadlock
-  if (gpu_disabled_.load(std::memory_order_relaxed) && !memexport_used) {
+  // Cvar-gated because this skip is not as side-effect-free as it looks: a draw that renders
+  // INTO a texture (rendered to EDRAM, then resolved out to guest memory) leaves that memory
+  // empty when the raster is skipped, and the native renderer then decodes zeros. Turn it off
+  // to test whether a missing texture is really a skipped render-to-texture.
+  if (gpu_disabled_.load(std::memory_order_relaxed) && !memexport_used &&
+      REXCVAR_GET(nx1_skip_reference_raster)) {
     static std::atomic<uint64_t> nx1_skipped{0};
     const uint64_t n = ++nx1_skipped;
     if ((n % 100000) == 1) {
