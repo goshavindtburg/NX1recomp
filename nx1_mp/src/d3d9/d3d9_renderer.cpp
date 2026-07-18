@@ -1663,6 +1663,25 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
                       be, sb, db, sep, cw, af, blend.enabled ? 1 : 0,
                       uint32_t(HostBlendFactor(blend.color_src)),
                       uint32_t(HostBlendFactor(blend.color_dst)), d.color_write_mask);
+          // Name the textures this draw samples. With the blend proven correct, an opaque result
+          // under ONE->INVSRCALPHA means the shader emitted alpha 1.0, and the usual source of a
+          // wrong alpha is the texture's alpha channel decoding opaque -- the same family as the
+          // BC broadcast-swizzle bug that made smoke sprites invisible. The address is what the
+          // existing texture tooling keys on (nx1_d3d9_dbg_track_addr, TRACK/DECODE logging), so
+          // printing it here is what turns "the shader is wrong" into something inspectable.
+          for (uint32_t s = 0; s < 16; ++s) {
+            if (!(active_sampler_mask_ & (1u << s))) {
+              continue;
+            }
+            const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(s));
+            if (!t.valid || !t.base_address) {
+              continue;
+            }
+            REXGPU_INFO("nx1_d3d9: BLENDVERIFY   sampler{} tex={:08X} {}x{} fmt={} swizzle={:#05X} "
+                        "gamma={} miplevels={}..{}",
+                        s, t.base_address, t.width, t.height, t.format, t.swizzle,
+                        t.gamma ? 1 : 0, t.mip_min_level, t.mip_max_level);
+          }
         }
       } else {
         SetRenderStateCached(D3DRS_COLORWRITEENABLE, 0);
