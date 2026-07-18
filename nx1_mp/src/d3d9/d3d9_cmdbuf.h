@@ -313,7 +313,14 @@ class CommandBuffer {
     const size_t n = size_t(count) * 4;
     // A single append is at most kMaxHostConstants*4 = 1024 floats, far below a chunk, so a
     // request never straddles two chunks.
-    if (chunks_.empty() || chunk_used_ + n > kChunkFloats) {
+    // The chunk_index_ == -1 test is NOT redundant with the size test, and dropping it crashed
+    // the worker. BeginFrame rewinds to (index = -1, used = kChunkFloats) and relied on the size
+    // test to step onto chunk 0 -- but a frame whose FIRST append has n == 0 evaluates
+    // kChunkFloats + 0 > kChunkFloats as false, never advances, and indexes chunks_[-1]. The
+    // memcpy is guarded on n so nothing faults there; instead the returned offset is
+    // astronomical and the worker dies later inside constants(). n == 0 is common -- it is the
+    // zero-register constant window of a shader whose whole window was optimised out.
+    if (chunk_index_ == size_t(-1) || chunk_used_ + n > kChunkFloats) {
       if (++chunk_index_ >= chunks_.size()) {
         chunks_.emplace_back(new float[kChunkFloats]);
       }
