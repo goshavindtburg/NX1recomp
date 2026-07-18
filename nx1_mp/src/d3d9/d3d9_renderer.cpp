@@ -1677,9 +1677,19 @@ void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, Reco
   // pointer arithmetic on it silently reads the wrong page. This exact line rendered the whole
   // game black once already -- it was latent from the moment it was written, because nothing
   // consumed the recorded constants until the texture path started reading them.
-  std::memcpy(d.fetch_constants,
-              GuestPointer(base, guest_device + guest_device::kFetchConstants),
-              sizeof(d.fetch_constants));
+  //
+  // TWO REGIONS, not the whole array. Only the head (16 texture slots) and the tail (the vertex
+  // streams, aliased as 2-dword slots 92..95) are ever read; the 368 bytes between are dead
+  // weight. At ~4900 draws that is 3.75 MB/frame copied instead of 2.0 -- and this copy sits on
+  // the guest thread, which PROF/bound shows is the longer pole while the worker idles ~3.4
+  // ms/frame. Trimming it is the one part of that thread's time we actually control.
+  const uint8_t* fetch = GuestPointer(base, guest_device + guest_device::kFetchConstants);
+  static constexpr size_t kTextureBytes = 16 * guest_device::kFetchConstantStride;  // slots 0..15
+  static constexpr size_t kStreamSlot0 = size_t(VertexFetchSlotForStream(kMaxHostStreams - 1)) * 8;
+  static constexpr size_t kStreamBytes = sizeof(d.fetch_constants) - kStreamSlot0;
+  std::memcpy(d.fetch_constants, fetch, kTextureBytes);
+  std::memcpy(reinterpret_cast<uint8_t*>(d.fetch_constants) + kStreamSlot0, fetch + kStreamSlot0,
+              kStreamBytes);
 
   d.vs_object = BoundVertexShader(base, guest_device);
   d.ps_object = BoundPixelShader(base, guest_device);
