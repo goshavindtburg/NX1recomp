@@ -35,8 +35,9 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
 
 // TEMP PROFILING: accumulate per-phase draw cost and report it once a second.
 REXCVAR_DEFINE_BOOL(nx1_d3d9_record, false, "GPU",
-                    "Record draws into the deferred-translation command buffer (step 1: "
-                    "records alongside the live path, nothing consumes it yet)");
+                    "Report the deferred-translation recorder's per-frame cost (PROF/record). "
+                    "Recording itself is unconditional as of step 2 -- every draw executes from "
+                    "its record -- so this gates the log line only");
 
 REXCVAR_DEFINE_BOOL(nx1_d3d9_skip_clean_constants, true, "GPU",
                     "Skip the shader constant upload when the guest's dirty mask, the PM4 "
@@ -393,15 +394,16 @@ void Renderer::Present() {
   // Start every frame with a real bind, so a skip chain always descends from a draw that
   // refreshed the cache entries' last_frame within this frame.
   last_sig_valid_ = false;
-  if (REXCVAR_GET(nx1_d3d9_record)) {
-    if (REXCVAR_GET(nx1_d3d9_profile) && !cmdbuf_.draws().empty()) {
-      REXGPU_INFO("nx1_d3d9: PROF/record {} draws, {} constant deltas, {:.2f} MB, {:.2f} ms",
-                  cmdbuf_.draws().size(), cmdbuf_.delta_count(),
-                  double(cmdbuf_.captured_bytes()) / (1024.0 * 1024.0), prof_record_ns_ / 1e6);
-    }
-    prof_record_ns_ = 0;
-    cmdbuf_.BeginFrame();
+  if (REXCVAR_GET(nx1_d3d9_record) && REXCVAR_GET(nx1_d3d9_profile) && !cmdbuf_.draws().empty()) {
+    REXGPU_INFO("nx1_d3d9: PROF/record {} draws, {} constant deltas, {:.2f} MB, {:.2f} ms",
+                cmdbuf_.draws().size(), cmdbuf_.delta_count(),
+                double(cmdbuf_.captured_bytes()) / (1024.0 * 1024.0), prof_record_ns_ / 1e6);
   }
+  prof_record_ns_ = 0;
+  // UNCONDITIONAL. Every draw now executes from its record, so the buffer fills whatever the
+  // cvar says; leaving the reset behind nx1_d3d9_record would grow it without bound for the
+  // whole session. The cvar gates the report and nothing else.
+  cmdbuf_.BeginFrame();
 
   const bool prof_on = REXCVAR_GET(nx1_d3d9_profile);
   ResourceTracker::Get().prof_enabled_ = prof_on;
@@ -848,13 +850,13 @@ void Renderer::UploadVertexUniforms(const Sm3Shader& shader, uint32_t base_reg) 
   std::memcpy(last_vs_uniform_params_, params, sizeof(params));
 }
 
-void Renderer::ResolveViewport(const uint8_t* base, uint32_t guest_device) {
+void Renderer::ResolveViewport(const RecordedDraw& d) {
   // Replicates rex::graphics::GetHostViewportInfo for a real D3D9 host: produce
   // an integer host viewport plus the guest-clip -> host-clip NDC fold that the
   // translated vertex shaders apply. We cannot call GetHostViewportInfo directly
   // -- it reads a populated RegisterFile, which only exists when the (now
   // disabled) PM4 backend runs -- so it is reproduced here from the shadow regs.
-  const ViewportState v = ReadViewportState(base, guest_device);
+  const ViewportState& v = d.viewport;
   // Relative to the bound target, not the backbuffer -- the world renders into a
   // 1024x600 target and the shadow maps into 1024x2048 ones.
   const float max_x = float(current_rt_width_ ? current_rt_width_ : backbuffer_width_);
@@ -1004,11 +1006,12 @@ void Renderer::UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg,
   std::memcpy(last_ps_dims_, dims, sizeof(dims));
 }
 
-bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_device) {
+bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_device,
+                                       const RecordedDraw& d) {
   auto& cache = ShaderCache::Get();
 
-  const uint32_t vs_object = BoundVertexShader(base, guest_device);
-  const uint32_t ps_object = BoundPixelShader(base, guest_device);
+  const uint32_t vs_object = d.vs_object;
+  const uint32_t ps_object = d.ps_object;
   if (!vs_object) {
     return false;
   }
@@ -1027,7 +1030,11 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     if (sprof) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
   };
 
-  const uint32_t vs_pass = VertexShaderPass(base, vs_object, /*has_pixel_shader=*/ps_object != 0);
+  const uint32_t vs_pass = d.vs_pass;
+  // DEFERRED-GAP: ReadGuestUcode reads the shader object's microcode out of guest memory. Shader
+  // objects are allocated once and live for the frame, so a worker reading them late is very
+  // likely safe -- but "very likely" is what the vertex-range probe was for, and this has not
+  // had the same treatment. Measure before trusting it.
   const auto t_hash = smark();
   const uint64_t vs_hash =
       HashGuestUcode(ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, vs_pass));
@@ -1086,6 +1093,10 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   if (skip_vs_constants) {
     ++prof_const_skipped_vs_;
   } else {
+    // DEFERRED-GAP: reads the guest's live constant file. This is the one the recorder already
+    // has an answer for -- d.constant_delta indexes the groups the guest rewrote -- but the
+    // executor needs a running constant file to apply them into before this can switch over.
+    // That is the next increment; see ExecuteDraw.
     cache.UploadConstants(base, guest_device, *vs, /*pixel_stage=*/false);
     last_const_vs_ = vs;
   }
@@ -1116,7 +1127,7 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   //
   // Otherwise honour the guest's own mask: it masks colour off to write destination alpha
   // alone (see ReadColorWriteMask).
-  const uint32_t want_color_write = ps ? ReadColorWriteMask(base, guest_device) : 0;
+  const uint32_t want_color_write = ps ? d.color_write_mask : 0;
   if (want_color_write != bound_color_write_) {
     SetRenderStateCached(D3DRS_COLORWRITEENABLE, want_color_write);
     bound_color_write_ = want_color_write;
@@ -1139,9 +1150,13 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   return true;
 }
 
-bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t needed_vertices,
-                           uint32_t* vertex_count) {
+bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
+                           uint32_t needed_vertices, uint32_t* vertex_count) {
   auto& tracker = ResourceTracker::Get();
+  // DEFERRED-GAP: GetVertexLayout / GetShaderVertexLayout / GetVertexBuffer all read the fetch
+  // constants and the declaration out of guest memory. d.fetch_constants and
+  // d.vertex_declaration already carry both; these need overloads taking them.
+  (void)d;
   // NX1 binds no CVertexDeclaration; for bound-buffer draws derive the multi-stream
   // layout from the vertex shader's vfetch (stream0_stride=0 selects bound mode).
   const bool vprof = REXCVAR_GET(nx1_d3d9_profile);
@@ -1292,16 +1307,16 @@ void Renderer::SetRenderStateCached(D3DRENDERSTATETYPE state, uint32_t value) {
   device_->SetRenderState(state, value);
 }
 
-void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device) {
+void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   // Depth. NX1 renders reverse-Z, so the guest's stored zfunc is GREATER_EQUAL --
   // we read it rather than hardcoding, so a draw that flips the test still works.
-  const DepthState depth = ReadDepthState(base, guest_device);
+  const DepthState& depth = d.depth;
   SetRenderStateCached(D3DRS_ZENABLE, depth.test_enabled ? D3DZB_TRUE : D3DZB_FALSE);
   SetRenderStateCached(D3DRS_ZWRITEENABLE, depth.write_enabled ? TRUE : FALSE);
   SetRenderStateCached(D3DRS_ZFUNC, HostCompare(depth.compare_function));
 
   // Blend. Separate color/alpha factors, exactly as Xenos stores them.
-  const BlendState blend = ReadBlendState(base, guest_device);
+  const BlendState& blend = d.blend;
   SetRenderStateCached(D3DRS_ALPHABLENDENABLE, blend.enabled ? TRUE : FALSE);
   SetRenderStateCached(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
   SetRenderStateCached(D3DRS_SRCBLEND, HostBlendFactor(blend.color_src));
@@ -1313,7 +1328,7 @@ void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device) {
 
   // Cull. D3D9 folds the front-face winding into the cull direction (it has no
   // separate "front face" state), so resolve the Xenos (cull, winding) pair here.
-  const CullState cull = ReadCullState(base, guest_device);
+  const CullState& cull = d.cull;
   D3DCULL mode = D3DCULL_NONE;
   if (cull.cull_back) {
     mode = cull.front_is_cw ? D3DCULL_CCW : D3DCULL_CW;
@@ -1361,8 +1376,14 @@ void Renderer::InvalidateStateShadow() {
   last_sig_valid_ = false;
 }
 
-void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t surface_key) {
+void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
+                            uint64_t surface_key) {
   auto& tracker = ResourceTracker::Get();
+  // DEFERRED-GAP: the signature below and GetTexture both re-read the fetch constants out of
+  // guest memory, which d.fetch_constants already holds verbatim. Everything else this function
+  // needs (clamp modes, filters, gamma) is decoded from that same constant, so converting
+  // GetTexture to take a raw slot pointer closes the whole function at once.
+  (void)d;
   // A scene is ~5000 draws over 16 samplers, and consecutive draws overwhelmingly share
   // their textures and filters -- so shadow the sampler state and only touch D3D when it
   // actually changes. Issuing all of it unconditionally was 80k SetTexture and ~500k
@@ -1476,16 +1497,7 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
   }
 }
 
-void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
-                          uint32_t base_vertex_index, uint32_t start_index,
-                          uint32_t index_count) {
-  RecordedDraw& d = cmdbuf_.AddDraw();
-  d.prim_type = prim_type;
-  d.base_vertex_index = base_vertex_index;
-  d.start_index = start_index;
-  d.index_count = index_count;
-  d.indexed = true;
-
+void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, RecordedDraw& d) {
   // Every fetch constant, as one memcpy of RAW guest bytes. The 32 slots are contiguous, and
   // -- exactly as with the constant blocks -- byte-swapping here is what makes recording
   // expensive: 32 slots x 6 dwords of GuestRead32 is 192 swapped reads per draw, which at
@@ -1502,15 +1514,38 @@ void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t p
     d.stream_stride[stream] = StreamStride(base, guest_device, stream);
   }
 
+  // Stable per-surface identity for prefer-largest LOD substitution: a static world surface draws
+  // the same index-buffer range every frame (the index buffers plateau at a few hundred addresses),
+  // so (ib address, draw range) keys the surface across its near/far LOD swaps. Mix in a golden-ratio
+  // constant so start_index/index_count don't collide across nearby ranges.
+  d.index_buffer = ReadIndexBuffer(base, guest_device).base_address;
+  d.surface_key = uint64_t(d.index_buffer) ^ (uint64_t(d.start_index) * 0x9E3779B185EBCA87ull) ^
+                  (uint64_t(d.index_count) << 40) ^
+                  (uint64_t(d.base_vertex_index) * 0xD1B54A32D192ED03ull);
+
   d.viewport = ReadViewportState(base, guest_device);
   d.depth = ReadDepthState(base, guest_device);
   d.blend = ReadBlendState(base, guest_device);
   d.cull = ReadCullState(base, guest_device);
   d.alpha = ReadAlphaTestState(base, guest_device);
   d.color_write_mask = ReadColorWriteMask(base, guest_device);
+}
+
+void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
+                          uint32_t base_vertex_index, uint32_t start_index,
+                          uint32_t index_count) {
+  RecordedDraw& d = cmdbuf_.AddDraw();
+  d.prim_type = prim_type;
+  d.base_vertex_index = base_vertex_index;
+  d.start_index = start_index;
+  d.index_count = index_count;
+  d.indexed = true;
+  CaptureDrawState(base, guest_device, d);
 
   // Only the register groups the guest actually rewrote. guest_dirty_* were captured in the
-  // draw hook, before the guest's body flushed and zeroed them.
+  // draw hook, before the guest's body flushed and zeroed them. Only the buffered path records
+  // a delta: the UP paths build a scratch RecordedDraw on the stack and execute it immediately,
+  // so appending their constants to the frame's pool would be pure waste.
   d.constant_delta =
       cmdbuf_.RecordConstantDelta(base, guest_device, guest_dirty_vs_, guest_dirty_ps_);
 }
@@ -1590,15 +1625,24 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
     prof_last_prim_type_ = prim_type;
   }
 
-  // Record this draw. Step 1 of deferred translation: the recorder runs alongside the live
-  // path and nothing consumes it yet, so behaviour is unchanged -- but it lets the capture be
-  // validated against what the live path actually reads, which is where "we forgot to capture
-  // X" bugs live. Recording cost shows up as PROF/record.
-  if (REXCVAR_GET(nx1_d3d9_record)) {
-    const auto t_rec = std::chrono::steady_clock::now();
-    RecordDraw(base, guest_device, prim_type, base_vertex_index, start_index, index_count);
-    prof_record_ns_ += uint64_t((std::chrono::steady_clock::now() - t_rec).count());
-  }
+  // Record, then execute from the record. STEP 2 of deferred translation: still synchronous, so
+  // this buys no speed -- what it buys is that there is exactly ONE path. A "live" path reading
+  // guest memory alongside a "recorded" one is how a capture gap stays invisible until the day
+  // it becomes a race; here a missing field is a rendering bug immediately, on the guest thread,
+  // with nothing else in the picture. Recording cost shows up as PROF/record.
+  const auto t_rec = std::chrono::steady_clock::now();
+  RecordDraw(base, guest_device, prim_type, base_vertex_index, start_index, index_count);
+  prof_record_ns_ += uint64_t((std::chrono::steady_clock::now() - t_rec).count());
+
+  ExecuteDraw(base, guest_device, cmdbuf_.draws().back());
+}
+
+void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d) {
+  const D3DPRIMITIVETYPE host_prim = HostPrimitiveType(d.prim_type);
+  const uint32_t prim_count = HostPrimitiveCount(d.prim_type, d.index_count);
+  const uint32_t base_vertex_index = d.base_vertex_index;
+  const uint32_t start_index = d.start_index;
+  const uint32_t index_count = d.index_count;
 
   // TEMP PROFILING: per-phase frame cost. ~2000 draws/frame at ~19us each says the bottleneck
   // is our own per-draw work, not Xenia -- but which part is guesswork until measured.
@@ -1610,11 +1654,11 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   };
 
   auto t_vp = ptick();
-  ResolveViewport(base, guest_device);
+  ResolveViewport(d);
   padd(prof_viewport_ns_, t_vp);
 
   auto t_sh = ptick();
-  const bool shaders_ok = BindShadersAndConstants(base, guest_device);
+  const bool shaders_ok = BindShadersAndConstants(base, guest_device, d);
   padd(prof_shaders_ns_, t_sh);
   if (!shaders_ok) {
     return;
@@ -1623,6 +1667,12 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
   // Indices first: how far into the vertex buffer this draw actually reaches decides how
   // much of it we have to mirror. The guest's fetch constant would have us mirror the whole
   // pool the model happens to live in.
+  //
+  // DEFERRED-GAP: GetIndexBuffer / GetDrawMaxIndex read the index-buffer descriptor and scan the
+  // index data itself out of guest memory. d.index_buffer carries the descriptor's base address;
+  // the index DATA is bulk memory the worker is meant to read late, on the same stability
+  // argument as the vertex data -- but the probe only ever covered vertex ranges. Index ranges
+  // need the same measurement before this is trusted.
   auto t_ib = ptick();
   uint32_t index_size = 0;
   IDirect3DIndexBuffer9* ib = ResourceTracker::Get().GetIndexBuffer(base, guest_device, &index_size);
@@ -1637,7 +1687,7 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
 
   auto t_vb = ptick();
   uint32_t vertex_count = 0;
-  const bool streams_ok = BindStreams(base, guest_device, needed_vertices, &vertex_count);
+  const bool streams_ok = BindStreams(base, guest_device, d, needed_vertices, &vertex_count);
   padd(prof_streams_ns_, t_vb);
   if (!streams_ok) {
     return;
@@ -1655,20 +1705,12 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
     }
   }
   device_->SetIndices(ib);
-  // Stable per-surface identity for prefer-largest LOD substitution: a static world surface draws
-  // the same index-buffer range every frame (the index buffers plateau at a few hundred addresses),
-  // so (ib address, draw range) keys the surface across its near/far LOD swaps. Mix in a golden-ratio
-  // constant so start_index/index_count don't collide across nearby ranges.
-  const uint32_t ib_base = ReadIndexBuffer(base, guest_device).base_address;
-  const uint64_t surface_key =
-      uint64_t(ib_base) ^ (uint64_t(start_index) * 0x9E3779B185EBCA87ull) ^
-      (uint64_t(index_count) << 40) ^ (uint64_t(base_vertex_index) * 0xD1B54A32D192ED03ull);
   auto t_tex = ptick();
-  BindTextures(base, guest_device, surface_key);
+  BindTextures(base, guest_device, d, d.surface_key);
   padd(prof_textures_ns_, t_tex);
 
   auto t_rs = ptick();
-  ApplyRenderStates(base, guest_device);
+  ApplyRenderStates(d);
   padd(prof_states_ns_, t_rs);
 
   auto t_dr = ptick();
@@ -1713,18 +1755,28 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
     return;
   }
   ++draws_attempted_;
-  ResolveViewport(base, guest_device);
-  if (!BindShadersAndConstants(base, guest_device)) {
+  // Non-indexed draws are a handful a frame and are not deferred, so this record is a stack
+  // scratch rather than a command-buffer entry -- it exists so every path resolves its state
+  // through the same CaptureDrawState.
+  RecordedDraw d{};
+  d.prim_type = prim_type;
+  d.start_vertex = start_vertex;
+  d.vertex_count = vertex_count;
+  d.indexed = false;
+  CaptureDrawState(base, guest_device, d);
+
+  ResolveViewport(d);
+  if (!BindShadersAndConstants(base, guest_device, d)) {
     return;
   }
   // A non-indexed draw reads exactly [start_vertex, start_vertex + vertex_count), so its
   // reach into the (possibly pooled) buffer is known without consulting any indices.
   uint32_t stream_vertices = 0;
-  if (!BindStreams(base, guest_device, start_vertex + vertex_count, &stream_vertices)) {
+  if (!BindStreams(base, guest_device, d, start_vertex + vertex_count, &stream_vertices)) {
     return;
   }
-  BindTextures(base, guest_device);
-  ApplyRenderStates(base, guest_device);
+  BindTextures(base, guest_device, d);
+  ApplyRenderStates(d);
   device_->DrawPrimitive(host_prim, start_vertex, prim_count);
   ++draws_submitted_;
 }
@@ -1743,9 +1795,17 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
     return;
   }
   ++draws_attempted_;
-  ResolveViewport(base, guest_device);
+  // Stack scratch, not a command-buffer entry: a UP draw's vertex and index payloads live
+  // inline in guest memory and are copied into the D3D call itself, so it can never be deferred.
+  RecordedDraw d{};
+  d.prim_type = prim_type;
+  d.index_count = index_count;
+  d.vertex_count = num_vertices;
+  CaptureDrawState(base, guest_device, d);
 
-  if (!BindShadersAndConstants(base, guest_device)) {
+  ResolveViewport(d);
+
+  if (!BindShadersAndConstants(base, guest_device, d)) {
     return;
   }
 
@@ -1777,8 +1837,8 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
     return;
   }
 
-  BindTextures(base, guest_device);
-  ApplyRenderStates(base, guest_device);
+  BindTextures(base, guest_device, d);
+  ApplyRenderStates(d);
   const HRESULT hr = device_->DrawIndexedPrimitiveUP(
       host_prim, 0, num_vertices, prim_count, indices.data(),
       index_size == 4 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, verts.data(), host_stride);
@@ -1812,8 +1872,14 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
     }
     return;
   }
-  ResolveViewport(base, guest_device);
-  if (!BindShadersAndConstants(base, guest_device)) {
+  RecordedDraw d{};  // stack scratch -- see DrawIndexedUP
+  d.prim_type = prim_type;
+  d.vertex_count = vertex_count;
+  d.indexed = false;
+  CaptureDrawState(base, guest_device, d);
+
+  ResolveViewport(d);
+  if (!BindShadersAndConstants(base, guest_device, d)) {
     return;
   }
 
@@ -1836,8 +1902,8 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
     return;
   }
 
-  BindTextures(base, guest_device);
-  ApplyRenderStates(base, guest_device);
+  BindTextures(base, guest_device, d);
+  ApplyRenderStates(d);
   if (SUCCEEDED(device_->DrawPrimitiveUP(host_prim, prim_count, verts.data(), host_stride))) {
     ++draws_submitted_;
   }

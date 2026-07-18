@@ -119,22 +119,43 @@ class Renderer {
   void RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
                   uint32_t base_vertex_index, uint32_t start_index, uint32_t index_count);
 
+  /// Fill everything in `d` that does not come from the draw call's own arguments. Split out of
+  /// RecordDraw so the UP paths -- which execute inline from transient guest memory and never
+  /// enter the command buffer -- can build a scratch RecordedDraw on the stack and share one
+  /// definition of "what a draw's state is". `d`'s draw parameters must already be set:
+  /// surface_key is derived from them.
+  void CaptureDrawState(const uint8_t* base, uint32_t guest_device, RecordedDraw& d);
+
   /// Snapshot m_Pending.m_Mask[5] before the guest's draw body flushes and zeroes it. Must be
   /// called from the draw hook BEFORE __imp__, which is the only moment these bits are valid.
   void CaptureGuestDirtyMask(const uint8_t* base, uint32_t guest_device);
 
   /// Resolve the guest's bound shaders, bind their SM3 translations, and upload
   /// their constants. Returns false on a cache miss -- the draw must be skipped.
-  bool BindShadersAndConstants(const uint8_t* base, uint32_t guest_device);
+  bool BindShadersAndConstants(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d);
 
  private:
+  /// Translate and submit one recorded draw.
+  ///
+  /// STEP 2 of deferred translation. This runs SYNCHRONOUSLY on the guest thread for now --
+  /// DrawIndexed records the draw and immediately executes it -- so it buys no speed at all.
+  /// What it buys is a single path: there is no "live" variant reading guest memory alongside a
+  /// "recorded" one that might disagree, so a field missing from RecordedDraw shows up as a
+  /// rendering bug NOW, with the guest thread still parked and no threading in the picture.
+  ///
+  /// `base`/`guest_device` are still passed because the readers are being converted
+  /// incrementally; every remaining use is a capture gap and is marked DEFERRED-GAP. The step is
+  /// complete when none are left, and only then can this move to a worker.
+  void ExecuteDraw(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d);
+
   /// Mirror the guest's vertex streams and bind them plus a host vertex declaration.
   /// `needed_vertices` bounds how much of each stream is mirrored (0 = all of it); see
   /// ResourceTracker::GetVertexBuffer. `vertex_count` receives the shortest stream's length.
-  bool BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t needed_vertices,
-                   uint32_t* vertex_count);
+  bool BindStreams(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
+                   uint32_t needed_vertices, uint32_t* vertex_count);
   /// Untile + bind every bound texture and its sampler state.
-  void BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t surface_key = 0);
+  void BindTextures(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
+                    uint64_t surface_key = 0);
   /// The copy half of a resolve (EDRAM -> host texture). Caller holds render_mutex_.
   void ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
                    uint32_t dest_point);
@@ -145,11 +166,11 @@ class Renderer {
                   uint32_t clear_stencil);
 
   /// Translate the guest's depth/blend/cull GPU-register shadows to D3D9.
-  void ApplyRenderStates(const uint8_t* base, uint32_t guest_device);
+  void ApplyRenderStates(const RecordedDraw& d);
   /// Resolve the guest viewport into a host D3D9 viewport + the NDC scale/offset
   /// the translated vertex shaders fold in. Sets the D3D9 viewport as a side
   /// effect and stashes ndc_scale_/ndc_offset_ for UploadVertexUniforms.
-  void ResolveViewport(const uint8_t* base, uint32_t guest_device);
+  void ResolveViewport(const RecordedDraw& d);
   /// Upload the packed NDC/half-pixel params a vertex shader expects at c[base_reg].
   /// Skips registers in the shader's def mask (see Sm3Shader::def_mask).
   void UploadVertexUniforms(const Sm3Shader& shader, uint32_t base_reg);
