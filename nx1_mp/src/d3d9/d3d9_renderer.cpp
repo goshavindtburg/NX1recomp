@@ -32,7 +32,6 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
                     "starting the game.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-
 namespace nx1::d3d9 {
 
 bool IsEnabled() {
@@ -787,9 +786,12 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
       const uint64_t key = vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull);
       if (std::find(seen.begin(), seen.end(), key) == seen.end() && seen.size() < 32) {
         seen.push_back(key);
-        REXGPU_WARN("nx1_d3d9: shader cache miss: vs=0x{:016X} ({}) ps=0x{:016X} ({}) -- draw dropped",
+        // The RT size names what the dropped draw was producing (scene, shadow atlas, ...).
+        REXGPU_WARN("nx1_d3d9: shader cache miss: vs=0x{:016X} ({}) ps=0x{:016X} ({}) rt={}x{} "
+                    "-- draw dropped",
                     vs_hash, vs ? "ok" : "MISSING", ps_hash,
-                    !ps_object ? "none" : (ps ? "ok" : "MISSING"));
+                    !ps_object ? "none" : (ps ? "ok" : "MISSING"), current_rt_width_,
+                    current_rt_height_);
       }
     }
     return false;

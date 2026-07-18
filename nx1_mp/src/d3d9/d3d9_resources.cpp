@@ -36,6 +36,7 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
                     "leaves every minified surface aliasing (the coloured speckle).")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+
 #ifdef _WIN32
 
 namespace nx1::d3d9 {
@@ -227,7 +228,7 @@ enum : uint32_t {
 // RRRR fetch swizzle (replicate the one channel into all four) that we cannot
 // reproduce on a fixed-function D3D9 sampler, so we CPU-decode them to A8R8G8B8
 // with the value written into every channel -- then any shader swizzle reads it.
-enum class TexDecode { kNone, kDXT3A, kDXT5A, kColorSwizzle };
+enum class TexDecode { kNone, kDXT3A, kDXT5A, kDXN, kColorSwizzle };
 
 struct HostTextureFormat {
   D3DFORMAT d3d;
@@ -258,8 +259,13 @@ HostTextureFormat PickHostTextureFormat(uint32_t xenos_format) {
     case kTex_DXT4_5_AS_16_16_16_16:
       return {D3DFMT_DXT5, false, true};
     case kTex_DXN:  // BC5 / two-channel normal maps
-      return {D3DFORMAT(MAKEFOURCC('A', 'T', 'I', '2')), false, true, TexDecode::kNone,
-              /*opaque_block=*/true};
+      // NOT host ATI2: Xenos k_DXN's hardware fetch swizzle is RGGG -- (x, y, y, y), Y
+      // replicated into green, blue and ALPHA (rexglue-sdk d3d12 texture_cache host format
+      // table). The world's bump-lit shaders read normal maps as `.xw`, so host BC5's
+      // constant `.w = 1` silently corrupts the bump-basis weight that scales the primary
+      // (sun + baked shadow) lightmap on every lightmapped surface -- the flat world.
+      // Decode on the CPU to A8R8G8B8 laid out exactly as the hardware returns it.
+      return {D3DFMT_A8R8G8B8, false, true, TexDecode::kDXN};
     case kTex_DXT3A:  // single-channel explicit-alpha BC -> decode + replicate
       return {D3DFMT_A8R8G8B8, false, true, TexDecode::kDXT3A};
     case kTex_DXT5A:  // single-channel interpolated-alpha BC -> decode + replicate
@@ -795,6 +801,36 @@ void DecodeBc4Block(const uint8_t* blk, uint8_t out[16]) {
   uint64_t bits = 0;
   for (uint32_t i = 0; i < 6; ++i) bits |= uint64_t(blk[2 + i]) << (8 * i);
   for (uint32_t i = 0; i < 16; ++i) out[i] = pal[(bits >> (3 * i)) & 0x7];
+}
+
+/// Decode DXN (two BC4 planes, 16 bytes/block) to A8R8G8B8 with Xenos k_DXN fetch semantics:
+/// hardware swizzle RGGG -- (x, y, y, y). Memory layout per texel is [B][G][R][A] = [Y][Y][X][Y].
+void DecodeDXNToArgb(uint8_t* dst, uint32_t dst_pitch, const uint8_t* src, uint32_t blocks_wide,
+                     uint32_t blocks_high, uint32_t width, uint32_t height) {
+  for (uint32_t by = 0; by < blocks_high; ++by) {
+    for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
+      const uint8_t* blk = src + (size_t(by) * blocks_wide + bx) * 16;
+      uint8_t xs[16], ys[16];
+      DecodeBc4Block(blk, xs);
+      DecodeBc4Block(blk + 8, ys);
+      for (uint32_t py = 0; py < 4; ++py) {
+        const uint32_t y = by * 4 + py;
+        if (y >= height) break;
+        uint8_t* row = dst + size_t(y) * dst_pitch;
+        for (uint32_t px = 0; px < 4; ++px) {
+          const uint32_t x = bx * 4 + px;
+          if (x >= width) continue;
+          uint8_t* p = row + size_t(x) * 4;
+          const uint8_t xv = xs[py * 4 + px];
+          const uint8_t yv = ys[py * 4 + px];
+          p[0] = yv;
+          p[1] = yv;
+          p[2] = xv;
+          p[3] = yv;
+        }
+      }
+    }
+  }
 }
 
 /// Decode one 4x4 block of any of the four BC formats into RGBA. ATI2 carries two channels
@@ -2208,6 +2244,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
         for (uint32_t x = 0; x < t.width; ++x) sa += r[x * 4 + 3];
       }
       swizzle_all_zero = sa == 0;
+    } else if (host.decode == TexDecode::kDXN) {
+      // CPU-decode DXN normal maps with the hardware RGGG swizzle (see PickHostTextureFormat).
+      std::vector<uint8_t> scratch(size_t(extent.block_width) * extent.block_height * bpb);
+      DetileMip2D(scratch.data(), extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DecodeDXNToArgb(dst, uint32_t(locked.Pitch), scratch.data(), extent.block_width,
+                      extent.block_height, t.width, height);
     } else if (host.decode != TexDecode::kNone) {
       // CPU-decode single-channel BC-alpha: detile the compressed 8-byte blocks
       // into a linear scratch buffer, then expand each block to A8R8G8B8 (v,v,v,v).
