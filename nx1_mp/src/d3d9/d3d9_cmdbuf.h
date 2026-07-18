@@ -197,6 +197,63 @@ struct RecordedDraw {
   uint64_t surface_key = 0;
 };
 
+/// What kind of GPU command a RecordedCommand is.
+///
+/// Draws are not the only thing that has to be ordered. A resolve that runs before the draws it
+/// captures produces a correct-but-EMPTY surface, and a render-target bind that lands mid-batch
+/// sends a pass to the wrong place -- the shadow cascades and the final composite both depend on
+/// this sequencing. So every one of these shares a single ordered list, and the worker is the only
+/// thing that executes any of them.
+enum class CommandKind : uint32_t {
+  kDraw,
+  kClear,
+  kResolve,
+  kSetRenderTarget,
+  kSetDepthStencil,
+};
+
+/// One ordered GPU command. Draws live in their own array (RecordedDraw is ~1 KB, far too big to
+/// inline into a struct a clear also uses) and are referenced by index; everything else carries
+/// its own small payload here.
+///
+/// Payloads hold RESOLVED values, not guest addresses, wherever the source is transient: a clear's
+/// colour arrives as a guest __vector4 and its rect as a guest _D3DRECT, both typically on the
+/// caller's stack, so reading them late would be reading whatever the guest has since pushed.
+struct RecordedCommand {
+  CommandKind kind = CommandKind::kDraw;
+  /// kDraw: index into draws().
+  uint32_t draw_index = 0;
+
+  // --- kClear --------------------------------------------------------------------------
+  /// Xenos clear bits, NOT desktop D3DCLEAR_* -- the mapping happens at execute time because it
+  /// also depends on whether a depth-stencil is bound, which an earlier command may change.
+  uint32_t clear_flags = 0;
+  bool has_rect = false;
+  /// The guest supplied no colour vector, which suppresses D3DCLEAR_TARGET independently of the
+  /// flag bits.
+  bool has_color = false;
+  int32_t rect[4] = {};
+  float clear_color[4] = {};  ///< r, g, b, a as the guest stored them
+  float clear_z = 0.0f;
+  uint32_t clear_stencil = 0;
+
+  // --- kResolve ------------------------------------------------------------------------
+  /// DEFERRED-GAP: these are still guest ADDRESSES (src rect, dest point, clear colour), read at
+  /// execute time. Safe while execution is synchronous. Before the worker lands they need the
+  /// same treatment the clear payload got above -- resolve to values at record time.
+  uint32_t dest_texture = 0;
+  uint32_t src_rect = 0;
+  uint32_t dest_point = 0;
+  uint32_t resolve_flags = 0;
+  uint32_t resolve_clear_color = 0;
+  float resolve_clear_z = 0.0f;
+  uint32_t resolve_clear_stencil = 0;
+
+  // --- kSetRenderTarget / kSetDepthStencil ---------------------------------------------
+  uint32_t rt_index = 0;
+  uint32_t surface = 0;
+};
+
 /// A frame's worth of recorded draws plus the constant blocks they reference.
 ///
 /// Deliberately owns its storage and is reused frame to frame: at 5000 draws this is a few MB,
@@ -224,6 +281,7 @@ class CommandBuffer {
 
   void BeginFrame() {
     draws_.clear();
+    commands_.clear();
     deltas_.clear();
     delta_pool_.clear();
     const_pool_.clear();
@@ -233,8 +291,19 @@ class CommandBuffer {
 
   RecordedDraw& AddDraw() {
     draws_.emplace_back();
+    RecordedCommand& c = AddCommand(CommandKind::kDraw);
+    c.draw_index = uint32_t(draws_.size() - 1);
     return draws_.back();
   }
+
+  RecordedCommand& AddCommand(CommandKind kind) {
+    commands_.emplace_back();
+    commands_.back().kind = kind;
+    return commands_.back();
+  }
+
+  const std::vector<RecordedCommand>& commands() const { return commands_; }
+  RecordedDraw& draw(uint32_t index) { return draws_[index]; }
 
   /// Append a delta for whatever the guest just rewrote, or reuse the previous one when the
   /// masks are clear. `vs_mask`/`ps_mask` come from the draw hook, captured before the guest's
@@ -256,6 +325,7 @@ class CommandBuffer {
 
  private:
   std::vector<RecordedDraw> draws_;
+  std::vector<RecordedCommand> commands_;
   std::vector<ConstantDelta> deltas_;
   std::vector<uint8_t> delta_pool_;
   std::vector<float> const_pool_;

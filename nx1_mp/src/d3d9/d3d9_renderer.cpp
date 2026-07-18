@@ -554,9 +554,35 @@ void Renderer::Clear(const uint8_t* base, uint32_t flags, uint32_t rect_addr, ui
   if (shutting_down_.load(std::memory_order_acquire) || !device_) {
     return;
   }
+  // Record, then execute. The guest hands the clear colour as a __vector4 of floats and an
+  // optional _D3DRECT, both typically on the caller's stack -- so they are resolved to VALUES
+  // here rather than deferred as addresses. What is deliberately NOT resolved here is the Xenos
+  // -> D3DCLEAR_* mapping: it depends on whether a depth-stencil is bound, and an earlier
+  // command in this same list may have changed that. See ExecuteClear.
+  RecordedCommand& c = cmdbuf_.AddCommand(CommandKind::kClear);
+  c.clear_flags = flags;
+  c.clear_z = z;
+  c.clear_stencil = stencil;
+  c.has_rect = rect_addr != 0;
+  if (rect_addr) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      c.rect[i] = int32_t(GuestRead32(base, rect_addr + i * 4));
+    }
+  }
+  if (color_addr) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      c.clear_color[i] = GuestReadF32(base, color_addr + i * 4);
+    }
+  }
+  c.has_color = color_addr != 0;
+  ExecuteClear(c);
+}
+
+void Renderer::ExecuteClear(const RecordedCommand& c) {
   // Xenos clear flags, not desktop ones: bits 0-3 select colour targets 0-3, 0x10 is
   // depth, 0x20 is stencil. We bind a single colour target, so any of the four means
   // "clear it". Passing the guest's bits to D3D9 unmasked would fail the whole call.
+  const uint32_t flags = c.clear_flags;
   DWORD host_flags = 0;
   if (flags & kClearTargetAny) {
     host_flags |= D3DCLEAR_TARGET;
@@ -575,34 +601,26 @@ void Renderer::Clear(const uint8_t* base, uint32_t flags, uint32_t rect_addr, ui
     return;
   }
 
-  // The guest hands the clear colour as a __vector4 of floats, and an optional _D3DRECT
+  // The recorded colour is the guest's __vector4 (r,g,b,a) and the rect its _D3DRECT
   // ({x1,y1,x2,y2}, the same layout D3D9 uses). Both the guest and D3D9 clip the clear
   // to the current viewport, so leave the viewport alone -- it is already the guest's.
   D3DCOLOR color = 0;
-  if ((host_flags & D3DCLEAR_TARGET) && color_addr) {
-    auto to8 = [](float c) { return uint32_t(std::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f); };
-    color = D3DCOLOR_ARGB(to8(GuestReadF32(base, color_addr + 12)),  // a
-                          to8(GuestReadF32(base, color_addr + 0)),   // r
-                          to8(GuestReadF32(base, color_addr + 4)),   // g
-                          to8(GuestReadF32(base, color_addr + 8)));  // b
+  if ((host_flags & D3DCLEAR_TARGET) && c.has_color) {
+    auto to8 = [](float v) { return uint32_t(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    color = D3DCOLOR_ARGB(to8(c.clear_color[3]), to8(c.clear_color[0]), to8(c.clear_color[1]),
+                          to8(c.clear_color[2]));
   }
-  D3DRECT rect = {};
-  if (rect_addr) {
-    rect.x1 = int32_t(GuestRead32(base, rect_addr + 0));
-    rect.y1 = int32_t(GuestRead32(base, rect_addr + 4));
-    rect.x2 = int32_t(GuestRead32(base, rect_addr + 8));
-    rect.y2 = int32_t(GuestRead32(base, rect_addr + 12));
-  }
+  const D3DRECT rect = {c.rect[0], c.rect[1], c.rect[2], c.rect[3]};
+  const DWORD rect_count = c.has_rect ? 1u : 0u;
+  const D3DRECT* rect_ptr = c.has_rect ? &rect : nullptr;
 
   // z is the guest's clear value verbatim -- under NX1's reverse-Z that is 0.0 for
   // the far plane, which is exactly what the D3DCMP_GREATEREQUAL depth test wants.
-  if (FAILED(device_->Clear(rect_addr ? 1 : 0, rect_addr ? &rect : nullptr, host_flags, color, z,
-                            stencil)) &&
+  if (FAILED(device_->Clear(rect_count, rect_ptr, host_flags, color, c.clear_z, c.clear_stencil)) &&
       (host_flags & D3DCLEAR_STENCIL)) {
     // A depth surface without stencil rejects D3DCLEAR_STENCIL, and D3D9 then fails the
     // whole call -- clearing nothing. Drop back rather than lose the depth clear.
-    device_->Clear(rect_addr ? 1 : 0, rect_addr ? &rect : nullptr,
-                   host_flags & ~D3DCLEAR_STENCIL, color, z, 0);
+    device_->Clear(rect_count, rect_ptr, host_flags & ~D3DCLEAR_STENCIL, color, c.clear_z, 0);
   }
 }
 

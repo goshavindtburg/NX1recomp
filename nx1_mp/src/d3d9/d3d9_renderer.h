@@ -154,6 +154,13 @@ class Renderer {
   /// complete when none are left, and only then can this move to a worker.
   void ExecuteDraw(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d);
 
+  /// Execute a recorded clear. Split from Clear() so the Xenos -> D3DCLEAR_* mapping happens in
+  /// COMMAND ORDER: it depends on whether a depth-stencil is bound, and a SetDepthStencil earlier
+  /// in the same list may have changed that. Deciding it at record time would bake in the state
+  /// as of recording rather than as of execution -- the exact class of error the ordered command
+  /// list exists to prevent.
+  void ExecuteClear(const RecordedCommand& c);
+
   /// Mirror the guest's vertex streams and bind them plus a host vertex declaration.
   /// `needed_vertices` bounds how much of each stream is mirrored (0 = all of it); see
   /// ResourceTracker::GetVertexBuffer. `vertex_count` receives the shortest stream's length.
