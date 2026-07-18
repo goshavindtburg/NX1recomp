@@ -447,6 +447,10 @@ void Renderer::Present() {
   // empty and this returns immediately.
   DrainWorker();
   cmdbuf_.BeginFrame();
+  // The shader memo is valid for ONE frame. Microcode is measured stable within a frame, not
+  // across frames, and a shader object the guest repurposes between frames must not be served
+  // its old translation. 512 slots is a cheap wipe against ~5000 draws of savings.
+  std::memset(shader_memo_, 0, sizeof(shader_memo_));
   queue_head_ = queue_tail_ = 0;
   // Latched once per frame rather than read per command, so the mode cannot change underneath a
   // half-submitted frame -- which would leave commands queued that nothing ever drains.
@@ -544,6 +548,16 @@ void Renderer::Present() {
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
+      // Report the hit rate, not just the timing. Several shadows in this renderer measured
+      // exactly zero benefit and were only caught by a counter -- a memo that never hits is pure
+      // added cost, and the phase timing alone cannot tell the difference.
+      {
+        const uint64_t total = prof_shader_memo_hits_ + prof_shader_memo_misses_;
+        REXGPU_INFO("nx1_d3d9: PROF/shmemo {:.1f}% hit of {:.0f} resolves/frame",
+                    total ? 100.0 * double(prof_shader_memo_hits_) / double(total) : 0.0,
+                    double(total) / prof_frames);
+        prof_shader_memo_hits_ = prof_shader_memo_misses_ = 0;
+      }
       if (worker_active_) {
         // Names the limiting side outright. Guest-wait high => the worker is the bottleneck and
         // more translation work should come off it. Worker-idle high => the guest thread is,
@@ -1174,22 +1188,44 @@ void Renderer::ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_de
   };
 
   const uint32_t vs_pass = d.vs_pass;
-  const auto t_hash = smark();
-  const GuestUcode vs_ucode = ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, vs_pass);
-  // Microcode is read late by the worker on the argument that shader objects are allocated once
-  // and live for the frame. Plausible, and untested -- so probe it rather than assume it.
-  if (REXCVAR_GET(nx1_d3d9_profile) && vs_ucode.valid()) {
-    ProbeStability(ProbeKind::kUcode, vs_ucode.physical_address, vs_ucode.dword_count * 4);
-  }
-  const uint64_t vs_hash = HashGuestUcode(vs_ucode);
-  const uint64_t ps_hash =
-      ps_object ? HashGuestUcode(ReadGuestUcode(base, ps_object, /*pixel_shader=*/true)) : 0;
-  sadd(prof_hash_ns_, t_hash);
 
-  const auto t_look = smark();
-  const Sm3Shader* vs = vs_hash ? cache.Lookup(vs_hash) : nullptr;
-  const Sm3Shader* ps = ps_hash ? cache.Lookup(ps_hash) : nullptr;
-  sadd(prof_lookup_ns_, t_look);
+  // Memoized resolve: (object, pass, stage) -> translated shader, valid for this frame only.
+  // Skips BOTH the microcode hash and the map lookup, which is the bulk of what recording costs
+  // on the guest thread. A miss is cached too -- a shader with no SM3 translation would
+  // otherwise re-hash its whole microcode on every draw that wants it, which is the worst case
+  // rather than the rare one.
+  const auto resolve = [&](uint32_t object, uint32_t pass, bool pixel_stage,
+                           const GuestUcode* ucode_out) -> const Sm3Shader* {
+    const uint64_t key = (uint64_t(object) << 8) ^ (uint64_t(pass) << 1) ^ (pixel_stage ? 1u : 0u) ^
+                         0x9E3779B97F4A7C15ull;
+    ShaderMemo& slot = shader_memo_[(key * 0xD1B54A32D192ED03ull) >> 55];
+    if (slot.key == key && slot.resolved) {
+      ++prof_shader_memo_hits_;
+      return slot.shader;
+    }
+    const auto t_hash = smark();
+    const GuestUcode ucode = ReadGuestUcode(base, object, pixel_stage, pass);
+    if (ucode_out && REXCVAR_GET(nx1_d3d9_profile) && ucode.valid()) {
+      // Microcode is read late by the worker on the argument that shader objects live for the
+      // frame -- the same argument this memo rests on, so keep probing it.
+      ProbeStability(ProbeKind::kUcode, ucode.physical_address, ucode.dword_count * 4);
+    }
+    const uint64_t hash = HashGuestUcode(ucode);
+    sadd(prof_hash_ns_, t_hash);
+    const auto t_look = smark();
+    const Sm3Shader* resolved = hash ? cache.Lookup(hash) : nullptr;
+    sadd(prof_lookup_ns_, t_look);
+    slot = {key, resolved, true};
+    ++prof_shader_memo_misses_;
+    return resolved;
+  };
+
+  const GuestUcode probe_marker{};
+  const Sm3Shader* vs = resolve(vs_object, vs_pass, /*pixel_stage=*/false, &probe_marker);
+  const Sm3Shader* ps = ps_object ? resolve(ps_object, 0, /*pixel_stage=*/true, nullptr) : nullptr;
+  // Only used by the cache-miss diagnostic below, and only on the slow path.
+  const uint64_t vs_hash = vs ? 1 : 0;
+  const uint64_t ps_hash = ps ? 1 : 0;
 
   if (!vs || (ps_object && !ps)) {
     // A handful of shaders do not lower to SM3, and a draw that wants one is silently

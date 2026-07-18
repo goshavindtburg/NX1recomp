@@ -355,6 +355,30 @@ class Renderer {
   /// balanced and the remainder is GPU or present.
   uint64_t prof_drain_wait_ns_ = 0;
   std::atomic<uint64_t> prof_worker_idle_ns_{0};
+
+  /// Shader-resolution memo: (object address, pass) -> translated shader.
+  ///
+  /// HashGuestUcode XXH3s the WHOLE microcode, twice per draw (~10k times a frame), and then the
+  /// result is looked up in a map -- all to answer a question that changes maybe 120 times a
+  /// frame across ~5000 draws. This skips both. It lives on the guest thread's critical path,
+  /// which PROF/bound identifies as the longer pole.
+  ///
+  /// Safe for exactly one frame, on the evidence rather than on faith: the stability probe
+  /// measured shader microcode unchanged within a frame (0 of ~19800 probed, with the vertex
+  /// class showing churn as a control). Cleared every frame anyway, so a shader object the guest
+  /// repurposes between frames cannot be served stale.
+  ///
+  /// Direct-mapped and collision-overwriting -- no chains, no eviction policy. With ~120 live
+  /// shaders in 512 slots, collisions are rare and a miss just does the work.
+  static constexpr uint32_t kShaderMemoSlots = 512;
+  struct ShaderMemo {
+    uint64_t key = 0;  ///< 0 = empty; object|pass mixed
+    const Sm3Shader* shader = nullptr;
+    bool resolved = false;  ///< a MISS is cached too: a cache-miss shader must not re-hash daily
+  };
+  ShaderMemo shader_memo_[kShaderMemoSlots];
+  uint64_t prof_shader_memo_hits_ = 0;
+  uint64_t prof_shader_memo_misses_ = 0;
   /// Splits the shaders phase outside UploadConstants: microcode hashing, cache lookup, and the
   /// SetShader/uniform/colour-mask binding around them.
   uint64_t prof_hash_ns_ = 0;
