@@ -544,10 +544,17 @@ void Renderer::Present() {
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
-      REXGPU_INFO("nx1_d3d9: PROF/defer guest work: pre-draw={:.2f} between-draws={:.2f} "
-                  "post-draw={:.2f} ms/frame",
-                  prof_gap_before_first_ns_ * tf, prof_gap_between_ns_ * tf,
-                  prof_gap_after_last_ns_ * tf);
+      // Only meaningful synchronously. The gap timers difference a mark taken on the guest
+      // thread against one taken in ExecuteDraw, which under async runs on the WORKER -- the
+      // subtraction then measures the distance between two unrelated clocks and reported
+      // between-draws=886 ms/frame. An instrument that silently becomes nonsense when its
+      // assumption breaks is worse than no instrument, so it stays quiet instead.
+      if (!worker_active_) {
+        REXGPU_INFO("nx1_d3d9: PROF/defer guest work: pre-draw={:.2f} between-draws={:.2f} "
+                    "post-draw={:.2f} ms/frame",
+                    prof_gap_before_first_ns_ * tf, prof_gap_between_ns_ * tf,
+                    prof_gap_after_last_ns_ * tf);
+      }
       // Reported PER CLASS. A combined number is dominated by the vertex probes and would let a
       // genuinely unstable index or microcode range hide inside a 99.9% aggregate -- which is
       // exactly the assumption the executor is resting on.
