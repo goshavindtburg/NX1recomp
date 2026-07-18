@@ -387,6 +387,12 @@ void Renderer::Present() {
                   double(sp.calls) / prof_frames,
                   sp.calls ? double(sp.registers) / double(sp.calls) : 0.0,
                   sp.calls ? double(sp.def_writes) / double(sp.calls) : 0.0);
+      REXGPU_INFO("nx1_d3d9: PROF/vtx decl skipped {:.1f}% of {:.0f} | stream skipped {:.1f}% of {:.0f} per frame",
+                  prof_decl_calls_ ? 100.0 * double(prof_decl_skips_) / double(prof_decl_calls_) : 0.0,
+                  double(prof_decl_calls_) / prof_frames,
+                  prof_stream_calls_ ? 100.0 * double(prof_stream_skips_) / double(prof_stream_calls_) : 0.0,
+                  double(prof_stream_calls_) / prof_frames);
+      prof_decl_skips_ = prof_decl_calls_ = prof_stream_skips_ = prof_stream_calls_ = 0;
       REXGPU_INFO("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
                   prof_bind_calls_ ? 100.0 * double(prof_bind_skips_) / double(prof_bind_calls_)
                                    : 0.0,
@@ -953,7 +959,13 @@ bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t 
   if (!layout) {
     return false;
   }
-  device_->SetVertexDeclaration(layout->decl);
+  ++prof_decl_calls_;
+  if (layout->decl != bound_decl_) {
+    device_->SetVertexDeclaration(layout->decl);
+    bound_decl_ = layout->decl;
+  } else {
+    ++prof_decl_skips_;
+  }
 
   *vertex_count = 0;
   for (uint32_t stream = 0; stream < layout->stream_count; ++stream) {
@@ -963,7 +975,15 @@ bool Renderer::BindStreams(const uint8_t* base, uint32_t guest_device, uint32_t 
     if (!vb) {
       return false;
     }
-    device_->SetStreamSource(stream, vb, 0, layout->host_stride[stream]);
+    ++prof_stream_calls_;
+    if (vb != bound_stream_vb_[stream] ||
+        layout->host_stride[stream] != bound_stream_stride_[stream]) {
+      device_->SetStreamSource(stream, vb, 0, layout->host_stride[stream]);
+      bound_stream_vb_[stream] = vb;
+      bound_stream_stride_[stream] = layout->host_stride[stream];
+    } else {
+      ++prof_stream_skips_;
+    }
     // The draw's vertex range has to fit inside every stream it reads.
     *vertex_count = *vertex_count ? std::min(*vertex_count, count) : count;
   }
@@ -1088,6 +1108,14 @@ void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device) {
   device_->SetRenderState(D3DRS_CULLMODE, mode);
 }
 
+void Renderer::InvalidateVertexShadow() {
+  bound_decl_ = kVertexDeclUnknown;
+  for (uint32_t i = 0; i < 4; ++i) {
+    bound_stream_vb_[i] = kVertexBufferUnknown;
+    bound_stream_stride_[i] = ~0u;
+  }
+}
+
 void Renderer::InvalidateStateShadow() {
   for (uint32_t s = 0; s < 16; ++s) {
     sampler_texture_[s] = kSamplerTextureUnknown;
@@ -1098,6 +1126,7 @@ void Renderer::InvalidateStateShadow() {
   bound_vs_ = kVertexShaderUnknown;
   bound_ps_ = kPixelShaderUnknown;
   bound_color_write_ = kColorWriteUnset;
+  InvalidateVertexShadow();
   ShaderCache::Get().InvalidateDefShadow();
   // The draw-signature skip trusts that the device still holds the previous draw's bindings;
   // once something else has rebound them that is no longer true.
@@ -1179,7 +1208,10 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
     if (!tex) {
       continue;
     }
-    const SamplerClampModes clamp = ReadSamplerClampModes(base, guest_device, sampler);
+    // Clamp modes live in dword0 of the fetch constant GetTexture already read and handed
+    // back; ReadSamplerClampModes would fetch that same dword out of guest memory again,
+    // once per bound slot per draw.
+    const SamplerClampModes clamp{t.clamp_u, t.clamp_v, t.clamp_w};
     // Anisotropy is minification-only, so it replaces the min filter and nothing else. Half of
     // NX1's binds ask for a point *mip* filter, which is only sane on hardware that filters
     // anisotropically underneath it: without aniso that is bilinear plus a hard mip step, and
@@ -1412,6 +1444,8 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
   if (SUCCEEDED(hr)) {
     ++draws_submitted_;
   }
+  // This bound its own declaration, and the runtime sets stream 0 to NULL behind a UP draw.
+  InvalidateVertexShadow();
 }
 
 void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_type,
@@ -1466,6 +1500,7 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
   if (SUCCEEDED(device_->DrawPrimitiveUP(host_prim, prim_count, verts.data(), host_stride))) {
     ++draws_submitted_;
   }
+  InvalidateVertexShadow();
 }
 
 #endif  // _WIN32

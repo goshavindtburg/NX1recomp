@@ -293,6 +293,11 @@ struct TextureFetchConstant {
   uint32_t depth;         ///< texels / array slices (>=1)
   uint32_t dimension;     ///< xenos::DataDimension (0=1D,1=2D/stacked,2=3D,3=cube)
   uint32_t swizzle;       ///< 12-bit XE_GPU_TEXTURE_SWIZZLE (xyzw, 3 bits each)
+  /// Xenos ClampMode per axis (0=repeat, 1=mirror, 2=clamp-to-last, 3=mirror-once, ...).
+  /// These live in dword0 of this very fetch constant, so a caller that already has one must
+  /// NOT call ReadSamplerClampModes -- that re-reads the same dword out of guest memory, once
+  /// per bound sampler slot per draw (~21k times a frame).
+  uint32_t clamp_u, clamp_v, clamp_w;
   // Sampler filters (D3DTEXTUREFILTERTYPE-like: 0=point, 1=linear on Xenos).
   uint32_t mag_filter;
   uint32_t min_filter;
@@ -317,12 +322,17 @@ struct TextureFetchConstant {
 /// Used both for sampler slots and for a D3DBaseTexture's embedded Format (at
 /// texture + 0x1C), e.g. a resolve destination.
 inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint32_t addr) {
-  const uint32_t d0 = GuestRead32(base, addr + 0);
-  const uint32_t d1 = GuestRead32(base, addr + 4);
-  const uint32_t d2 = GuestRead32(base, addr + 8);
-  const uint32_t d3 = GuestRead32(base, addr + 12);
-  const uint32_t d4 = GuestRead32(base, addr + 16);
-  const uint32_t d5 = GuestRead32(base, addr + 20);
+  // Translate once for all six dwords. They are 24 contiguous bytes, so they cannot straddle
+  // the 0xA0000000 physical window, yet GuestRead32 re-tests it and recomputes the host
+  // pointer on every one -- and this runs ~21k times a frame (every bound sampler slot of
+  // every draw), where it was the largest part of the texture cache lookup.
+  const uint8_t* p = addr >= 0xA0000000u ? GuestTranslatePhysical(addr) : base + addr;
+  const uint32_t d0 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 0);
+  const uint32_t d1 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 4);
+  const uint32_t d2 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 8);
+  const uint32_t d3 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 12);
+  const uint32_t d4 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 16);
+  const uint32_t d5 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 20);
 
   TextureFetchConstant t{};
   t.valid = (d0 & 0x3) == 2;  // FetchConstantType::kTexture
@@ -332,6 +342,9 @@ inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint
   t.gamma = ((d0 >> 2) & 0x3) == 3;
   t.pitch_pixels = ((d0 >> 22) & 0x1FF) << 5;
   t.tiled = ((d0 >> 31) & 0x1) != 0;
+  t.clamp_u = (d0 >> 10) & 0x7;
+  t.clamp_v = (d0 >> 13) & 0x7;
+  t.clamp_w = (d0 >> 16) & 0x7;
   t.format = d1 & 0x3F;
   t.endian = (d1 >> 6) & 0x3;
   t.base_address = ((d1 >> 12) & 0xFFFFF) << 12;

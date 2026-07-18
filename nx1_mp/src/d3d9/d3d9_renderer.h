@@ -220,6 +220,13 @@ class Renderer {
   uint64_t prof_hash_ns_ = 0;
   uint64_t prof_lookup_ns_ = 0;
   uint64_t prof_shbind_ns_ = 0;
+  /// Hit rates for the vertex declaration / stream-source shadows. The phase total did not
+  /// move when they went in, and a shadow that never hits is pure overhead -- so measure it
+  /// rather than keep it on faith.
+  uint64_t prof_decl_skips_ = 0;
+  uint64_t prof_decl_calls_ = 0;
+  uint64_t prof_stream_skips_ = 0;
+  uint64_t prof_stream_calls_ = 0;
 
   /// TEMP PROFILING (nx1_d3d9_profile): per-phase nanoseconds accumulated over a frame,
   /// reported and reset in Present. Measures where the ~19us/draw actually goes.
@@ -292,8 +299,24 @@ class Renderer {
   IDirect3DPixelShader9* bound_ps_ = kPixelShaderUnknown;
   uint32_t bound_color_write_ = kColorWriteUnset;
 
-  /// Forget what we think is bound to the samplers and shader stages, so the next draw
-  /// re-issues all of it.
+  /// The vertex declaration and stream sources, shadowed on the same principle. Note the UP
+  /// draw paths (DrawPrimitiveUP / DrawIndexedPrimitiveUP) set stream 0 to NULL inside the
+  /// runtime and bind their own declaration, so they invalidate this rather than track it --
+  /// they are a handful of inline draws a frame and not worth the bookkeeping.
+  static inline IDirect3DVertexDeclaration9* const kVertexDeclUnknown =
+      reinterpret_cast<IDirect3DVertexDeclaration9*>(~uintptr_t(0));
+  static inline IDirect3DVertexBuffer9* const kVertexBufferUnknown =
+      reinterpret_cast<IDirect3DVertexBuffer9*>(~uintptr_t(0));
+  IDirect3DVertexDeclaration9* bound_decl_ = kVertexDeclUnknown;
+  IDirect3DVertexBuffer9* bound_stream_vb_[4];
+  uint32_t bound_stream_stride_[4];
+
+  /// Forget the vertex declaration and stream sources only. Split out because the UP draw
+  /// paths disturb exactly those and nothing else.
+  void InvalidateVertexShadow();
+
+  /// Forget what we think is bound to the samplers, shader stages and vertex streams, so the
+  /// next draw re-issues all of it.
   void InvalidateStateShadow();
 
   // The guest colour surface currently bound to MRT slot 0.
