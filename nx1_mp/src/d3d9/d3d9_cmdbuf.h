@@ -253,6 +253,17 @@ struct RecordedCommand {
   /// kDraw: index into draws().
   uint32_t draw_index = 0;
 
+  /// The guest D3D::CDevice this command was recorded against.
+  ///
+  /// PER COMMAND, deliberately. This started life as one shared slot on the renderer that
+  /// SubmitCommand overwrote -- which is correct synchronously (no gap between submit and
+  /// execute) and silently wrong under a worker, which reads it at DEQUEUE time and so sees
+  /// whatever the most recent submit wrote. Clear/Resolve/SetRenderTarget submit with 0, so any
+  /// draw still queued behind one of those executed with guest_device == 0 and read its
+  /// index-buffer descriptor out of address 0. Bad draws, then a crash on the wild index range.
+  /// A bug that literally could not appear until the queue existed.
+  uint32_t guest_device = 0;
+
   // --- kClear and kResolve (shared: `kind` discriminates, and a command is never both) ---
   /// Xenos clear bits, NOT desktop D3DCLEAR_* -- the mapping happens at execute time because it
   /// also depends on whether a depth-stencil is bound, which an earlier command may change.
@@ -348,6 +359,7 @@ class CommandBuffer {
   }
 
   const std::deque<RecordedCommand>& commands() const { return commands_; }
+  RecordedCommand& command(uint32_t index) { return commands_[index]; }
   RecordedDraw& draw(uint32_t index) { return draws_[index]; }
 
   /// Append a delta for whatever the guest just rewrote, or reuse the previous one when the

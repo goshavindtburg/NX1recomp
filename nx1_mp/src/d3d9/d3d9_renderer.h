@@ -191,7 +191,7 @@ class Renderer {
   //--- Deferred execution (step 3) --------------------------------------------------------
   /// Execute one recorded command, whichever kind it is. The single dispatch point shared by
   /// the synchronous path and the worker, so the two can never drift apart.
-  void ExecuteCommand(const uint8_t* base, uint32_t guest_device, const RecordedCommand& c);
+  void ExecuteCommand(const uint8_t* base, const RecordedCommand& c);
 
   /// Submit a recorded command for execution: runs it inline when async is off, otherwise hands
   /// it to the worker. Every recording site calls this instead of an Execute* directly.
@@ -217,7 +217,7 @@ class Renderer {
   bool worker_running_ = false;
   bool worker_active_ = false;  ///< async enabled for this frame; latched at BeginFrame
   const uint8_t* worker_base_ = nullptr;
-  uint32_t worker_guest_device_ = 0;
+
 
   /// Translate the guest's depth/blend/cull GPU-register shadows to D3D9.
   void ApplyRenderStates(const RecordedDraw& d);
@@ -347,6 +347,9 @@ class Renderer {
   /// sample covers. "100% unchanged" means nothing without knowing how much was looked at.
   uint64_t prof_probe_offered_[3] = {};
   void ProbeStability(ProbeKind kind, uint32_t addr, uint32_t bytes);
+  /// Guards prof_stability_ and the sampling counters: ProbeStability is called from the guest
+  /// thread (ucode) and the worker (vertex, index) simultaneously under async.
+  std::mutex prof_probe_mutex_;
   /// Splits the shaders phase outside UploadConstants: microcode hashing, cache lookup, and the
   /// SetShader/uniform/colour-mask binding around them.
   uint64_t prof_hash_ns_ = 0;

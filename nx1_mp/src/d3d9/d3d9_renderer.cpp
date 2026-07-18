@@ -441,8 +441,11 @@ void Renderer::Present() {
   // cvar says; leaving the reset behind nx1_d3d9_record would grow it without bound for the
   // whole session. The cvar gates the report and nothing else.
   //
-  // Safe to reset here only because Present already drained the worker: the frame boundary is
-  // the one moment nothing is reading the buffer.
+  // Drain again before clearing. Present normally does it, but Present early-returns when the
+  // device is gone or shutdown has begun -- and clearing the buffer while the worker still holds
+  // a reference into it is a use-after-free. Cheap: after a normal Present the queue is already
+  // empty and this returns immediately.
+  DrainWorker();
   cmdbuf_.BeginFrame();
   queue_head_ = queue_tail_ = 0;
   // Latched once per frame rather than read per command, so the mode cannot change underneath a
@@ -1705,11 +1708,11 @@ void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t p
       cmdbuf_.RecordConstantDelta(base, guest_device, guest_dirty_vs_, guest_dirty_ps_);
 }
 
-void Renderer::ExecuteCommand(const uint8_t* base, uint32_t guest_device,
-                              const RecordedCommand& c) {
+void Renderer::ExecuteCommand(const uint8_t* base, const RecordedCommand& c) {
+
   switch (c.kind) {
     case CommandKind::kDraw:
-      ExecuteDraw(base, guest_device, cmdbuf_.draws()[c.draw_index]);
+      ExecuteDraw(base, c.guest_device, cmdbuf_.draws()[c.draw_index]);
       break;
     case CommandKind::kClear:
       ExecuteClear(c);
@@ -1727,8 +1730,12 @@ void Renderer::ExecuteCommand(const uint8_t* base, uint32_t guest_device,
 }
 
 void Renderer::SubmitCommand(const uint8_t* base, uint32_t guest_device, uint32_t command_index) {
+  // Stamp the device onto the COMMAND, never onto a slot the worker reads later -- see
+  // RecordedCommand::guest_device for what a shared slot cost. Non-draw commands pass 0 and do
+  // not use it, but a draw queued behind them must still find its own.
+  cmdbuf_.command(command_index).guest_device = guest_device;
   if (!worker_active_) {
-    ExecuteCommand(base, guest_device, cmdbuf_.commands()[command_index]);
+    ExecuteCommand(base, cmdbuf_.commands()[command_index]);
     return;
   }
   // Async: publish the command and let the worker pick it up. The guest thread returns
@@ -1736,8 +1743,7 @@ void Renderer::SubmitCommand(const uint8_t* base, uint32_t guest_device, uint32_
   // that logic was measured at 5.3-7.5 ms a frame sitting idle behind our translation.
   {
     std::lock_guard<std::mutex> lk(queue_mutex_);
-    worker_base_ = base;
-    worker_guest_device_ = guest_device;
+    worker_base_ = base;  // genuinely constant for the process, unlike guest_device
     queue_head_ = size_t(command_index) + 1;
   }
   queue_cv_.notify_one();
@@ -1755,7 +1761,6 @@ void Renderer::WorkerMain() {
   for (;;) {
     size_t index = 0;
     const uint8_t* base = nullptr;
-    uint32_t guest_device = 0;
     {
       std::unique_lock<std::mutex> lk(queue_mutex_);
       queue_cv_.wait(lk, [this] { return queue_tail_ < queue_head_ || !worker_running_; });
@@ -1764,13 +1769,12 @@ void Renderer::WorkerMain() {
       }
       index = queue_tail_;
       base = worker_base_;
-      guest_device = worker_guest_device_;
     }
     // Executed OUTSIDE the lock: this is the ~10 ms of translation whose whole purpose is to
     // overlap with the guest thread. Holding queue_mutex_ across it would serialise the two
     // again and buy exactly nothing. Safe because the guest only ever APPENDS to cmdbuf_, and
     // its deques and chunked constant pool never move an element that has been handed out.
-    ExecuteCommand(base, guest_device, cmdbuf_.commands()[index]);
+    ExecuteCommand(base, cmdbuf_.commands()[index]);
     {
       std::lock_guard<std::mutex> lk(queue_mutex_);
       queue_tail_ = index + 1;
@@ -1782,6 +1786,11 @@ void Renderer::WorkerMain() {
 }
 
 void Renderer::ProbeStability(ProbeKind kind, uint32_t addr, uint32_t bytes) {
+  // Locked because this is called from BOTH threads under async: the ucode probe runs on the
+  // guest thread inside ResolveShadersAndConstants, while the vertex and index probes run on the
+  // worker inside ExecuteDraw. Concurrent push_back on the same vector is a corruption-or-crash
+  // data race -- and a diagnostic taking down the thing it is measuring is the worst kind.
+  std::lock_guard<std::mutex> lk(prof_probe_mutex_);
   // STRIDE, not first-N. Taking the first 256 of each class sampled only the frame's opening
   // passes -- the same shadow-cascade draws every frame -- and reported a perfect 100% across
   // all three classes while the original first-512 probe had found 1 vertex range in 448
