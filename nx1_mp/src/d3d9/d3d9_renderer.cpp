@@ -574,6 +574,9 @@ void Renderer::Present() {
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
+      REXGPU_INFO("nx1_d3d9: PROF/constblend {:.1f} draws/frame use a constant blend factor",
+                  double(prof_const_blend_draws_) / prof_frames);
+      prof_const_blend_draws_ = 0;
       // Report the hit rate, not just the timing. Several shadows in this renderer measured
       // exactly zero benefit and were only caught by a counter -- a memo that never hits is pure
       // added cost, and the phase timing alone cannot tell the difference.
@@ -1576,6 +1579,34 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   SetRenderStateCached(D3DRS_SRCBLENDALPHA, HostBlendFactor(blend.alpha_src));
   SetRenderStateCached(D3DRS_DESTBLENDALPHA, HostBlendFactor(blend.alpha_dst));
   SetRenderStateCached(D3DRS_BLENDOPALPHA, HostBlendOp(blend.alpha_op));
+
+  // GLASS HUNT. HostBlendFactor maps Xenos factors 12..15 (constant colour / constant alpha) to
+  // D3DBLEND_BLENDFACTOR, but nothing here ever sets D3DRS_BLENDFACTOR -- so those draws blend
+  // against D3D9's default of opaque white. A material blending against a constant would then
+  // render fully opaque, which is exactly what intact glass does (broken glass, a different
+  // material, is correctly transparent).
+  //
+  // That is a hypothesis, not a finding. Count the draws that actually use those factors before
+  // going looking for the guest's RB_BLEND_RGBA offset: if nothing uses them, the theory is dead
+  // and the offset hunt would have been wasted work.
+  if (REXCVAR_GET(nx1_d3d9_profile) && blend.enabled) {
+    const auto is_const = [](uint32_t f) { return f >= 12 && f <= 15; };
+    if (is_const(blend.color_src) || is_const(blend.color_dst) || is_const(blend.alpha_src) ||
+        is_const(blend.alpha_dst)) {
+      ++prof_const_blend_draws_;
+      static std::mutex m;
+      static std::vector<uint32_t> seen;
+      const uint32_t sig = blend.color_src | (blend.color_dst << 8) | (blend.alpha_src << 16) |
+                           (blend.alpha_dst << 24);
+      std::lock_guard<std::mutex> lk(m);
+      if (std::find(seen.begin(), seen.end(), sig) == seen.end() && seen.size() < 16) {
+        seen.push_back(sig);
+        REXGPU_INFO("nx1_d3d9: CONSTBLEND src={} dst={} asrc={} adst={} -- blends against "
+                    "D3DRS_BLENDFACTOR, which we never set",
+                    blend.color_src, blend.color_dst, blend.alpha_src, blend.alpha_dst);
+      }
+    }
+  }
 
   // Cull. D3D9 folds the front-face winding into the cull direction (it has no
   // separate "front face" state), so resolve the Xenos (cull, winding) pair here.
