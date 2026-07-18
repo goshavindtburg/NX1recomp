@@ -1595,7 +1595,12 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   // register). If it is enabled with SRCALPHA/INVSRCALPHA, then the source alpha is arriving as
   // 1.0 and the fault is in the pixel shader's alpha or the texture's alpha channel -- two very
   // different investigations, and this says which.
-  if (REXCVAR_GET(nx1_d3d9_dbg_blend_log)) {
+  // Either cvar arms this block. The isolate check used to be nested inside the log check, so
+  // setting isolate alone did nothing -- the index bookkeeping it depends on never ran. A debug
+  // tool that silently no-ops is worse than no tool: it reads as "the theory is wrong" rather
+  // than "the switch was off".
+  const int32_t blend_isolate = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_isolate));
+  if (REXCVAR_GET(nx1_d3d9_dbg_blend_log) || blend_isolate >= 0) {
     const uint64_t sig = uint64_t(blend.enabled) | (uint64_t(blend.color_src) << 1) |
                          (uint64_t(blend.color_dst) << 7) | (uint64_t(blend.color_op) << 13) |
                          (uint64_t(blend.alpha_src) << 17) | (uint64_t(blend.alpha_dst) << 23) |
@@ -1609,6 +1614,7 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
       ++it->second;
     } else if (seen.size() < 32) {
       seen.push_back({sig, 1});
+      it = seen.end() - 1;  // so a freshly discovered config can be isolated on its first draw
       REXGPU_INFO("nx1_d3d9: BLENDCFG #{} enabled={} colour {}->{} op={} alpha {}->{} op={} "
                   "writemask={:#x}",
                   seen.size() - 1, blend.enabled ? 1 : 0, blend.color_src, blend.color_dst,
@@ -1622,9 +1628,8 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
     //
     // Indices are assigned in DISCOVERY ORDER, so they are stable only within one run. Read them
     // from the same run's log, not an earlier one.
-    const int32_t isolate = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_isolate));
-    if (isolate >= 0 && it != seen.end() &&
-        size_t(isolate) == size_t(it - seen.begin())) {
+    if (blend_isolate >= 0 && it != seen.end() &&
+        size_t(blend_isolate) == size_t(it - seen.begin())) {
       SetRenderStateCached(D3DRS_COLORWRITEENABLE, 0);
       bound_color_write_ = 0;
     }
