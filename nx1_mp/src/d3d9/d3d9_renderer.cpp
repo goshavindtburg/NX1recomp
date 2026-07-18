@@ -498,10 +498,11 @@ void Renderer::Present() {
                   tp.uploads ? double(tp.upload_ns) / (1e3 * tp.uploads) : 0.0);
       // Why the rebuilds happen, and at what memory cost -- the two numbers that decide whether
       // the fix is the commit policy, the eviction policy, or the streaming pool.
-      REXGPU_INFO("nx1_d3d9: PROF/tex why: new={:.1f} layout={:.1f} dirty={:.1f} zero={:.1f} per "
-                  "frame | {:.2f} MB/frame decoded ({:.1f} GB/s effective)",
+      REXGPU_INFO("nx1_d3d9: PROF/tex why: new={:.1f} layout={:.1f} dirty={:.1f} zero={:.1f} "
+                  "deferred={:.1f} per frame | {:.2f} MB/frame decoded ({:.1f} GB/s effective)",
                   double(tp.why_new) / prof_frames, double(tp.why_layout) / prof_frames,
                   double(tp.why_dirty) / prof_frames, double(tp.why_zero) / prof_frames,
+                  double(tp.deferred) / prof_frames,
                   double(tp.decode_bytes) / (1024.0 * 1024.0 * prof_frames),
                   tp.decode_ns ? double(tp.decode_bytes) / double(tp.decode_ns) : 0.0);
       // How often the clean-constant skip actually fires. The dirty mask says ~94%/78% of
