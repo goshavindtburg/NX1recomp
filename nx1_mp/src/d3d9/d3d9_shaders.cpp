@@ -320,17 +320,17 @@ bool NeedsHostNdcTransform(const Sm3Shader& shader) {
 #endif
 }
 
-void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
-                                  const Sm3Shader& shader, bool pixel_stage) {
+uint32_t ShaderCache::ResolveConstants(const uint8_t* base, uint32_t guest_device,
+                                       const Sm3Shader& shader, bool pixel_stage, float* staging) {
 #ifndef NX1_HAVE_SM3_SHADER_CACHE
-  (void)base; (void)guest_device; (void)shader; (void)pixel_stage;
+  (void)base; (void)guest_device; (void)shader; (void)pixel_stage; (void)staging;
+  return 0;
 #else
   if (!device_ || !shader.entry) {
-    return;
+    return 0;
   }
   const Nx1Sm3CacheEntry& e = *shader.entry;
 
-  float staging[kMaxHostConstants * 4];
   uint32_t count;
 
   // A register the engine wrote through D3DDevice_GpuBeginShaderConstantF4 lives in the
@@ -409,6 +409,24 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
 
   padd(prof_.read_ns, t_read);
   if (prof_enabled_) prof_.registers += count;
+  return count;
+#endif
+}
+
+void ShaderCache::ApplyConstants(const Sm3Shader& shader, bool pixel_stage, const float* staging,
+                                 uint32_t count) {
+#ifndef NX1_HAVE_SM3_SHADER_CACHE
+  (void)shader; (void)pixel_stage; (void)staging; (void)count;
+#else
+  if (!device_) {
+    return;
+  }
+  const auto pmark = [this] {
+    return prof_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  };
+  const auto padd = [this](uint64_t& sink, std::chrono::steady_clock::time_point t0) {
+    if (prof_enabled_) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
+  };
 
   // Only when this stage's shader changed. Our own window upload deliberately steps AROUND
   // this shader's def registers, so while the same shader stays bound nothing we issue can
@@ -480,6 +498,13 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
   }
   padd(prof_.defs_ns, t_defs);
 #endif
+}
+
+void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
+                                  const Sm3Shader& shader, bool pixel_stage) {
+  float staging[kMaxHostConstants * 4];
+  const uint32_t count = ResolveConstants(base, guest_device, shader, pixel_stage, staging);
+  ApplyConstants(shader, pixel_stage, staging, count);
 }
 
 }  // namespace nx1::d3d9

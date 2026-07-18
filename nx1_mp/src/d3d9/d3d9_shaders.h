@@ -91,6 +91,20 @@ class ShaderCache {
   void UploadConstants(const uint8_t* base, uint32_t guest_device, const Sm3Shader& shader,
                        bool pixel_stage);
 
+  /// The two halves of UploadConstants, split for deferred translation.
+  ///
+  /// ResolveConstants READS guest memory; ApplyConstants only issues D3D calls. That split is
+  /// forced rather than tidy: the values come partly from the PM4 constant ring, whose storage
+  /// the guest recycles, and partly from shader literals -- neither survives long enough for a
+  /// worker to read them late, and the guest's dirty mask does not even report ring writes (see
+  /// last_const_ring_gen_ in the renderer). So resolution must stay on the guest thread while
+  /// only the upload moves. `staging` must hold kMaxHostConstants*4 floats; the return is how
+  /// many registers were written, which is typically ~10, not 256.
+  uint32_t ResolveConstants(const uint8_t* base, uint32_t guest_device, const Sm3Shader& shader,
+                            bool pixel_stage, float* staging);
+  void ApplyConstants(const Sm3Shader& shader, bool pixel_stage, const float* staging,
+                      uint32_t count);
+
   /// TEMP PROFILING: where the shaders phase actually goes. It runs twice per draw and is now
   /// the largest phase, and its parts have very different fixes -- guest reads want memoising,
   /// D3D constant calls want eliding -- so the split has to be measured, not assumed.
