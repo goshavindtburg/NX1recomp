@@ -41,6 +41,7 @@ set(NX1MP_SOURCES
     src/d3d9/d3d9_hooks.cpp
     src/d3d9/d3d9_resources.cpp
     src/d3d9/d3d9_shaders.cpp
+    src/d3d9/d3d9_cmdbuf.cpp
     src/d3d9/d3d9_overlay.cpp
     src/d3d9/guest_d3d.cpp
 )
