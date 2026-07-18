@@ -344,6 +344,7 @@ class ResourceTracker {
     uint64_t converts = 0;     ///< buffers actually rebuilt
     uint64_t hash_bytes = 0;
     uint64_t convert_bytes = 0;
+    uint64_t dynamic_converts = 0;  ///< of those, rebuilds into a DYNAMIC (DISCARD-able) buffer
   };
   VertexProfile TakeVertexProfile() {
     VertexProfile p = prof_vtx_;

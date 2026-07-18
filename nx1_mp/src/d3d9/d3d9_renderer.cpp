@@ -398,6 +398,9 @@ void Renderer::Present() {
                   double(vp.hash_bytes) / (1024.0 * 1024.0 * prof_frames),
                   double(vp.converts) / prof_frames,
                   double(vp.convert_bytes) / (1024.0 * 1024.0 * prof_frames));
+      REXGPU_INFO("nx1_d3d9: PROF/vb dynamic converts {:.1f} of {:.1f} per frame",
+                  double(vp.dynamic_converts) / prof_frames,
+                  double(vp.converts) / prof_frames);
       prof_vlayout_ns_ = prof_vbuffer_ns_ = 0;
       REXGPU_INFO("nx1_d3d9: PROF/vtx decl skipped {:.1f}% of {:.0f} | stream skipped {:.1f}% of {:.0f} per frame",
                   prof_decl_calls_ ? 100.0 * double(prof_decl_skips_) / double(prof_decl_calls_) : 0.0,

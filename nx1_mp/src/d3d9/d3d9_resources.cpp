@@ -482,7 +482,15 @@ struct VertexBufferEntry {
   uint32_t vertex_count = 0;
   uint64_t content_hash = 0;
   uint64_t last_frame = 0;
+  /// How many times this entry's contents have been rewritten, and whether it has been moved
+  /// to a DYNAMIC buffer as a result. See the rebuild path in GetVertexBuffer.
+  uint32_t rebuilds = 0;
+  bool dynamic = false;
 };
+
+/// Rebuilds after which a vertex buffer is treated as dynamic geometry and recreated with
+/// D3DUSAGE_DYNAMIC. Low, because the cost of being wrong is small in either direction.
+inline constexpr uint32_t kDynamicRebuilds = 3;
 
 struct IndexBufferEntry {
   IDirect3DIndexBuffer9* ib = nullptr;
@@ -1696,25 +1704,41 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   if (entry.vb && entry.bytes == host_bytes && entry.content_hash == content_hash) {
     return entry.vb;
   }
-  if (entry.vb && entry.bytes != host_bytes) {
+  // Lock(.., 0) on a D3DPOOL_DEFAULT buffer blocks until the GPU has finished reading it.
+  // Measured at ~23 us to rewrite ~8 KB -- 0.35 GB/s, which is a pipeline stall, not CPU
+  // throughput. A buffer rewritten again and again is dynamic geometry, so give repeat
+  // offenders a DYNAMIC buffer and let Lock DISCARD: the driver hands back fresh storage
+  // instead of waiting. Static geometry deliberately stays in DEFAULT -- it is rebuilt once
+  // and then read by thousands of draws, and DYNAMIC would park it in AGP memory where the
+  // GPU reads it more slowly. That is the trade this threshold exists to avoid making blindly.
+  ++entry.rebuilds;
+  const bool want_dynamic = entry.rebuilds >= kDynamicRebuilds;
+  if (entry.vb && (entry.bytes != host_bytes || want_dynamic != entry.dynamic)) {
     entry.vb->Release();
     entry.vb = nullptr;
   }
-  if (!entry.vb &&
-      FAILED(device_->CreateVertexBuffer(host_bytes, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
-                                         &entry.vb, nullptr))) {
-    REXGPU_ERROR("nx1_d3d9: CreateVertexBuffer({} bytes) failed", host_bytes);
-    entry.vb = nullptr;
-    return nullptr;
+  if (!entry.vb) {
+    const DWORD usage = D3DUSAGE_WRITEONLY | (want_dynamic ? D3DUSAGE_DYNAMIC : 0u);
+    if (FAILED(device_->CreateVertexBuffer(host_bytes, usage, 0, D3DPOOL_DEFAULT, &entry.vb,
+                                           nullptr))) {
+      REXGPU_ERROR("nx1_d3d9: CreateVertexBuffer({} bytes, {}) failed", host_bytes,
+                   want_dynamic ? "dynamic" : "default");
+      entry.vb = nullptr;
+      return nullptr;
+    }
+    entry.dynamic = want_dynamic;
   }
 
   const auto t_conv = vmark();
   if (prof_enabled_) {
     ++prof_vtx_.converts;
     prof_vtx_.convert_bytes += host_bytes;
+    if (entry.dynamic) ++prof_vtx_.dynamic_converts;
   }
   void* mapped = nullptr;
-  if (FAILED(entry.vb->Lock(0, 0, &mapped, 0))) {
+  // DISCARD is only legal on a DYNAMIC buffer, and only for a whole-buffer lock -- which
+  // Lock(0, 0, ..) is.
+  if (FAILED(entry.vb->Lock(0, 0, &mapped, entry.dynamic ? D3DLOCK_DISCARD : 0))) {
     return nullptr;
   }
   auto* dst = static_cast<uint8_t*>(mapped);
