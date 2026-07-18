@@ -8,7 +8,9 @@
 // Sleep macro otherwise mangles.
 #include <rex/cvar.h>
 #include <rex/logging/macros.h>
+#include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/window.h>
 
 #include <algorithm>
 #include <mutex>
@@ -91,6 +93,17 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lparam) {
 }  // namespace
 
 HWND FindGameWindow() {
+  // Prefer the real rex host window. With host presentation suppressed (nx1_d3d9,
+  // see Nx1MpApp::OnPreSetup) nothing else draws to it, so the D3D9 device renders
+  // straight into its client area -- one window, not two.
+  if (auto* rt = rex::Runtime::instance()) {
+    if (auto* win = rt->display_window()) {
+      if (void* h = win->GetNativeWindowHandle()) {
+        return static_cast<HWND>(h);
+      }
+    }
+  }
+  // Fallback: enumerate this process's own top-level windows.
   FindWindowCtx ctx{GetCurrentProcessId(), nullptr};
   EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&ctx));
   return ctx.result;
@@ -141,7 +154,7 @@ Renderer& Renderer::Get() {
   return instance;
 }
 
-bool Renderer::Initialize(HWND reference_window) {
+bool Renderer::Initialize(HWND output_window) {
   if (device_) {
     return true;
   }
@@ -152,34 +165,46 @@ bool Renderer::Initialize(HWND reference_window) {
     return false;
   }
 
-  // Size to the guest window if we found one, else a sane default.
-  RECT client{0, 0, 1280, 720};
-  if (reference_window) {
-    GetClientRect(reference_window, &client);
+  HWND hwnd = nullptr;
+  if (output_window) {
+    // Borrow the host window. rex created it and pumps its message loop on the UI
+    // thread; with the Xenia presenter suppressed (nx1_d3d9) nothing else draws to
+    // it, so this D3D9 device owns its client area. We must not spawn our own
+    // message loop for a window we don't own, nor tear it down at shutdown.
+    hwnd = output_window;
+    owns_window_ = false;
+    REXGPU_INFO("nx1_d3d9: rendering into the host window ({:#x})",
+                reinterpret_cast<uintptr_t>(hwnd));
+  } else {
+    // No host window was handed to us -- fall back to our own top-level window on
+    // a dedicated message-pump thread. Win32 delivers a window's messages only to
+    // the thread that created it, so wait for the thread to publish the HWND (or
+    // fail) before creating the device against it.
+    window_thread_ = std::thread(&Renderer::WindowThreadMain, this, 1280u, 720u);
+    while (!window_ready_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    hwnd = window_ready_hwnd_.load(std::memory_order_acquire);
+    if (!hwnd) {
+      REXGPU_ERROR("nx1_d3d9: failed to create output window");
+      if (window_thread_.joinable()) {
+        window_thread_.join();
+      }
+      d3d_->Release();
+      d3d_ = nullptr;
+      return false;
+    }
+    owns_window_ = true;
   }
+
+  // Size the backbuffer to the output window's client area, else a sane default.
+  RECT client{0, 0, 1280, 720};
+  GetClientRect(hwnd, &client);
   uint32_t width = uint32_t(client.right - client.left);
   uint32_t height = uint32_t(client.bottom - client.top);
   if (!width || !height) {
     width = 1280;
     height = 720;
-  }
-
-  // Our own window on its own thread -- never share the guest's HWND with the
-  // Xenia presenter, and never leave it pumped from a foreign thread. Wait for the
-  // thread to publish the HWND (or fail) before creating the device against it.
-  window_thread_ = std::thread(&Renderer::WindowThreadMain, this, width, height);
-  while (!window_ready_.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  HWND hwnd = window_ready_hwnd_.load(std::memory_order_acquire);
-  if (!hwnd) {
-    REXGPU_ERROR("nx1_d3d9: failed to create output window");
-    if (window_thread_.joinable()) {
-      window_thread_.join();
-    }
-    d3d_->Release();
-    d3d_ = nullptr;
-    return false;
   }
 
   D3DPRESENT_PARAMETERS pp{};
@@ -286,17 +311,21 @@ void Renderer::Shutdown() {
       d3d_ = nullptr;
     }
   }
+  // Only tear down a window we created. When we borrowed the rex host window it is
+  // rex's to destroy -- closing it here would take the whole app's window down.
   // DestroyWindow must run on the thread that created the window; ask it to close
   // (DefWindowProc -> DestroyWindow -> WM_DESTROY -> WM_QUIT) and let it exit. The
   // window thread only pumps messages -- it never touches render_mutex_ -- so join
   // it outside the lock.
-  if (hwnd_) {
-    PostMessageW(hwnd_, WM_CLOSE, 0, 0);
-    hwnd_ = nullptr;
+  if (owns_window_) {
+    if (hwnd_) {
+      PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+    }
+    if (window_thread_.joinable()) {
+      window_thread_.join();
+    }
   }
-  if (window_thread_.joinable()) {
-    window_thread_.join();
-  }
+  hwnd_ = nullptr;
 }
 
 void Renderer::BeginFrame() {

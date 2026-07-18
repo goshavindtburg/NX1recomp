@@ -64,6 +64,11 @@ struct RuntimeConfig {
   std::function<std::unique_ptr<system::IInputSystem>(bool tool_mode)> input_factory;
   std::function<void(Runtime*, system::KernelState*)> kernel_init;
   bool tool_mode = false;
+  // When true, the graphics system is still created and its command processor
+  // still executes the guest ring, but no host presenter/swapchain is built:
+  // an external renderer (the native D3D9 path, nx1_d3d9) owns the output
+  // window instead. See ReXApp::SetupPresentation and Runtime::Setup.
+  bool suppress_host_presentation = false;
 };
 
 /// Helper macros for populating RuntimeConfig with concrete backends.

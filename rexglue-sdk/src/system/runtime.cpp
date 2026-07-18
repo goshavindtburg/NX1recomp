@@ -155,7 +155,10 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Initialize GPU from injected config
   if (config.graphics) {
     graphics_system_ = std::move(config.graphics);
-    bool with_presentation = (app_context_ != nullptr);
+    // suppress_host_presentation keeps the command processor (it still executes
+    // the guest ring) but skips SetupPresentation, so no host swapchain is built
+    // -- the native D3D9 renderer owns the window in that mode.
+    bool with_presentation = (app_context_ != nullptr) && !config.suppress_host_presentation;
     X_STATUS gpu_status = graphics_system_->Setup(function_dispatcher_.get(), kernel_state_.get(),
                                                   app_context_, with_presentation);
     if (XFAILED(gpu_status)) {

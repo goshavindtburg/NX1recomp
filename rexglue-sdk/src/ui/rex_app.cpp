@@ -423,7 +423,7 @@ bool ReXApp::SetupPresentation() {
 
   OnPreSetup(config_);
 
-  if (config_.graphics) {
+  if (config_.graphics && !config_.suppress_host_presentation) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
     if (XFAILED(status)) {
       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);

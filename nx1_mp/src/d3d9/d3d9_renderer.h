@@ -163,6 +163,9 @@ class Renderer {
   IDirect3D9Ex* d3d_ = nullptr;
   IDirect3DDevice9Ex* device_ = nullptr;
   HWND hwnd_ = nullptr;
+  // True only when we created hwnd_ ourselves (the fallback path). When we borrow
+  // the rex host window we must neither pump nor destroy it -- rex owns it.
+  bool owns_window_ = false;
   std::thread window_thread_;
 
   // Teardown safety. Every entry point the guest ring/GPU thread calls (draws,
@@ -241,8 +244,9 @@ class Renderer {
   uint32_t current_rt_surface_ = 0;
 };
 
-/// Best-effort discovery of the game's top-level window.
-/// TODO(d3d9): plumb the real `rex::ui::Window` handle through instead.
+/// The window the D3D9 device renders into. Prefers the real rex host window
+/// (Runtime::display_window); falls back to enumerating this process's own
+/// top-level windows if the runtime hasn't published one yet.
 HWND FindGameWindow();
 
 #endif  // _WIN32

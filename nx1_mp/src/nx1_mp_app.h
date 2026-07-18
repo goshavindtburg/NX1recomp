@@ -44,7 +44,17 @@ class Nx1MpApp : public rex::ReXApp {
     ConfigureNx1Performance();
     ConfigureNx1Input();
   }
-  // void OnPreSetup(rex::RuntimeConfig& config) override {}
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    // The native D3D9 renderer (nx1_d3d9) renders the guest frame directly into
+    // the host window. Suppress the Xenia host presenter/swapchain so the two
+    // never fight for the same HWND: the command processor still executes the
+    // ring (fences, swap interrupt), only the host present is dropped. Leaving
+    // this off keeps the default Xenia presentation path untouched.
+    if (rex::cvar::Query<bool>("nx1_d3d9")) {
+      config.suppress_host_presentation = true;
+      REXLOG_INFO("NX1 MP: nx1_d3d9 set -- host presenter suppressed, D3D9 owns the window");
+    }
+  }
   void OnLoadXexImage(std::string& xex_image) override {
     xex_image = "game:\\5-nx1mp_demo.xex";
   }
