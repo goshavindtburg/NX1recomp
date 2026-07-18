@@ -289,14 +289,24 @@ class Renderer {
 
   /// Vertex ranges a draw referenced this frame, re-hashed at Present to see whether the
   /// engine rewrote them behind us.
+  /// Which memory class a probe covers. The original measurement only ever sampled VERTEX
+  /// ranges, but the executor reads index data and shader microcode late on the same argument --
+  /// which is analogy, not evidence. Each class translates differently (microcode is a GPU
+  /// physical address, the other two are guest physical), so the kind has to travel with it.
+  enum class ProbeKind : uint32_t { kVertex, kIndex, kUcode };
   struct StabilityProbe {
     uint32_t addr;
     uint32_t bytes;
     uint64_t hash;
+    ProbeKind kind;
   };
   std::vector<StabilityProbe> prof_stability_;
   uint64_t prof_stable_ok_ = 0;
   uint64_t prof_stable_changed_ = 0;
+  /// Per-class tallies, so "index data is stable" is a number rather than an assumption.
+  uint64_t prof_stable_ok_kind_[3] = {};
+  uint64_t prof_stable_changed_kind_[3] = {};
+  void ProbeStability(ProbeKind kind, uint32_t addr, uint32_t bytes);
   /// Splits the shaders phase outside UploadConstants: microcode hashing, cache lookup, and the
   /// SetShader/uniform/colour-mask binding around them.
   uint64_t prof_hash_ns_ = 0;

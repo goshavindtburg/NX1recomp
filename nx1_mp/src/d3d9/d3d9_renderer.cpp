@@ -366,13 +366,16 @@ void Renderer::Present() {
     }
     auto& tracker_probe = ResourceTracker::Get();
     for (const auto& probe : prof_stability_) {
-      if (const uint8_t* pp = tracker_probe.PhysicalPointer(probe.addr)) {
-        if (XXH3_64bits(pp, probe.bytes) == probe.hash) {
-          ++prof_stable_ok_;
-        } else {
-          ++prof_stable_changed_;
-        }
+      const uint8_t* pp = probe.kind == ProbeKind::kUcode
+                              ? GuestTranslateGpuPhysical(probe.addr)
+                              : tracker_probe.PhysicalPointer(probe.addr);
+      if (!pp) {
+        continue;
       }
+      const bool same = XXH3_64bits(pp, probe.bytes) == probe.hash;
+      const uint32_t k = uint32_t(probe.kind);
+      (same ? prof_stable_ok_ : prof_stable_changed_) += 1;
+      (same ? prof_stable_ok_kind_[k] : prof_stable_changed_kind_[k]) += 1;
     }
     prof_stability_.clear();
     prof_saw_draw_ = false;
@@ -498,14 +501,21 @@ void Renderer::Present() {
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
       REXGPU_INFO("nx1_d3d9: PROF/defer guest work: pre-draw={:.2f} between-draws={:.2f} "
-                  "post-draw={:.2f} ms/frame | vertex ranges stable {:.1f}% of {:.0f}",
+                  "post-draw={:.2f} ms/frame",
                   prof_gap_before_first_ns_ * tf, prof_gap_between_ns_ * tf,
-                  prof_gap_after_last_ns_ * tf,
-                  (prof_stable_ok_ + prof_stable_changed_)
-                      ? 100.0 * double(prof_stable_ok_) /
-                            double(prof_stable_ok_ + prof_stable_changed_)
-                      : 0.0,
-                  double(prof_stable_ok_ + prof_stable_changed_) / prof_frames);
+                  prof_gap_after_last_ns_ * tf);
+      // Reported PER CLASS. A combined number is dominated by the vertex probes and would let a
+      // genuinely unstable index or microcode range hide inside a 99.9% aggregate -- which is
+      // exactly the assumption the executor is resting on.
+      static const char* const kKindName[3] = {"vertex", "index", "ucode"};
+      for (uint32_t k = 0; k < 3; ++k) {
+        const uint64_t total = prof_stable_ok_kind_[k] + prof_stable_changed_kind_[k];
+        REXGPU_INFO("nx1_d3d9: PROF/stability {:<6} {:.2f}% unchanged, {} changed of {} probed",
+                    kKindName[k],
+                    total ? 100.0 * double(prof_stable_ok_kind_[k]) / double(total) : 0.0,
+                    prof_stable_changed_kind_[k], total);
+        prof_stable_ok_kind_[k] = prof_stable_changed_kind_[k] = 0;
+      }
       prof_gap_before_first_ns_ = prof_gap_between_ns_ = prof_gap_after_last_ns_ = 0;
       prof_stable_ok_ = prof_stable_changed_ = 0;
       REXGPU_INFO("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
@@ -1097,13 +1107,14 @@ void Renderer::ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_de
   };
 
   const uint32_t vs_pass = d.vs_pass;
-  // DEFERRED-GAP: ReadGuestUcode reads the shader object's microcode out of guest memory. Shader
-  // objects are allocated once and live for the frame, so a worker reading them late is very
-  // likely safe -- but "very likely" is what the vertex-range probe was for, and this has not
-  // had the same treatment. Measure before trusting it.
   const auto t_hash = smark();
-  const uint64_t vs_hash =
-      HashGuestUcode(ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, vs_pass));
+  const GuestUcode vs_ucode = ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, vs_pass);
+  // Microcode is read late by the worker on the argument that shader objects are allocated once
+  // and live for the frame. Plausible, and untested -- so probe it rather than assume it.
+  if (REXCVAR_GET(nx1_d3d9_profile) && vs_ucode.valid()) {
+    ProbeStability(ProbeKind::kUcode, vs_ucode.physical_address, vs_ucode.dword_count * 4);
+  }
+  const uint64_t vs_hash = HashGuestUcode(vs_ucode);
   const uint64_t ps_hash =
       ps_object ? HashGuestUcode(ReadGuestUcode(base, ps_object, /*pixel_shader=*/true)) : 0;
   sadd(prof_hash_ns_, t_hash);
@@ -1651,6 +1662,29 @@ void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t p
       cmdbuf_.RecordConstantDelta(base, guest_device, guest_dirty_vs_, guest_dirty_ps_);
 }
 
+void Renderer::ProbeStability(ProbeKind kind, uint32_t addr, uint32_t bytes) {
+  // Cap per class, not overall: a shared budget let the ~5000 vertex probes fill it before a
+  // single index or microcode range was ever sampled, which would have reported "no changes"
+  // for classes that were never actually looked at.
+  static constexpr size_t kPerKind = 256;
+  size_t of_kind = 0;
+  for (const auto& p : prof_stability_) {
+    if (p.kind == kind) ++of_kind;
+  }
+  if (of_kind >= kPerKind || !bytes || bytes > (16u << 20)) {
+    return;
+  }
+  // Microcode lives at a GPU physical address; vertex and index data at guest physical. Using
+  // the wrong translation here is the mistake that has blacked the screen three times, and in a
+  // diagnostic it would be worse -- it would silently report bogus instability.
+  const uint8_t* p = kind == ProbeKind::kUcode ? GuestTranslateGpuPhysical(addr)
+                                               : ResourceTracker::Get().PhysicalPointer(addr);
+  if (!p) {
+    return;
+  }
+  prof_stability_.push_back({addr, bytes, XXH3_64bits(p, bytes), kind});
+}
+
 void Renderer::CaptureGuestDirtyMask(const uint8_t* base, uint32_t guest_device) {
   if (!guest_device) {
     return;
@@ -1794,15 +1828,20 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
     return;
   }
 
-  if (REXCVAR_GET(nx1_d3d9_profile) && prof_stability_.size() < 512) {
-    // Record the vertex range this draw read, to re-hash at Present. A mismatch means the
-    // engine rewrote memory a deferred worker would still have been consuming.
+  if (REXCVAR_GET(nx1_d3d9_profile)) {
+    // Record the ranges this draw read, to re-hash at Present. A mismatch means the engine
+    // rewrote memory a deferred worker would still have been consuming.
     uint32_t probe_addr = 0, probe_bytes = 0;
-    auto& tracker_probe = ResourceTracker::Get();
-    if (tracker_probe.LastStreamRange(&probe_addr, &probe_bytes) && probe_bytes) {
-      if (const uint8_t* pp = tracker_probe.PhysicalPointer(probe_addr)) {
-        prof_stability_.push_back({probe_addr, probe_bytes, XXH3_64bits(pp, probe_bytes)});
-      }
+    if (ResourceTracker::Get().LastStreamRange(&probe_addr, &probe_bytes) && probe_bytes) {
+      ProbeStability(ProbeKind::kVertex, probe_addr, probe_bytes);
+    }
+    // The INDEX range this draw actually reads. Never measured before -- the executor reads it
+    // late purely by analogy with the vertex result, and index buffers are written by a
+    // different part of the engine on a different schedule, so the analogy is worth nothing
+    // until it is a number.
+    if (d.index_buffer && index_size) {
+      ProbeStability(ProbeKind::kIndex, d.index_buffer + start_index * index_size,
+                     index_count * index_size);
     }
   }
   device_->SetIndices(ib);

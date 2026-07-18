@@ -77,6 +77,8 @@
 #include <cstdint>
 
 #ifdef _WIN32
+#include <cstring>
+#include <memory>
 #include <vector>
 
 #include "d3d9_resources.h"  // kMaxHostStreams
@@ -270,28 +272,45 @@ class CommandBuffer {
  public:
   /// Append `count` registers (count*4 floats) of resolved constants; returns the pool offset.
   ///
-  /// !! POINTER INVALIDATION -- MUST BE FIXED BEFORE THE WORKER LANDS !!
-  /// constants() hands back a pointer INTO this vector. Today that is safe only because the flow
-  /// is synchronous and strictly append-then-read within one draw: nothing appends between a
-  /// draw's AddConstants and its ApplyConstants. The moment a worker reads frame data while the
-  /// guest thread keeps recording, a growth reallocation frees the block the worker is reading --
-  /// a use-after-free that will present as random constant corruption or a driver crash, not as
-  /// an obvious fault. Same hazard the FlatMap notes describe, with a worse failure mode.
-  /// Fix before step 3: either reserve a hard cap and refuse to grow, or hand the executor
-  /// offsets into a chunked pool whose blocks never move.
+  /// Backed by a CHUNKED pool, and that is load-bearing rather than an optimisation. This was a
+  /// plain std::vector, which was safe only because the synchronous flow appends and reads within
+  /// one draw. Under a worker -- reading frame data while the guest thread keeps recording -- a
+  /// growth reallocation frees the block the worker is mid-read of. That is a use-after-free that
+  /// presents as random constant corruption or a driver crash, not as a clean fault, and it would
+  /// have been miserable to find through a thread. Chunks are never resized and never moved, so a
+  /// pointer handed out stays valid for the whole frame no matter how much is appended after it.
   uint32_t AddConstants(const float* values, uint32_t count) {
-    const uint32_t offset = uint32_t(const_pool_.size());
-    const_pool_.insert(const_pool_.end(), values, values + size_t(count) * 4);
+    const size_t n = size_t(count) * 4;
+    // A single append is at most kMaxHostConstants*4 = 1024 floats, far below a chunk, so a
+    // request never straddles two chunks.
+    if (chunks_.empty() || chunk_used_ + n > kChunkFloats) {
+      if (++chunk_index_ >= chunks_.size()) {
+        chunks_.emplace_back(new float[kChunkFloats]);
+      }
+      chunk_used_ = 0;
+    }
+    float* dst = chunks_[chunk_index_].get() + chunk_used_;
+    if (n) {
+      std::memcpy(dst, values, n * sizeof(float));
+    }
+    const uint32_t offset = uint32_t(chunk_index_ * kChunkFloats + chunk_used_);
+    chunk_used_ += n;
     return offset;
   }
-  const float* constants(uint32_t offset) const { return const_pool_.data() + offset; }
+  const float* constants(uint32_t offset) const {
+    return chunks_[offset / kChunkFloats].get() + (offset % kChunkFloats);
+  }
 
   void BeginFrame() {
     draws_.clear();
     commands_.clear();
     deltas_.clear();
     delta_pool_.clear();
-    const_pool_.clear();
+    // Chunks are RETAINED, only rewound: reallocating a few hundred KB every frame would put
+    // cost back on the thread this whole scheme exists to unload. chunk_index_ starts at -1 so
+    // the first AddConstants steps onto chunk 0.
+    chunk_index_ = size_t(-1);
+    chunk_used_ = kChunkFloats;  // forces the first append to step to a chunk
     // The executor's running constant file carries across frames exactly as the guest's shadow
     // does, so a frame does not need to open with a full copy.
   }
@@ -327,7 +346,7 @@ class CommandBuffer {
   /// scheme and needs to stay visible.
   size_t captured_bytes() const {
     return draws_.size() * sizeof(RecordedDraw) + deltas_.size() * sizeof(ConstantDelta) +
-           delta_pool_.size() + const_pool_.size() * sizeof(float);
+           delta_pool_.size() + (chunk_index_ + 1) * kChunkFloats * sizeof(float);
   }
 
  private:
@@ -335,7 +354,12 @@ class CommandBuffer {
   std::vector<RecordedCommand> commands_;
   std::vector<ConstantDelta> deltas_;
   std::vector<uint8_t> delta_pool_;
-  std::vector<float> const_pool_;
+
+  /// Chunked constant storage -- see AddConstants for why the blocks must never move.
+  static constexpr size_t kChunkFloats = 64 * 1024;  // 256 KB per chunk
+  std::vector<std::unique_ptr<float[]>> chunks_;
+  size_t chunk_index_ = size_t(-1);
+  size_t chunk_used_ = kChunkFloats;
 };
 
 }  // namespace nx1::d3d9
