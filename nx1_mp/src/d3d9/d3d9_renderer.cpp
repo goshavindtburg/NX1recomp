@@ -1198,7 +1198,7 @@ void Renderer::ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_de
                            const GuestUcode* ucode_out) -> const Sm3Shader* {
     const uint64_t key = (uint64_t(object) << 8) ^ (uint64_t(pass) << 1) ^ (pixel_stage ? 1u : 0u) ^
                          0x9E3779B97F4A7C15ull;
-    ShaderMemo& slot = shader_memo_[(key * 0xD1B54A32D192ED03ull) >> 55];
+    ShaderMemo& slot = shader_memo_[(key * 0xD1B54A32D192ED03ull) >> 52];
     if (slot.key == key && slot.resolved) {
       ++prof_shader_memo_hits_;
       return slot.shader;

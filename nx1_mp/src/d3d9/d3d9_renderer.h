@@ -370,7 +370,7 @@ class Renderer {
   ///
   /// Direct-mapped and collision-overwriting -- no chains, no eviction policy. With ~120 live
   /// shaders in 512 slots, collisions are rare and a miss just does the work.
-  static constexpr uint32_t kShaderMemoSlots = 512;
+  static constexpr uint32_t kShaderMemoSlots = 4096;
   struct ShaderMemo {
     uint64_t key = 0;  ///< 0 = empty; object|pass mixed
     const Sm3Shader* shader = nullptr;
