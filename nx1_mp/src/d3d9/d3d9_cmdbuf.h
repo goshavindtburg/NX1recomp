@@ -96,7 +96,6 @@
 
 #ifdef _WIN32
 #include <cstring>
-#include <deque>
 #include <memory>
 #include <vector>
 
@@ -322,7 +321,15 @@ class CommandBuffer {
     // zero-register constant window of a shader whose whole window was optimised out.
     if (chunk_index_ == size_t(-1) || chunk_used_ + n > kChunkFloats) {
       if (++chunk_index_ >= chunks_.size()) {
-        chunks_.emplace_back(new float[kChunkFloats]);
+        // chunks_ is RESERVED to kMaxChunks so this push_back never reallocates. That matters:
+        // the chunk BLOCKS never move, but the vector holding the pointers to them would, and
+        // the worker dereferences chunks_[i] concurrently. Making the blocks immovable while
+        // leaving their index movable is a half-fix, and it corrupted every deferred draw.
+        if (chunk_index_ >= kMaxChunks) {
+          chunk_index_ = kMaxChunks - 1;  // bounded rather than reallocating; see full()
+        } else {
+          chunks_.emplace_back(new float[kChunkFloats]);
+        }
       }
       chunk_used_ = 0;
     }
@@ -339,6 +346,13 @@ class CommandBuffer {
   }
 
   void BeginFrame() {
+    // Reserve once, up front. clear() keeps capacity, so from here on push_back never
+    // reallocates and the worker can index safely while the guest appends.
+    if (draws_.capacity() < kMaxDraws) {
+      draws_.reserve(kMaxDraws);
+      commands_.reserve(kMaxCommands);
+      chunks_.reserve(kMaxChunks);
+    }
     draws_.clear();
     commands_.clear();
     deltas_.clear();
@@ -351,6 +365,24 @@ class CommandBuffer {
     // The executor's running constant file carries across frames exactly as the guest's shadow
     // does, so a frame does not need to open with a full copy.
   }
+
+  /// CAPACITY IS THE CORRECTNESS PROPERTY HERE, not a tuning knob.
+  ///
+  /// The worker indexes draws_/commands_ while the guest thread keeps appending. That is only
+  /// safe if the backing buffer NEVER MOVES: with capacity reserved, push_back writes past the
+  /// end and bumps size_, so an index the worker already holds keeps pointing at the same
+  /// memory. Grow the vector and the worker is reading freed storage.
+  ///
+  /// std::deque was tried here first, on the strength of "push_back does not invalidate
+  /// references". That guarantee is about references obtained BEFORE the push; calling
+  /// operator[] CONCURRENTLY with push_back still races the deque's internal block map. It
+  /// rendered the whole world as exploded geometry. Reserved vectors do not have that problem
+  /// because nothing inside them is written except the new tail.
+  static constexpr size_t kMaxDraws = 32768;
+  static constexpr size_t kMaxCommands = 49152;
+  static constexpr size_t kMaxChunks = 256;  // x 256 KB = 64 MB ceiling, ~4 chunks/frame in use
+
+  bool full() const { return draws_.size() >= kMaxDraws || commands_.size() >= kMaxCommands; }
 
   RecordedDraw& AddDraw() {
     draws_.emplace_back();
@@ -365,7 +397,7 @@ class CommandBuffer {
     return commands_.back();
   }
 
-  const std::deque<RecordedCommand>& commands() const { return commands_; }
+  const std::vector<RecordedCommand>& commands() const { return commands_; }
   RecordedCommand& command(uint32_t index) { return commands_[index]; }
   RecordedDraw& draw(uint32_t index) { return draws_[index]; }
 
@@ -375,7 +407,7 @@ class CommandBuffer {
   uint32_t RecordConstantDelta(const uint8_t* base, uint32_t guest_device, uint64_t vs_mask,
                                uint64_t ps_mask);
 
-  const std::deque<RecordedDraw>& draws() const { return draws_; }
+  const std::vector<RecordedDraw>& draws() const { return draws_; }
   const ConstantDelta& delta(uint32_t index) const { return deltas_[index]; }
   const uint8_t* delta_bytes(const ConstantDelta& d) const { return delta_pool_.data() + d.offset; }
   size_t delta_count() const { return deltas_.size(); }
@@ -388,8 +420,8 @@ class CommandBuffer {
   }
 
  private:
-  std::deque<RecordedDraw> draws_;
-  std::deque<RecordedCommand> commands_;
+  std::vector<RecordedDraw> draws_;
+  std::vector<RecordedCommand> commands_;
   std::vector<ConstantDelta> deltas_;
   std::vector<uint8_t> delta_pool_;
 

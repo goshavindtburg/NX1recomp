@@ -1892,6 +1892,21 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
     prof_last_prim_type_ = prim_type;
   }
 
+  // A frame that would exceed the command buffer's reserved capacity must not append: growing it
+  // reallocates storage the worker is indexing. Drain, then run the rest of this frame
+  // synchronously -- correct, and it only costs the overlap on a frame that is already an
+  // outlier (the reserve is ~6x a typical 5000-draw frame). BeginFrame restores async next frame.
+  if (worker_active_ && cmdbuf_.full()) {
+    DrainWorker();
+    worker_active_ = false;
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXGPU_WARN("nx1_d3d9: command buffer full ({} draws) -- rest of frame runs synchronously",
+                  cmdbuf_.draws().size());
+    }
+  }
+
   // Record, then execute from the record. STEP 2 of deferred translation: still synchronous, so
   // this buys no speed -- what it buys is that there is exactly ONE path. A "live" path reading
   // guest memory alongside a "recorded" one is how a capture gap stays invisible until the day
