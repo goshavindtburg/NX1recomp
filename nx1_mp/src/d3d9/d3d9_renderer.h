@@ -306,6 +306,14 @@ class Renderer {
   /// Per-class tallies, so "index data is stable" is a number rather than an assumption.
   uint64_t prof_stable_ok_kind_[3] = {};
   uint64_t prof_stable_changed_kind_[3] = {};
+  /// Per-frame sampling state: how many candidates of each class were offered, and how many were
+  /// actually taken. Reset every frame with the probe list -- see ProbeStability for why the
+  /// selection is a stride rather than the first N.
+  size_t prof_probe_seen_[3] = {};
+  size_t prof_probe_taken_[3] = {};
+  /// Cumulative candidates offered, so the report can state what FRACTION of the frame the
+  /// sample covers. "100% unchanged" means nothing without knowing how much was looked at.
+  uint64_t prof_probe_offered_[3] = {};
   void ProbeStability(ProbeKind kind, uint32_t addr, uint32_t bytes);
   /// Splits the shaders phase outside UploadConstants: microcode hashing, cache lookup, and the
   /// SetShader/uniform/colour-mask binding around them.

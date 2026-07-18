@@ -378,6 +378,10 @@ void Renderer::Present() {
       (same ? prof_stable_ok_kind_[k] : prof_stable_changed_kind_[k]) += 1;
     }
     prof_stability_.clear();
+    for (uint32_t k = 0; k < 3; ++k) {
+      prof_probe_offered_[k] += prof_probe_seen_[k];
+      prof_probe_seen_[k] = prof_probe_taken_[k] = 0;
+    }
     prof_saw_draw_ = false;
     prof_frame_start_ = tl_now;
   }
@@ -510,11 +514,13 @@ void Renderer::Present() {
       static const char* const kKindName[3] = {"vertex", "index", "ucode"};
       for (uint32_t k = 0; k < 3; ++k) {
         const uint64_t total = prof_stable_ok_kind_[k] + prof_stable_changed_kind_[k];
-        REXGPU_INFO("nx1_d3d9: PROF/stability {:<6} {:.2f}% unchanged, {} changed of {} probed",
+        REXGPU_INFO("nx1_d3d9: PROF/stability {:<6} {:.2f}% unchanged, {} changed of {} probed "
+                    "(strided sample of {} candidates)",
                     kKindName[k],
                     total ? 100.0 * double(prof_stable_ok_kind_[k]) / double(total) : 0.0,
-                    prof_stable_changed_kind_[k], total);
+                    prof_stable_changed_kind_[k], total, prof_probe_offered_[k]);
         prof_stable_ok_kind_[k] = prof_stable_changed_kind_[k] = 0;
+        prof_probe_offered_[k] = 0;
       }
       prof_gap_before_first_ns_ = prof_gap_between_ns_ = prof_gap_after_last_ns_ = 0;
       prof_stable_ok_ = prof_stable_changed_ = 0;
@@ -1663,17 +1669,21 @@ void Renderer::RecordDraw(const uint8_t* base, uint32_t guest_device, uint32_t p
 }
 
 void Renderer::ProbeStability(ProbeKind kind, uint32_t addr, uint32_t bytes) {
-  // Cap per class, not overall: a shared budget let the ~5000 vertex probes fill it before a
-  // single index or microcode range was ever sampled, which would have reported "no changes"
-  // for classes that were never actually looked at.
-  static constexpr size_t kPerKind = 256;
-  size_t of_kind = 0;
-  for (const auto& p : prof_stability_) {
-    if (p.kind == kind) ++of_kind;
-  }
-  if (of_kind >= kPerKind || !bytes || bytes > (16u << 20)) {
+  // STRIDE, not first-N. Taking the first 256 of each class sampled only the frame's opening
+  // passes -- the same shadow-cascade draws every frame -- and reported a perfect 100% across
+  // all three classes while the original first-512 probe had found 1 vertex range in 448
+  // changing. A measurement that only ever looks at the most static part of the frame will
+  // always say the frame is static. Sampling every kStride-th draw spreads the budget over the
+  // whole frame instead; at ~5000 draws that is ~310 probes per class, still cheap.
+  static constexpr size_t kStride = 16;
+  static constexpr size_t kPerKind = 512;
+  const uint32_t k = uint32_t(kind);
+  const size_t seen = prof_probe_seen_[k]++;
+  if ((seen % kStride) != 0 || prof_probe_taken_[k] >= kPerKind || !bytes ||
+      bytes > (16u << 20)) {
     return;
   }
+  ++prof_probe_taken_[k];
   // Microcode lives at a GPU physical address; vertex and index data at guest physical. Using
   // the wrong translation here is the mistake that has blacked the screen three times, and in a
   // diagnostic it would be worse -- it would silently report bogus instability.
