@@ -83,11 +83,6 @@ class ShaderCache {
   void UploadConstants(const uint8_t* base, uint32_t guest_device, const Sm3Shader& shader,
                        bool pixel_stage);
 
-  /// TEMP DIAGNOSTIC: the host register a given GUEST register was uploaded into, or -1.
-  /// The remap is per-shader, so a probe that wants a specific engine constant (the cascade
-  /// scale/offset, say) cannot hardcode a host index -- it has to ask for the guest one.
-  int HostRegisterForGuest(const Sm3Shader& shader, uint32_t guest_register) const;
-
  private:
   ShaderCache() = default;
   ~ShaderCache() { Shutdown(); }

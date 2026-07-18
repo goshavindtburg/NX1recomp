@@ -36,29 +36,6 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
                     "leaves every minified surface aliasing (the coloured speckle).")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-// TEMP DIAGNOSTIC (no shadows)
-// Polarity, anchored EMPIRICALLY this time (nx1_d3d9_dbg_shadow=16 screenshot, 2026-07-17):
-// a tap is `sge r14, r4.zzzz, r14` => (frag_z >= atlas_z) ? 1 : 0, and on screen 1 renders as
-// LIT (white dominates open ground; the black shapes are where geometry casts). Fragment
-// depths are ~0.48 and the atlas background clears to 0, so a lookup that misses everything
-// lands on 0 => z >= 0 => lit, a sensible default. Therefore:
-//       0 (atlas = 0.0) => every tap 1 => fully lit  => looks like the status quo (null test)
-//     100 (atlas = 1.0) => every tap 0 => fully SHADOWED => the world must DARKEN by exactly
-//                          the sun term's visible contribution
-//     200 => flicker 0.0 <-> 1.0 every 500 ms. The two constants bracket every fragment
-//            depth, so all taps flip lit<->shadowed together: if the sun-shadow term reaches
-//            the frame at all, the whole world pulses. Separate 0-vs-100 runs (different
-//            scene, eyeballed stills) can hide a uniform dim; a pulse cannot be missed.
-// This note has been rewritten twice with opposite conclusions derived from the microcode --
-// trust the mode-16 screenshot, not re-derivation.
-REXCVAR_DEFINE_INT32(nx1_d3d9_shadow_test, -1, "GPU",
-                     "Debug: replace shadow-atlas depth with a constant (value/100). -1 = off, "
-                     "0 = fully lit (null test), 100 = fully shadowed (world must darken), "
-                     "200 = flicker between the two every 500 ms.");
-
-REXCVAR_DEFINE_BOOL(nx1_d3d9_dump_shadow, false, "GPU",
-                    "Debug: dump each shadow-atlas resolve to texdump/shadow_atlas_*.bmp.");
-
 #ifdef _WIN32
 
 namespace nx1::d3d9 {
@@ -1641,57 +1618,6 @@ IDirect3DVertexBuffer9* ResourceTracker::GetVertexBuffer(const uint8_t* base, ui
   }
   entry.vb->Unlock();
 
-  // TEMP DIAGNOSTIC (no sun shadows): check the packed-normal decode CONTRACT.
-  //
-  // XenosRecomp deletes the decode from the shader -- `tfetchR11G11B10(x)` -> `x`, commented
-  // "Normal decode moves to the vertex-upload path" -- and trusts THIS code to hand the shader a
-  // decoded, unit-length normal. Nothing verifies that, and the world lighting does
-  //     sun = saturate(dot(normal, sunDir)) * sunColour;  oC0 = sun * shadow + ambient
-  // so a bad normal reads as "lit but flat, no sun shadows" -- precisely the open bug. A mean
-  // length of ~1.0 clears the decode; ~0 or wildly off is the answer.
-  {
-    static std::mutex nm;
-    static std::vector<uint64_t> nseen;
-    for (const ConvertOp& op : layout.ops) {
-      if (op.stream != stream || !op.expand) {
-        continue;
-      }
-      if (op.format != kFmt_11_11_10 && op.format != kFmt_10_11_11 &&
-          op.format != kFmt_2_10_10_10) {
-        continue;  // the three packed formats the renderer maps to NORMAL/TANGENT/BINORMAL
-      }
-      const uint64_t key = (uint64_t(op.format) << 40) ^ (uint64_t(op.src_offset) << 16) ^
-                           uint64_t(guest_stride);
-      std::lock_guard<std::mutex> lk(nm);
-      if (std::find(nseen.begin(), nseen.end(), key) != nseen.end() || nseen.size() >= 8) {
-        continue;
-      }
-      nseen.push_back(key);
-      char b[512];
-      int n = std::snprintf(b, sizeof(b),
-                            "nx1_d3d9: VTXNORMAL fmt=%u off=%u signed=%u norm=%u stride=%u |",
-                            op.format, op.src_offset, op.is_signed ? 1u : 0u,
-                            op.is_normalized ? 1u : 0u, guest_stride);
-      double sum_len = 0.0;
-      uint32_t taken = 0;
-      const uint32_t step = count > 6 ? count / 6 : 1;
-      for (uint32_t v = 0; v < count && taken < 6; v += step, ++taken) {
-        float d[4];
-        Expand(src + size_t(v) * guest_stride + op.src_offset, op, d);
-        const double len =
-            std::sqrt(double(d[0]) * d[0] + double(d[1]) * d[1] + double(d[2]) * d[2]);
-        sum_len += len;
-        if (taken < 3 && n < 380) {
-          n += std::snprintf(b + n, sizeof(b) - n, " (%.3f,%.3f,%.3f)len=%.3f", d[0], d[1], d[2],
-                             len);
-        }
-      }
-      std::snprintf(b + n, sizeof(b) - n, " | meanlen=%.4f over %u verts", sum_len / double(taken),
-                    taken);
-      REXGPU_INFO("{}", b);
-    }
-  }
-
   entry.bytes = host_bytes;
   entry.vertex_count = count;
   entry.content_hash = content_hash;
@@ -2324,70 +2250,6 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       cur.swap(next);
     }
   }
-  // TEMP DIAGNOSTIC (no shadows): dump the decoded lightmap atlas (8888, 512x2048 / 512x1024)
-  // while its level 0 is still mapped. IW4 bakes the sun's shadows into the lightmaps, and
-  // forcing the dynamic shadow atlas changed nothing -- so the question is whether the baked
-  // shadows are present in this data at all.
-  if (dst && t.format == 6 && t.width == 512 && (height == 2048 || height == 1024)) {
-    static uint32_t n = 0;
-    if (n++ < 3) {
-      char p[128];
-      std::snprintf(p, sizeof(p), "texdump/lightmap_%08X_%ux%u.bmp", t.base_address, t.width,
-                    height);
-      if (FILE* f = std::fopen(p, "wb")) {
-        const uint32_t row = (t.width * 3 + 3) & ~3u;
-        uint8_t hdr[54] = {'B', 'M'};
-        const uint32_t fsz = 54 + row * height, off = 54, ih = 40, data = row * height;
-        const uint16_t planes = 1, bpp = 24;
-        std::memcpy(hdr + 2, &fsz, 4);  std::memcpy(hdr + 10, &off, 4);
-        std::memcpy(hdr + 14, &ih, 4);  std::memcpy(hdr + 18, &t.width, 4);
-        std::memcpy(hdr + 22, &height, 4); std::memcpy(hdr + 26, &planes, 2);
-        std::memcpy(hdr + 28, &bpp, 2); std::memcpy(hdr + 34, &data, 4);
-        std::fwrite(hdr, 1, 54, f);
-        std::vector<uint8_t> line(row, 0);
-        for (int y = int(height) - 1; y >= 0; --y) {
-          const uint8_t* r = dst + size_t(y) * locked.Pitch;
-          for (uint32_t x = 0; x < t.width; ++x) {
-            line[x * 3 + 0] = r[x * 4 + 0];
-            line[x * 3 + 1] = r[x * 4 + 1];
-            line[x * 3 + 2] = r[x * 4 + 2];
-          }
-          std::fwrite(line.data(), 1, row, f);
-        }
-        std::fclose(f);
-        REXGPU_INFO("nx1_d3d9: LIGHTMAPDUMP wrote {} (swizzle {:#05x}, tiled={})", p, t.swizzle,
-                    t.tiled);
-      }
-    }
-  }
-
-  // TEMP DIAGNOSTIC (colour grading): dump the composite's tonemap ramp (s8 = 256x1). With a
-  // valid graded LUT (proven), the composite is oC0 = tex3D(LUT, ramp(scene)) -- so this ramp
-  // sets the LUT lookup coords. Log its curve at a few points, decoded as the shader sees it
-  // (A8R8G8B8 in memory = [B][G][R][A]). A straight 0->255 line is identity (correct passthrough
-  // into the LUT); a compressed/flat/wrong curve mis-indexes the grade.
-  if (t.width == 256 && height == 1 && dst) {
-    static std::mutex sm;
-    static std::vector<uint32_t> sseen;
-    std::lock_guard<std::mutex> lk(sm);
-    if (std::find(sseen.begin(), sseen.end(), t.base_address) == sseen.end() &&
-        sseen.size() < 8) {
-      sseen.push_back(t.base_address);
-      // fmt=2 (k_8) builds as L8 -- ONE byte per texel, sampled as luminance replicated to RGB.
-      // Read the row at its real host pitch and stride by the actual bytes/texel.
-      const uint8_t* row = static_cast<const uint8_t*>(locked.pBits);
-      const uint32_t bpt = uint32_t(locked.Pitch) / 256u;  // bytes per texel (1 for L8)
-      char b[420];
-      int n = std::snprintf(b, sizeof(b), "nx1_d3d9: RAMP8 @%08X fmt=%u bpt=%u 256x1:",
-                            t.base_address, t.format, bpt);
-      for (uint32_t x = 0; x <= 256; x += 32) {
-        const uint32_t xi = x > 255 ? 255 : x;
-        n += std::snprintf(b + n, sizeof(b) - n, " [%u]=%u", xi, row[size_t(xi) * bpt]);
-      }
-      REXGPU_INFO("{}", b);
-    }
-  }
-
   staging->UnlockRect(0);
 
   // D3DUSAGE_AUTOGENMIPMAP reports a single level and keeps its sub-levels to itself: the
@@ -2629,51 +2491,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
   const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
   const uint64_t content_hash = XXH3_64bits(src, guest_bytes);
 
-  // TEMP DIAGNOSTIC (colour grading): the composite is `oC0 = tex3D(s7, ...)`, a pure LUT
-  // replacement -- a truly-black LUT would make the frame black, and it is not. So log, on
-  // EVERY call for a small cubic LUT (not just cache-miss), whether the guest memory is empty
-  // and whether we are about to serve a cache hit. If the LUT is empty on a cache HIT, we are
-  // permanently serving a black texture built once from empty RAM.
-  if (t.width <= 64 && t.depth >= 8 && t.width == t.depth) {
-    static std::mutex hm;
-    static uint32_t hcount = 0;
-    std::lock_guard<std::mutex> lk(hm);
-    if ((hcount++ % 240) == 0) {
-      uint32_t nz = 0;
-      for (size_t bi = 0; bi < guest_bytes; ++bi) nz += src[bi] != 0 ? 1 : 0;
-      const bool cache_hit =
-          entry.vol && entry.layout_key == layout_key && entry.content_hash == content_hash;
-      REXGPU_INFO("nx1_d3d9: LUTLIVE s{} @{:08X} {}^3 nonzero={}/{} cachehit={} hosttex={}",
-                  sampler, t.base_address, t.width, nz, uint32_t(guest_bytes), cache_hit,
-                  entry.vol ? "have" : "none");
-    }
-  }
-
   if (entry.vol && entry.layout_key == layout_key && entry.content_hash == content_hash) {
     return entry.vol;
   }
   if (entry.vol && entry.layout_key != layout_key) {
     entry.vol->Release();
     entry.vol = nullptr;
-  }
-
-  // TEMP DIAGNOSTIC (sun ~10x too weak): identify the volume light. The world PS turns this
-  // sample into ambient as `(2*V)^2`, so V is squared straight into the frame and competes
-  // with a sun of NdotL*g18 ~= 1.06. Log what we actually build: a gamma flag we honour with
-  // SRGBTEXTURE (D3D9 sRGB reads are a FORMAT CAP -- drivers commonly do not support them for
-  // VOLUME textures, so setting it may be silently ignored, leaving V gamma-encoded and the
-  // ambient ~5x hot), and the host format (a float format could legitimately exceed 1).
-  {
-    static std::mutex vm;
-    static std::vector<uint64_t> vseen;
-    std::lock_guard<std::mutex> lk(vm);
-    if (std::find(vseen.begin(), vseen.end(), layout_key) == vseen.end() && vseen.size() < 8) {
-      vseen.push_back(layout_key);
-      REXGPU_INFO(
-          "nx1_d3d9: VOLTEX s{} {}x{}x{} guestfmt={} hostfmt=0x{:X} gamma={} tiled={} swizzle={:03X}",
-          sampler, t.width, t.height, t.depth, t.format, uint32_t(host.d3d), t.gamma, t.tiled,
-          t.swizzle & 0xFFF);
-    }
   }
 
   IDirect3DVolumeTexture9* staging = nullptr;
@@ -2697,96 +2520,6 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
       for (uint32_t y = 0; y < blocks_high; ++y) {
         SwizzleRow32(slice + size_t(y) * box.RowPitch, blocks_wide, swz);
       }
-    }
-  }
-  // TEMP DIAGNOSTIC (colour grading): dump the corners of the small cubic LUT AS THE SHADER
-  // WILL SEE IT (post-detile, post-swizzle). The composite binds it `ok`, so the grade is
-  // applied -- the question is whether the content is a real warm grade or has been flattened
-  // / channel-swapped in our path. Identity LUT: cell(i,i,i) ~= (i/(N-1)) grey. A real grade
-  // deviates (warm = R>B at the top). BGRA in memory: byte order is [B][G][R][A].
-  // Dedup on CONTENT hash, not layout_key: the LUT is built empty on frame 1 then populated,
-  // and keying on layout_key only ever dumped the empty first build. Now we also capture the
-  // real, populated grade.
-  if (t.width <= 64 && t.depth >= 8 && t.width == t.depth) {
-    static std::mutex lm;
-    static std::vector<uint64_t> lseen;
-    std::lock_guard<std::mutex> lk(lm);
-    if (std::find(lseen.begin(), lseen.end(), content_hash) == lseen.end() && lseen.size() < 24) {
-      lseen.push_back(content_hash);
-      const uint32_t N = t.width;
-      auto cell = [&](uint32_t x, uint32_t y, uint32_t z, char* out, size_t cap) {
-        const uint8_t* px = static_cast<const uint8_t*>(box.pBits) + size_t(z) * box.SlicePitch +
-                            size_t(y) * box.RowPitch + size_t(x) * 4;
-        std::snprintf(out, cap, "(B%u G%u R%u A%u)", px[0], px[1], px[2], px[3]);
-      };
-      char c0[32], c1[32], c2[32], c3[32], c4[32];
-      cell(0, 0, 0, c0, sizeof(c0));
-      cell(N / 4, N / 4, N / 4, c1, sizeof(c1));
-      cell(N / 2, N / 2, N / 2, c2, sizeof(c2));
-      cell(3 * N / 4, 3 * N / 4, 3 * N / 4, c3, sizeof(c3));
-      cell(N - 1, N - 1, N - 1, c4, sizeof(c4));
-      REXGPU_INFO("nx1_d3d9: LUTDIAG {}^3 fmt={} swizzle={:03X} diag: {} {} {} {} {}", N, t.format,
-                  t.swizzle & 0xFFF, c0, c1, c2, c3, c4);
-
-      // Dump the whole cube as a (N*N) wide by N tall RGB montage (the N z-slices laid out
-      // left-to-right) -- a correct colour LUT is a smooth cube; a misplaced/sparse
-      // reconstruction (our 25%-nonzero suspect) shows as scattered lit cells on black.
-      uint32_t diag_nz = 0;
-      for (size_t bi = 0; bi < guest_bytes; ++bi) diag_nz += src[bi] != 0 ? 1 : 0;
-      if (diag_nz > 0) {
-        const uint32_t W = N * N, H = N;
-        const uint32_t stride = (W * 3 + 3) & ~3u;
-        std::vector<uint8_t> img(size_t(stride) * H, 0);
-        for (uint32_t z = 0; z < N; ++z) {
-          const uint8_t* slice =
-              static_cast<const uint8_t*>(box.pBits) + size_t(z) * box.SlicePitch;
-          for (uint32_t y = 0; y < N; ++y) {
-            const uint8_t* row = slice + size_t(y) * box.RowPitch;
-            for (uint32_t x = 0; x < N; ++x) {
-              const uint8_t* px = row + size_t(x) * 4;  // BGRA
-              uint8_t* out = img.data() + size_t(H - 1 - y) * stride + (z * N + x) * 3;
-              out[0] = px[0];  // B
-              out[1] = px[1];  // G
-              out[2] = px[2];  // R
-            }
-          }
-        }
-        char path[128];
-        std::snprintf(path, sizeof(path), "texdump/lut_%08X.bmp", t.base_address);
-        if (std::FILE* f = std::fopen(path, "wb")) {
-          BITMAPFILEHEADER fh{};
-          BITMAPINFOHEADER ih{};
-          fh.bfType = 0x4D42;
-          fh.bfOffBits = sizeof(fh) + sizeof(ih);
-          fh.bfSize = fh.bfOffBits + uint32_t(img.size());
-          ih.biSize = sizeof(ih);
-          ih.biWidth = LONG(W);
-          ih.biHeight = LONG(H);
-          ih.biPlanes = 1;
-          ih.biBitCount = 24;
-          std::fwrite(&fh, sizeof(fh), 1, f);
-          std::fwrite(&ih, sizeof(ih), 1, f);
-          std::fwrite(img.data(), 1, img.size(), f);
-          std::fclose(f);
-          REXGPU_INFO("nx1_d3d9: LUTDIAG dumped {} ({}x{})", path, W, H);
-        }
-      }
-      // Separate "we read the wrong/empty memory" from "detile zeroed good data": hash + first
-      // dwords of the RAW guest bytes, and the address/tiling we resolved from.
-      uint32_t nz = 0;
-      for (size_t bi = 0; bi < guest_bytes; ++bi) nz += src[bi] != 0 ? 1 : 0;
-      // Is this a GPU-produced texture? GetTexture (2D) serves resolve destinations from the
-      // rendered image; GetVolumeTexture does NOT. If the LUT address is a resolve dest, that
-      // gap is the bug -- we read empty CPU RAM where the GPU wrote the grade.
-      bool is_resolve = false;
-      if (resolves_) {
-        auto* rm = static_cast<ResolveMap*>(resolves_);
-        is_resolve = rm->find(PhysicalAddress(t.base_address)) != rm->end();
-      }
-      REXGPU_INFO("nx1_d3d9: LUTRAW @{:08X} bytes={} nonzero={} resolvedest={} tiled={} bpb={} "
-                  "mip@{:08X} hash={:016X} raw0={:08X}",
-                  t.base_address, uint32_t(guest_bytes), nz, is_resolve, t.tiled, bpb,
-                  t.mip_address, content_hash, *reinterpret_cast<const uint32_t*>(src));
     }
   }
 
@@ -2964,14 +2697,10 @@ bool ResourceTracker::EnsureDepthBlit() {
   // Reads the INTZ depth surface and writes it as a plain float. ps_2_0, not 3_0: the
   // quad is drawn with pre-transformed (XYZRHW) vertices through the fixed-function
   // vertex pipeline, and D3D9 refuses to pair that with a 3_0 pixel shader.
-  // c0.x is a debug override (nx1_d3d9_shadow_test): x < 0 passes depth through, otherwise
-  // the blit writes the constant c0.x so the shadow compare can be exercised end-to-end.
   static const char kSource[] =
       "sampler2D depth : register(s0);\n"
-      "float4 dbg : register(c0);\n"
       "float4 main(float2 uv : TEXCOORD0) : COLOR {\n"
-      "  float d = tex2D(depth, uv).r;\n"
-      "  return (dbg.x < 0 ? d : dbg.x).rrrr;\n"
+      "  return tex2D(depth, uv).rrrr;\n"
       "}\n";
 
   ID3DBlob* code = nullptr;
@@ -3068,20 +2797,6 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   device_->SetVertexDeclaration(nullptr);
   device_->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
   device_->SetPixelShader(depth_blit_ps_);
-  // TEMP DIAGNOSTIC (no shadows): nx1_d3d9_shadow_test >= 0 replaces every shadow-atlas
-  // depth with that constant. 1.0 = "nearest occluder everywhere": if the lighting
-  // shaders' shadow path is live, the world must go fully shadowed.
-  const int32_t shadow_test = REXCVAR_GET(nx1_d3d9_shadow_test);
-  // Scope the forcing to the shadow cascades. ResolveDepth also serves the 1024x600 SCENE
-  // depth, and forcing that too sent the DOF chain "everything is far" -- a full-screen blur
-  // that masqueraded as a shadow-term pulse in the 200 flicker and contaminated every earlier
-  // A/B. Cascade atlases are >= 1024 tall; the scene depth is 600.
-  float forced = shadow_test < 0 || height < 1024 ? -1.0f : float(shadow_test) / 100.0f;
-  if (shadow_test == 200 && height >= 1024) {
-    forced = (GetTickCount64() / 500) & 1 ? 1.0f : 0.0f;
-  }
-  const float dbg[4] = {forced, 0.0f, 0.0f, 0.0f};
-  device_->SetPixelShaderConstantF(0, dbg, 1);
   device_->SetTexture(0, src_depth);
   device_->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
   device_->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
@@ -3121,86 +2836,6 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
                               {x0, y1, 0.0f, 1.0f, u0, v1},
                               {x1, y1, 0.0f, 1.0f, u1, v1}};
   device_->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(BlitVertex));
-
-  // TEMP DIAGNOSTIC (no shadows): sample the atlas content after each blit. Degenerate
-  // stats (all zero / all one) mean the cascade passes never wrote depth; varied values
-  // mean the content is fine and the fault is in the lighting shader's sampling/compare.
-  {
-    static uint32_t n = 0;
-    if ((n++ % 181) == 0) {
-      IDirect3DSurface9* off = nullptr;
-      if (SUCCEEDED(device_->CreateOffscreenPlainSurface(width, height, D3DFMT_R32F,
-                                                         D3DPOOL_SYSTEMMEM, &off, nullptr)) &&
-          off) {
-        if (SUCCEEDED(device_->GetRenderTargetData(dst, off))) {
-          D3DLOCKED_RECT lr{};
-          if (SUCCEEDED(off->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
-            float mn = 1e30f, mx = -1e30f;
-            double sum = 0;
-            uint64_t cnt = 0, zeros = 0;
-            for (uint32_t y = 0; y < height; y += 4) {
-              const float* row = reinterpret_cast<const float*>(
-                  static_cast<const uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch);
-              for (uint32_t x = 0; x < width; x += 4) {
-                const float v = row[x];
-                mn = std::min(mn, v);
-                mx = std::max(mx, v);
-                sum += v;
-                ++cnt;
-                zeros += v == 0.0f ? 1 : 0;
-              }
-            }
-            REXGPU_INFO("nx1_d3d9: SHADOWATLAS 0x{:08X} {}x{} sr=({},{},{},{}) at=({},{}) "
-                        "min={:.6f} max={:.6f} mean={:.6f} zero={}% [shadow_test={}]",
-                        PhysicalAddress(dest_address), width, height, sr.left, sr.top, sr.right,
-                        sr.bottom, dest_point.x, dest_point.y, mn, mx,
-                        sum / double(std::max<uint64_t>(1, cnt)),
-                        zeros * 100 / std::max<uint64_t>(1, cnt), shadow_test);
-            // Dump the atlas itself: the stats say "real depth", but only the image says
-            // whether it is a *sun-view depth render of this scene* and whether both cascade
-            // tiles are populated. Normalized by max -- the useful values occupy a thin slice
-            // of [0,1] (the light-space depth range is ~62900 world units).
-            if (REXCVAR_GET(nx1_d3d9_dump_shadow) && mx > mn) {
-              static uint32_t dump_n = 0;
-              char path[256];
-              std::snprintf(path, sizeof(path), "texdump/shadow_atlas_%08X_%u.bmp",
-                            PhysicalAddress(dest_address), dump_n++);
-              if (std::FILE* f = std::fopen(path, "wb")) {
-                const uint32_t stride = (width * 3 + 3) & ~3u;
-                BITMAPFILEHEADER fh{};
-                BITMAPINFOHEADER ih{};
-                fh.bfType = 0x4D42;
-                fh.bfOffBits = sizeof(fh) + sizeof(ih);
-                fh.bfSize = fh.bfOffBits + stride * height;
-                ih.biSize = sizeof(ih);
-                ih.biWidth = LONG(width);
-                ih.biHeight = LONG(height);  // positive: rows are written bottom-up
-                ih.biPlanes = 1;
-                ih.biBitCount = 24;
-                std::fwrite(&fh, sizeof(fh), 1, f);
-                std::fwrite(&ih, sizeof(ih), 1, f);
-                std::vector<uint8_t> row(stride, 0);
-                for (uint32_t y = 0; y < height; ++y) {
-                  const float* src = reinterpret_cast<const float*>(
-                      static_cast<const uint8_t*>(lr.pBits) + size_t(height - 1 - y) * lr.Pitch);
-                  for (uint32_t x = 0; x < width; ++x) {
-                    const float t = (src[x] - mn) / (mx - mn);
-                    const uint8_t g = uint8_t((t < 0 ? 0 : t > 1 ? 1 : t) * 255.0f + 0.5f);
-                    row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = g;
-                  }
-                  std::fwrite(row.data(), stride, 1, f);
-                }
-                std::fclose(f);
-                REXGPU_INFO("nx1_d3d9: SHADOWATLAS dumped {}", path);
-              }
-            }
-            off->UnlockRect();
-          }
-        }
-        off->Release();
-      }
-    }
-  }
 
   device_->SetTexture(0, nullptr);
   device_->SetPixelShader(nullptr);

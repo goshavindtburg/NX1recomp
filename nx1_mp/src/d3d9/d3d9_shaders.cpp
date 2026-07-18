@@ -27,17 +27,6 @@
 #include "nx1_sm3_shader_cache.h"
 #endif
 
-// TEMP DIAGNOSTIC (sun term too weak): override one component of one guest PIXEL shader
-// constant, resolved through each shader's own remap. Selector is guestReg*100 + component
-// (0=x..3=w); value is hundredths. e.g. force g35.w = 1.0:
-//   nx1_d3d9_force_ps_const = 3503
-//   nx1_d3d9_force_ps_value = 100
-REXCVAR_DEFINE_INT32(nx1_d3d9_force_ps_const, -1, "GPU",
-                     "Debug: override a guest PS constant component. guestReg*100 + component "
-                     "(0=x,1=y,2=z,3=w). -1 = off.");
-REXCVAR_DEFINE_INT32(nx1_d3d9_force_ps_value, 100, "GPU",
-                     "Debug: the value for nx1_d3d9_force_ps_const, in hundredths (100 = 1.0).");
-
 namespace nx1::d3d9 {
 
 namespace {
@@ -257,12 +246,6 @@ const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
     shader.needs_inv_tex_dim =
         base + 17 < kMaxHostConstants &&
         ReadsUndefinedConstRange(code, found->bytecodeSize / 4, base + 2, base + 17);
-    static uint32_t with_dims = 0, without_dims = 0;
-    (shader.needs_inv_tex_dim ? with_dims : without_dims)++;
-    if (((with_dims + without_dims) % 64) == 0) {
-      REXGPU_INFO("nx1_d3d9: g_InvTexDim classification: {} shaders read it, {} do not",
-                  with_dims, without_dims);
-    }
   }
 
   HRESULT hr;
@@ -315,23 +298,6 @@ bool NeedsHostNdcTransform(const Sm3Shader& shader) {
 #else
   return shader.entry && (shader.entry->flags & NX1_SM3_NEEDS_HOST_HALF_PIXEL) != 0;
 #endif
-}
-
-int ShaderCache::HostRegisterForGuest(const Sm3Shader& shader, uint32_t guest_register) const {
-#ifdef NX1_HAVE_SM3_SHADER_CACHE
-  const Nx1Sm3CacheEntry* e = shader.entry;
-  if (!e || (e->flags & NX1_SM3_UNCOMPACTED_CONSTANTS)) {
-    return int(guest_register);  // uncompacted: uploaded 1:1
-  }
-  for (uint32_t i = 0; i < e->remapCount; ++i) {
-    if (g_nx1Sm3ConstantRemap[e->remapOffset + i] == guest_register) {
-      return int(i);
-    }
-  }
-#endif
-  (void)shader;
-  (void)guest_register;
-  return -1;
 }
 
 void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
@@ -401,47 +367,6 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
     }
   }
 
-  // TEMP DIAGNOSTIC (sun term ~10x too weak): override one component of one guest PS constant.
-  // The world PS ends in `mad r6.xyz, r0.xzy, c35.wwww, r5.xyz` -- i.e. lerp(r5, r7*r0, c35.w)
-  // -- and we read g35 = (1,1,1,0), so `.w = 0` multiplies the ENTIRE lit path out and leaves
-  // r6 = r5. The shadow only survives via r5's own lerp, which is exactly the measured 3-8%
-  // residue. Whether (1,1,1,0) is faithful guest data or a stale/short write on our side is the
-  // question; forcing .w answers it in one run instead of another trace.
-  //   nx1_d3d9_force_ps_const = <guestReg>*100 + <component>, value from nx1_d3d9_force_ps_value
-  const int32_t force_sel = REXCVAR_GET(nx1_d3d9_force_ps_const);
-  if (pixel_stage && force_sel >= 0 && !(e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS)) {
-    const uint32_t want_reg = uint32_t(force_sel / 100);
-    const uint32_t want_c = uint32_t(force_sel % 100);  // 0..3 = x..w, 4 = xyz together
-    if (want_c < 5) {
-      const float v = float(REXCVAR_GET(nx1_d3d9_force_ps_value)) / 100.0f;
-      for (uint32_t i = 0; i < count; ++i) {
-        if (g_nx1Sm3ConstantRemap[e.remapOffset + i] == want_reg) {
-          // Log the HASH, not just a host index: this override hits EVERY shader that reads
-          // the register, and a hash-less line already caused one wrong read (the value was
-          // reported against host c2 while the shader under investigation used c8).
-          static std::mutex fm;
-          static std::vector<uint64_t> ftold;
-          {
-            std::lock_guard<std::mutex> lk(fm);
-            if (std::find(ftold.begin(), ftold.end(), e.hash) == ftold.end() &&
-                ftold.size() < 12) {
-              ftold.push_back(e.hash);
-              REXGPU_WARN("nx1_d3d9: FORCECONST {:016X} g{}.{} was ({:.4g},{:.4g},{:.4g},{:.4g})"
-                          " -> {:.4g} (host c{})",
-                          e.hash, want_reg, want_c == 4 ? '*' : "xyzw"[want_c], staging[i * 4],
-                          staging[i * 4 + 1], staging[i * 4 + 2], staging[i * 4 + 3], v, i);
-            }
-          }
-          if (want_c == 4) {
-            staging[i * 4 + 0] = staging[i * 4 + 1] = staging[i * 4 + 2] = v;
-          } else {
-            staging[i * 4 + want_c] = v;
-          }
-        }
-      }
-    }
-  }
-
   if (count == 0) {
     // No window to upload, but the defs still need asserting (see below).
     for (uint32_t d = 0; d < shader.def_count; ++d) {
@@ -452,110 +377,6 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
       }
     }
     return;
-  }
-
-  // TEMP DIAGNOSTIC (no shadows). Log each host register's GUEST source register, its uploaded
-  // value, and its provenance (literal table / PM4 ring / shadow file). The remap is PER SHADER,
-  // so any reading of a host constant without it is a guess.
-  //
-  // Gate each stage on the constants that actually matter, not on size -- a `count >= 14` cut
-  // never fired at all, because the world pixel shader is smaller than that.
-  //   VS: reads the sun shadow matrix (guest c24..c27 -> world-to-shadow-atlas UV).
-  //   PS: reads guest c252/c255 -- the literal registers feeding the p0 gate that predicates
-  //       every shadow tap (`sge r12.w, r7.w, c252.x` / `setp_ne_push p0, c255.y, r12.w`).
-  //       This is the whole ballgame: the atlas and the matrix are now proven good, so the
-  //       question is only why that predicate never lets the taps run.
-  bool reads_gate = false;
-  if (!(e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS)) {
-    if (pixel_stage) {
-      // Constant-based gates all failed to isolate the sun-shadow shader: 164 of the 2549
-      // dumped shaders carry the `(p0) tfetch2D ... tf5` pattern, and every one of them reads
-      // g252 for unrelated reasons too, so any log cap fills with the wrong shaders. The one
-      // reliable signature of a shadow draw is what it BINDS: a depth-format texture on
-      // sampler 5 (the atlas). Fetch constants live in guest memory, readable right here.
-      const TextureFetchConstant s5 = ReadTextureFetchConstant(base, guest_device, 5);
-      reads_gate = s5.valid && (s5.format == 22 || s5.format == 23);
-    } else {
-      for (uint32_t i = 0; i < count; ++i) {
-        const uint32_t g = g_nx1Sm3ConstantRemap[e.remapOffset + i];
-        if (g >= 24 && g <= 27) {
-          reads_gate = true;
-          break;
-        }
-      }
-    }
-  }
-  if (!(e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS) && reads_gate) {
-    static std::mutex m;
-    static std::vector<const void*> seen_ps, seen_vs;  // per stage: one list starved the other
-    std::lock_guard<std::mutex> lk(m);
-    std::vector<const void*>& seen = pixel_stage ? seen_ps : seen_vs;
-    if (std::find(seen.begin(), seen.end(), (const void*)&e) == seen.end() && seen.size() < 32) {
-      seen.push_back((const void*)&e);
-      const char* stage = pixel_stage ? "PS" : "VS";
-      const void* obj = pixel_stage ? (const void*)shader.ps : (const void*)shader.vs;
-      char b[1600];
-      // The hash ties the line to tools/new_shader_dump/shader_<hash>.ucode.* -- without it the
-      // literal values are unreadable, because each shader packs its own pool into c252..c255
-      // and the microcode picks channels out of it (`c255.y` means nothing across shaders).
-      int nn = std::snprintf(b, sizeof(b), "nx1_d3d9: %sREMAP %016llX n=%u lits=%u |", stage,
-                             (unsigned long long)e.hash, count, literal_count);
-      (void)obj;
-      for (uint32_t i = 0; i < count && nn < 1450; ++i) {
-        const uint32_t g = g_nx1Sm3ConstantRemap[e.remapOffset + i];
-        const char* src = "sh";
-        for (uint32_t li = 0; li < literal_count; ++li) {
-          const uint32_t idx = g + file_base;
-          if (idx >= literals[li].reg && idx < literals[li].reg + literals[li].float4s) {
-            src = "LIT";
-            break;
-          }
-        }
-        if (src[0] == 's' && ring.Lookup(pixel_stage, g) != 0) {
-          src = "RING";
-        }
-        nn += std::snprintf(b + nn, sizeof(b) - nn, " c%u<-g%u=%s(%.4g,%.4g,%.4g,%.4g)", i, g, src,
-                            staging[i * 4], staging[i * 4 + 1], staging[i * 4 + 2],
-                            staging[i * 4 + 3]);
-      }
-      REXGPU_INFO("{}", b);
-      // The literal table itself: which file registers the shader loads, and from where.
-      char lb[600];
-      int ln = std::snprintf(lb, sizeof(lb), "nx1_d3d9: %sLITS %016llX count=%u |", stage,
-                             (unsigned long long)e.hash, literal_count);
-      for (uint32_t li = 0; li < literal_count && ln < 520; ++li) {
-        ln += std::snprintf(lb + ln, sizeof(lb) - ln, " [reg=%u n=%u @%08X]", literals[li].reg,
-                            literals[li].float4s, literals[li].address);
-      }
-      REXGPU_INFO("{}", lb);
-    }
-  }
-
-  // The sun shadow matrix (guest VS c24..c27) should be a per-FRAME cascade transform, i.e. the
-  // same for every world draw. Log it whenever it changes: if it churns per draw it is not a sun
-  // cascade at all, and if it carries no real translation the UVs land outside the atlas.
-  if (reads_gate && !pixel_stage) {
-    static std::mutex m2;
-    static float last[16] = {};
-    static uint32_t changes = 0;
-    float now[16] = {};
-    for (uint32_t r = 0; r < 4; ++r) {
-      read_register(24 + r, &now[r * 4]);
-    }
-    std::lock_guard<std::mutex> lk(m2);
-    if (std::memcmp(now, last, sizeof(now)) != 0 && changes < 12) {
-      ++changes;
-      std::memcpy(last, now, sizeof(now));
-      char sb[700];
-      int sn = std::snprintf(sb, sizeof(sb), "nx1_d3d9: SHADOWMTX #%u (vs=%p)", changes,
-                             (void*)shader.vs);
-      for (uint32_t r = 0; r < 4; ++r) {
-        sn += std::snprintf(sb + sn, sizeof(sb) - sn, " c%u=%s(%.6g,%.6g,%.6g,%.6g)", 24 + r,
-                            ring.Lookup(false, 24 + r) ? "RING" : "sh", now[r * 4], now[r * 4 + 1],
-                            now[r * 4 + 2], now[r * 4 + 3]);
-      }
-      REXGPU_INFO("{}", sb);
-    }
   }
 
   // Upload in runs that go AROUND the shader's own `def` registers. A def is applied when the

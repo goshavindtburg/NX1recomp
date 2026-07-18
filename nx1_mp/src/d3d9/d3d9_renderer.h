@@ -121,8 +121,6 @@ class Renderer {
                    uint32_t* vertex_count);
   /// Untile + bind every bound texture and its sampler state.
   void BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t surface_key = 0);
-  /// TEMP DIAGNOSTIC (world darkness): sampler bindings + PS dump on scene-pass draws.
-  void ProbeWorldDraw(const uint8_t* base, uint32_t guest_device);
   /// The copy half of a resolve (EDRAM -> host texture). Caller holds render_mutex_.
   void ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
                    uint32_t dest_point);
@@ -192,11 +190,6 @@ class Renderer {
   float ndc_offset_[3] = {0.0f, 0.0f, 0.0f};
 
   uint64_t shader_cache_misses_ = 0;
-  /// TEMP DIAGNOSTIC: the ucode hash of the most recently bound pixel shader, so probes that
-  /// run at draw time (ProbeWorldDraw/DEFCHECK) can tie their output to a shader identity.
-  /// A pointer-only dump forced guessing which shader an asm listing belonged to -- and the
-  /// guess was unprovable. Never infer identity; log it.
-  uint64_t last_ps_hash_ = 0;
 
   // The guest depth surface currently bound, so a depth resolve knows which host
   // (INTZ) texture to publish under the resolve's destination address.
