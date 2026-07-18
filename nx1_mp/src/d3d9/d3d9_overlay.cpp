@@ -26,6 +26,9 @@ REXCVAR_DECLARE(bool, nx1_d3d9_profile);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipsrc);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_lod);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipfill);
+REXCVAR_DECLARE(bool, nx1_d3d9_fast_detile);
+REXCVAR_DECLARE(bool, nx1_d3d9_commit_textures);
+REXCVAR_DECLARE(bool, nx1_d3d9_texture_mirror);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam,
                                                              LPARAM lparam);
@@ -324,6 +327,24 @@ void Overlay::DrawPanels() {
     ImGui::TextUnformatted("Mip chains");
     ImGui::Checkbox("Generate mips at all", &REXCVAR_GET(nx1_d3d9_mips));
     ImGui::Checkbox("CPU-build block-compressed mips", &REXCVAR_GET(nx1_d3d9_bc_mips));
+    ImGui::Checkbox("Read textures from the CPU mirror snapshot",
+                    &REXCVAR_GET(nx1_d3d9_texture_mirror));
+    ImGui::TextDisabled("Off = read live guest memory like the reference backend does.");
+    ImGui::TextDisabled("The mirror holds a page from first touch, so anything the guest");
+    ImGui::TextDisabled("writes afterwards never reaches us.");
+
+    ImGui::Spacing();
+    ImGui::Checkbox("Freeze texture decodes after 32 clean frames",
+                    &REXCVAR_GET(nx1_d3d9_commit_textures));
+    ImGui::TextDisabled("Off = keep honouring guest writes, so a texture decoded before its");
+    ImGui::TextDisabled("data finished streaming can still correct itself.");
+
+    ImGui::Spacing();
+    ImGui::Checkbox("Fast (table) detile path", &REXCVAR_GET(nx1_d3d9_fast_detile));
+    ImGui::TextDisabled("Off = per-block reference addressing. Costs nothing measurable;");
+    ImGui::TextDisabled("turn off first if anything tile-shaped looks wrong.");
+
+    ImGui::Spacing();
     ImGui::TextUnformatted("Mip chain test");
     int mipfill = int(REXCVAR_GET(nx1_d3d9_dbg_mipfill));
     ImGui::RadioButton("off##mipfill", &mipfill, 0);

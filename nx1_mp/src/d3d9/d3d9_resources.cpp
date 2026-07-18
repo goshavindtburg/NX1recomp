@@ -53,6 +53,37 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipfill, 0, "GPU",
                       "2=synthetic gradient as the level-0 source (tests filter+encoder "
                       "without our BC decoder)");
 
+/// Read texture texels from the CPU mirror rather than live guest memory.
+///
+/// The mirror captures a page on first touch and then HOLDS it, ignoring later guest writes,
+/// so the streaming pool recycling a slot cannot re-poison a good decode. The cost is
+/// staleness: any texture whose data the guest writes AFTER we snapshot stays frozen at
+/// whatever the memory held at capture time -- zeros, or the previous occupant's texels.
+///
+/// The reference backend reads live guest memory at draw time and renders all of this content
+/// correctly, which means the data IS reachable and the snapshot is what loses it. Turn this
+/// off to read live like the reference does.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_texture_mirror, true, "GPU",
+                    "Decode textures from the CPU mirror snapshot (off = read live guest "
+                    "memory, as the reference backend does)");
+
+/// Commit-and-freeze. A texture drawn cleanly for kCommitFrames stops honouring guest writes,
+/// so the streaming pool recycling its slot cannot re-poison a good decode. The risk is the
+/// mirror image of the benefit: if the decode was ALREADY wrong when it committed -- decoded
+/// while only part of the texture had streamed in, so some tiles still hold the previous
+/// occupant -- freezing makes that permanent. Turn this off to find out which side of that
+/// trade an artifact is on: with committing disabled the write-watch keeps re-decoding, so a
+/// texture that was merely early will correct itself once its data lands.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_commit_textures, true, "GPU",
+                    "Freeze a texture's decode after it has been drawn cleanly for 32 frames");
+
+/// The 32x32-table detile fast path. On by default because it is verified exhaustively against
+/// GetTiledOffset2D, but cvar-gated because it measured no performance benefit at all -- so if
+/// anything tile-shaped ever looks wrong, this is the cheapest thing in the renderer to rule
+/// out, and nothing is lost by leaving it off.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_fast_detile, true, "GPU",
+                    "Use the table-driven tiled-texture address path (off = per-block reference)");
+
 /// Diagnostic: dump the mip pipeline's intermediate images for the next N block-compressed
 /// textures built. Writes texdump/mip_<addr>_L<level>.bmp straight from the Rgba8 buffers, so
 /// what lands on disk is exactly what DecodeBcImage produced and what BoxFilterHalf produced
@@ -275,6 +306,11 @@ enum : uint32_t {
 // reproduce on a fixed-function D3D9 sampler, so we CPU-decode them to A8R8G8B8
 // with the value written into every channel -- then any shader swizzle reads it.
 enum class TexDecode { kNone, kDXT3A, kDXT5A, kDXN, kColorSwizzle };
+
+/// XE_GPU_TEXTURE_SWIZZLE with each component taken from its own source channel: x<-X, y<-Y,
+/// z<-Z, w<-W, i.e. 0 | 1<<3 | 2<<6 | 3<<9. Anything else means the fetch reorders, replicates
+/// or constant-fills channels, and a host format that samples RGBA straight cannot honour it.
+inline constexpr uint32_t kIdentitySwizzle = 0u | (1u << 3) | (2u << 6) | (3u << 9);
 
 struct HostTextureFormat {
   D3DFORMAT d3d;
@@ -693,7 +729,11 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
     // That holds only for blocks of 4 bytes or more (for 1- and 2-byte blocks the stride is 128 or
     // 256 and leaks into the mixed bits). Verified exhaustively against GetTiledOffset2D across
     // pitches 32..512 for bpb_log2 0..4: exact for 2..4, mismatching for 0..1 -- hence the guard.
-    if (bpb_log2 >= 2) {
+    // The table fast path is cvar-gated because it bought NOTHING when measured (the loop is
+    // bound by cache-miss latency on the scattered mirror reads, not by the address maths), so
+    // it is pure risk. If a tiled-looking artifact appears, turn this off first: a checkerboard
+    // in texture space is exactly what a wrong tiled address produces.
+    if (bpb_log2 >= 2 && REXCVAR_GET(nx1_d3d9_fast_detile)) {
       const uint32_t ap_tiles = ((pitch_blocks + 31u) & ~31u) >> 5;
       const uint32_t macro_stride = 1u << (bpb_log2 + 10);
       int32_t table[32][32];
@@ -1918,6 +1958,28 @@ std::pair<uint32_t, uint32_t> ResourceTracker::OnMemoryWrite(uint32_t addr, uint
 // A page is copied out of live guest RAM the first time it is requested while invalid, then held
 // (and its write-watch armed) until the guest writes it. Textures decode through this so
 // streaming-pool churn never reaches them between writes.
+void ResourceTracker::ArmWriteWatch(uint32_t phys_addr, uint32_t len) {
+  if (!phys_base_ || !len || uint64_t(phys_addr) + len > (uint64_t(kMirrorPages) << 12)) {
+    return;
+  }
+  if (watch_armed_.size() != mirror_valid_.size()) {
+    watch_armed_.assign(mirror_valid_.size(), 0);
+  }
+  auto* mem = rex::system::kernel_state()->memory();
+  if (!mem) {
+    return;
+  }
+  const uint32_t p0 = phys_addr >> 12;
+  const uint32_t p1 = (phys_addr + len - 1) >> 12;
+  for (uint32_t p = p0; p <= p1; ++p) {
+    const uint64_t bit = uint64_t(1) << (p & 63);
+    if (!(watch_armed_[p >> 6] & bit)) {
+      watch_armed_[p >> 6] |= bit;
+      mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
+    }
+  }
+}
+
 const uint8_t* ResourceTracker::MirrorSnapshot(uint32_t phys_addr, uint32_t len) {
   if (!mirror_ || !phys_base_ || uint64_t(phys_addr) + len > (uint64_t(kMirrorPages) << 12)) {
     return TranslatePhysical(phys_addr);
@@ -2319,7 +2381,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   // streaming pool's later garbage-recycle can't re-poison the decode (the confetti-on-backup).
   constexpr uint32_t kCommitFrames = 32;
   if (entry.tex && entry.last_frame != frame_ && entry.layout_key == layout_key &&
-      !entry.committed && ++entry.good_frames >= kCommitFrames) {
+      !entry.committed && ++entry.good_frames >= kCommitFrames &&
+      REXCVAR_GET(nx1_d3d9_commit_textures)) {
     entry.committed = true;
   }
   // Valid-texture early-out. A built texture whose layout still matches and that the write-watch
@@ -2362,6 +2425,22 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       host.d3d = D3DFMT_A8R8G8B8;
       host.decode = TexDecode::kColorSwizzle;
       host.opaque_block = false;
+    } else if (t.swizzle != kIdentitySwizzle) {
+      // TEMP DIAGNOSTIC: every other non-identity swizzle on a block-compressed texture is
+      // currently ignored -- we bind the BC format and let the GPU sample RGBA straight
+      // through. A sprite that sources its alpha from a colour channel would then come back
+      // opaque, which is exactly a reticle rendering as a solid square and smoke as a solid
+      // black one. Name them once each so we know whether that gap is real content or theory.
+      static std::mutex m;
+      static std::vector<uint32_t> seen;
+      std::lock_guard<std::mutex> lk(m);
+      if (std::find(seen.begin(), seen.end(), t.swizzle) == seen.end() && seen.size() < 24) {
+        seen.push_back(t.swizzle);
+        REXGPU_WARN("nx1_d3d9: BC texture with unhandled swizzle 0x{:03X} (x={} y={} z={} w={}) "
+                    "fmt {} {}x{} addr {:08X} -- sampled as raw RGBA",
+                    t.swizzle, sx, sy, sz, (t.swizzle >> 9) & 7, t.format, t.width, t.height,
+                    t.base_address);
+      }
     }
   }
   if (!host.valid) {
@@ -2467,7 +2546,16 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
       ++prof_tex_.why_dirty;
     }
   }
-  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
+  const uint8_t* src;
+  if (REXCVAR_GET(nx1_d3d9_texture_mirror)) {
+    src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
+  } else {
+    // Live read, but still watch the pages: the watch used to be armed only as a side effect
+    // of snapshotting, so reading live left every texture unwatched and a decode taken before
+    // the guest filled the memory could never be redone.
+    ArmWriteWatch(t.base_address, uint32_t(guest_bytes));
+    src = TranslatePhysical(t.base_address);
+  }
   if (entry.tex && entry.layout_key != layout_key) {
     entry.tex->Release();
     entry.tex = nullptr;
@@ -2937,7 +3025,16 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
 
   const size_t guest_bytes =
       size_t(extent.block_pitch_h) * extent.block_pitch_v * std::max(1u, t.depth) * bpb;
-  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
+  const uint8_t* src;
+  if (REXCVAR_GET(nx1_d3d9_texture_mirror)) {
+    src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
+  } else {
+    // Live read, but still watch the pages: the watch used to be armed only as a side effect
+    // of snapshotting, so reading live left every texture unwatched and a decode taken before
+    // the guest filled the memory could never be redone.
+    ArmWriteWatch(t.base_address, uint32_t(guest_bytes));
+    src = TranslatePhysical(t.base_address);
+  }
   const uint64_t content_hash = XXH3_64bits(src, guest_bytes);
 
   if (entry.vol && entry.layout_key == layout_key && entry.content_hash == content_hash) {
@@ -3032,7 +3129,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetCubeTexture(const TextureFetchConstan
   }
   entry.last_frame = frame_;
 
-  const uint8_t* src = MirrorSnapshot(t.base_address, uint32_t(size_t(face_stride) * 6));
+  const uint8_t* src =
+      REXCVAR_GET(nx1_d3d9_texture_mirror)
+          ? MirrorSnapshot(t.base_address, uint32_t(size_t(face_stride) * 6))
+          : TranslatePhysical(t.base_address);
   const uint64_t content_hash = XXH3_64bits(src, size_t(face_stride) * 6);
   if (entry.cube && entry.layout_key == layout_key && entry.content_hash == content_hash) {
     return entry.cube;

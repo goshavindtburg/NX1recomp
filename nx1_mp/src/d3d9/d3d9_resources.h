@@ -275,6 +275,12 @@ class ResourceTracker {
   uint8_t* mirror_ = nullptr;         ///< 512 MB VirtualAlloc, lazily committed
   const uint8_t* phys_base_ = nullptr;///< host pointer for guest physical 0
   std::vector<uint64_t> mirror_valid_;///< 1 bit per 4 KB page: captured and held
+  /// 1 bit per 4 KB page: the guest-write callback is enabled for it. Tracked separately from
+  /// mirror_valid_ because the live-read path needs the watch WITHOUT the snapshot -- the
+  /// watch used to be armed only as a side effect of capturing a page into the mirror, so
+  /// reading live meant no page was ever watched, no texture was ever dirtied, and a texture
+  /// decoded before its data arrived stayed empty forever.
+  std::vector<uint64_t> watch_armed_;
   uint32_t mirror_sweep_page_ = 0;    ///< proactive early-sweep cursor
   static constexpr uint32_t kMirrorPages = 0x20000000u >> 12;  ///< 512 MB / 4 KB
   /// Ensure [phys_addr, phys_addr+len) is captured in the mirror and return a pointer into it. A
@@ -282,6 +288,11 @@ class ResourceTracker {
   /// (and its write-watch armed) until the guest writes it. Falls back to live memory if out of
   /// range or the mirror is unavailable.
   const uint8_t* MirrorSnapshot(uint32_t phys_addr, uint32_t len);
+
+  /// Enable the guest-write callback for every page covering [phys_addr, +len), without
+  /// copying anything. DrainMemoryWrites then dirties any texture whose watched range overlaps
+  /// a write, which is what makes a live-read decode re-run once the data actually lands.
+  void ArmWriteWatch(uint32_t phys_addr, uint32_t len);
 
   void* layouts_ = nullptr;        ///< std::unordered_map<uint64_t, VertexLayout>*
   void* vertex_buffers_ = nullptr; ///< std::unordered_map<uint64_t, VertexBufferEntry>*
