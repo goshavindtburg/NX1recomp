@@ -588,8 +588,14 @@ void Renderer::Present() {
         // i.e. its own game logic plus our recording tax, and shaving translation buys nothing.
         const double drain_ms = prof_drain_wait_ns_ * tf;
         const double idle_ms = prof_worker_idle_ns_.exchange(0, std::memory_order_relaxed) * tf;
-        REXGPU_INFO("nx1_d3d9: PROF/hitch worst frame {:.1f} ms ({:.1f} ms of it blocked on the worker)",
-                    prof_frame_max_ns_ * tf, prof_frame_max_drain_ns_ * tf);
+        // NOT tf. tf is 1/(1e6 * prof_frames) -- it turns an ACCUMULATED total into a per-frame
+        // average, and dividing a MAXIMUM by the frame count made every hitch read ~60x too
+        // small (a 276 ms stall printed as 4.6 ms). These two are per-frame peaks already, so
+        // they need a plain ns -> ms conversion.
+        static constexpr double kNsToMs = 1.0 / 1e6;
+        REXGPU_INFO("nx1_d3d9: PROF/hitch worst frame {:.1f} ms ({:.1f} ms of it blocked on the "
+                    "worker)",
+                    prof_frame_max_ns_ * kNsToMs, prof_frame_max_drain_ns_ * kNsToMs);
         prof_frame_max_ns_ = prof_frame_max_drain_ns_ = 0;
         REXGPU_INFO("nx1_d3d9: PROF/bound guest waited {:.2f} ms/frame for the worker, worker "
                     "starved {:.2f} ms/frame -- limited by {}",
