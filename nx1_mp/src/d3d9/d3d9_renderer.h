@@ -364,6 +364,12 @@ class Renderer {
   /// for work. Whichever is large names the limiting side; both near zero means the two are
   /// balanced and the remainder is GPU or present.
   uint64_t prof_drain_wait_ns_ = 0;
+  /// Worst frame in the reporting window, and how much of it was spent blocked on the worker.
+  /// A hitch does not show up in a mean -- that pair says whether a spike is our queue stalling
+  /// or something outside it entirely.
+  uint64_t prof_frame_max_ns_ = 0;
+  uint64_t prof_frame_max_drain_ns_ = 0;
+  uint64_t prof_drain_wait_frame_ns_ = 0;
   std::atomic<uint64_t> prof_worker_idle_ns_{0};
 
   /// Shader-resolution memo: (object address, pass) -> translated shader.

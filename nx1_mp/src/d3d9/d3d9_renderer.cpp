@@ -433,7 +433,16 @@ void Renderer::Present() {
 
   static auto last_present = std::chrono::steady_clock::now();
   const auto t_present = std::chrono::steady_clock::now();
-  prof_frame_ns_ += uint64_t((t_present - last_present).count());
+  const uint64_t this_frame_ns = uint64_t((t_present - last_present).count());
+  prof_frame_ns_ += this_frame_ns;
+  // WORST frame in the window, not just the mean. A hitch is invisible in an average -- one
+  // 80 ms frame among sixty 16 ms ones moves the mean by a millisecond -- and "ran well, some
+  // hitches" is a report about the tail, not the middle.
+  if (this_frame_ns > prof_frame_max_ns_) {
+    prof_frame_max_ns_ = this_frame_ns;
+    prof_frame_max_drain_ns_ = prof_drain_wait_frame_ns_;
+  }
+  prof_drain_wait_frame_ns_ = 0;
   last_present = t_present;
   // Last thing before the flip, so it sits on top of the finished frame.
   Overlay::Get().Render();
@@ -579,6 +588,9 @@ void Renderer::Present() {
         // i.e. its own game logic plus our recording tax, and shaving translation buys nothing.
         const double drain_ms = prof_drain_wait_ns_ * tf;
         const double idle_ms = prof_worker_idle_ns_.exchange(0, std::memory_order_relaxed) * tf;
+        REXGPU_INFO("nx1_d3d9: PROF/hitch worst frame {:.1f} ms ({:.1f} ms of it blocked on the worker)",
+                    prof_frame_max_ns_ * tf, prof_frame_max_drain_ns_ * tf);
+        prof_frame_max_ns_ = prof_frame_max_drain_ns_ = 0;
         REXGPU_INFO("nx1_d3d9: PROF/bound guest waited {:.2f} ms/frame for the worker, worker "
                     "starved {:.2f} ms/frame -- limited by {}",
                     drain_ms, idle_ms,
@@ -1848,7 +1860,9 @@ void Renderer::DrainWorker() {
     std::unique_lock<std::mutex> lk(queue_mutex_);
     queue_done_cv_.wait(lk, [this] { return queue_tail_ >= queue_head_ || !worker_running_; });
   }
-  prof_drain_wait_ns_ += uint64_t((std::chrono::steady_clock::now() - t0).count());
+  const uint64_t waited = uint64_t((std::chrono::steady_clock::now() - t0).count());
+  prof_drain_wait_ns_ += waited;
+  prof_drain_wait_frame_ns_ += waited;
 }
 
 void Renderer::WorkerMain() {
