@@ -88,6 +88,43 @@
  * The drain barrier at Present is therefore the single synchronisation point, and the overlap
  * being bought is the guest's between-draw logic (measured 5.3-7.5 ms) running while the worker
  * translates.
+ *
+ * OUTCOME
+ *
+ * A/B toggled in a fixed spot, same scene and same ~4860 draws, with only the cvar changing:
+ *
+ *   nx1_d3d9_async 0   45 FPS
+ *   nx1_d3d9_async 1   60 FPS (vsync-locked)
+ *
+ * The 60 is a DISPLAY floor, not the renderer's ceiling -- FRAME reads 16.5 ms, which is 60.6 Hz
+ * to within noise, so the true async frame time is unmeasured and lower. Claim "at least
+ * 45 -> 60", not a specific ms figure.
+ *
+ * The toggle is what makes this attributable. The raw before/after (24.4 ms at 4960 draws in
+ * step 1 vs 16.5 ms at 4858 now) spans a lot of other work -- feeding textures and streams from
+ * the record removed a duplicate fetch-constant decode per bound slot, and the resolve/apply
+ * split moved constant work -- so only the same-scene toggle isolates the worker itself.
+ *
+ * WHAT THE THREADING COST, for the next person tempted to skip the staging
+ *
+ * Four bugs, none of which synchronous testing could have found, and all of the same shape --
+ * "this is safe because the synchronous path never does that":
+ *
+ *   1. guest_device read from a shared slot at DEQUEUE time, so a draw queued behind a clear or
+ *      resolve executed against device 0. Bad draws, then a crash.
+ *   2. The constant pool's chunks were made immovable while the vector of pointers TO them was
+ *      left free to reallocate. Immovable blocks behind a movable index is not immovable storage.
+ *   3. draws_/commands_ as std::deque, on "push_back does not invalidate references" -- true, but
+ *      it covers references taken BEFORE the push, not operator[] racing push_back. A real
+ *      guarantee that did not mean what it needed to mean.
+ *   4. The index-buffer BINDING re-read at execute time. Device state that changes every draw,
+ *      in the same category as the fetch constants. Missed because the stability probe measured
+ *      index DATA and that was taken as clearing index reads generally.
+ *
+ * Also worth keeping: two instruments silently became nonsense when their assumptions broke --
+ * PROF/defer differencing timestamps from two threads, and the stability probe saturating its
+ * cap on the frame's opening passes and reporting a confident 100%. Check that a measurement can
+ * still detect the thing it is looking for before believing a clean result.
  */
 
 #pragma once
