@@ -307,6 +307,21 @@ class ResourceTracker {
   };
   std::vector<NewTex> baseline_new_;
 
+  /// Flat mirror of the resolve map, scanned instead of hashed on the texture bind path.
+  /// There are only ever a handful of resolve targets (8 in practice), but GetTexture probed
+  /// the hash map for every bound sampler slot of every draw -- ~16.6k times a frame, each a
+  /// likely cache miss into a node/table lookup, to search eight entries. The keys pack into
+  /// two cache lines, so a linear scan is far cheaper than hashing. Rebuilt whenever the map
+  /// changes; kResolveFlatMax is a safety cap, above which the hash map is used as before.
+  static constexpr uint32_t kResolveFlatMax = 32;
+  uint32_t resolve_flat_addr_[kResolveFlatMax] = {};
+  IDirect3DTexture9* resolve_flat_tex_[kResolveFlatMax] = {};
+  uint32_t resolve_flat_count_ = 0;
+  bool resolve_flat_valid_ = false;
+
+  /// Rebuild the flat mirror from the resolve map. Cheap; called only when a resolve lands.
+  void RebuildResolveFlat();
+
   /// 1 bit per 4 KB page: the guest-write callback is enabled for it. Tracked separately from
   /// mirror_valid_ because the live-read path needs the watch WITHOUT the snapshot -- the
   /// watch used to be armed only as a side effect of capturing a page into the mirror, so

@@ -93,12 +93,11 @@ class FlatMap {
   iterator end() { return iterator(this, cap_); }
 
   iterator find(uint64_t key) {
-    const uint64_t k = Key(key);
-    size_t i = Slot(k);
+    size_t i = Slot(Key(key));
     for (;;) {
       const uint8_t s = state_[i];
       if (s == kEmpty) return end();
-      if (s == kFull && keys_[i] == k) return iterator(this, i);
+      if (s == kFull && keys_[i] == key) return iterator(this, i);
       i = (i + 1) & mask_;
     }
   }
@@ -110,15 +109,14 @@ class FlatMap {
     if ((used_ + 1) * 4 >= cap_ * 3) {
       Rehash(size_ * 4 >= cap_ ? cap_ * 2 : cap_);
     }
-    const uint64_t k = Key(key);
-    size_t i = Slot(k);
+    size_t i = Slot(Key(key));
     size_t tomb = kNoSlot;
     for (;;) {
       const uint8_t s = state_[i];
       if (s == kEmpty) break;
       if (s == kTomb) {
         if (tomb == kNoSlot) tomb = i;
-      } else if (keys_[i] == k) {
+      } else if (keys_[i] == key) {
         return vals_[i];
       }
       i = (i + 1) & mask_;
@@ -128,7 +126,7 @@ class FlatMap {
     } else {
       ++used_;
     }
-    keys_[i] = k;
+    keys_[i] = key;
     state_[i] = kFull;
     vals_[i] = V();
     ++size_;
@@ -158,9 +156,11 @@ class FlatMap {
   static constexpr uint8_t kTomb = 2;
   static constexpr size_t kNoSlot = ~size_t(0);
 
-  /// Key 0 is legal for callers but would be indistinguishable from an unused slot if it were the
-  /// sentinel, so slot state lives in its own array and keys are stored verbatim. This only
-  /// finalizes: page-aligned guest addresses share low bits and must not probe the same slots.
+  /// Slot selection only. Keys are STORED VERBATIM and compared verbatim -- storing the mixed
+  /// value instead would make iteration yield hashes rather than the caller's keys, which is a
+  /// silent trap for any code that reads `it->first` (it cost a black screen once: a flat
+  /// mirror of the resolve map compared hashed keys against real guest addresses and never
+  /// matched, so every render-target texture fell back to decoding raw memory).
   static uint64_t Key(uint64_t k) {
     k ^= k >> 33;
     k *= 0xFF51AFD7ED558CCDull;
@@ -189,7 +189,7 @@ class FlatMap {
     for (size_t j = 0; j < old_state.size(); ++j) {
       if (old_state[j] != kFull) continue;  // tombstones are dropped here
       const uint64_t k = old_keys[j];
-      size_t i = Slot(k);
+      size_t i = Slot(Key(k));
       while (state_[i] != kEmpty) i = (i + 1) & mask_;
       keys_[i] = k;
       state_[i] = kFull;

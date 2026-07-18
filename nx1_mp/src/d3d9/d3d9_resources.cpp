@@ -1509,6 +1509,8 @@ void ResourceTracker::Shutdown() {
     }
     delete map;
     resolves_ = nullptr;
+    resolve_flat_count_ = 0;
+    resolve_flat_valid_ = false;
   }
   if (render_targets_) {
     auto* map = static_cast<TargetMap*>(render_targets_);
@@ -1977,6 +1979,27 @@ std::pair<uint32_t, uint32_t> ResourceTracker::OnMemoryWrite(uint32_t addr, uint
 // A page is copied out of live guest RAM the first time it is requested while invalid, then held
 // (and its write-watch armed) until the guest writes it. Textures decode through this so
 // streaming-pool churn never reaches them between writes.
+void ResourceTracker::RebuildResolveFlat() {
+  resolve_flat_count_ = 0;
+  resolve_flat_valid_ = false;
+  if (!resolves_) {
+    return;
+  }
+  auto* map = static_cast<ResolveMap*>(resolves_);
+  if (map->size() > kResolveFlatMax) {
+    return;  // fall back to the hash map
+  }
+  for (auto [key, entry] : *map) {
+    if (!entry.tex) {
+      continue;
+    }
+    resolve_flat_addr_[resolve_flat_count_] = uint32_t(key);
+    resolve_flat_tex_[resolve_flat_count_] = entry.tex;
+    ++resolve_flat_count_;
+  }
+  resolve_flat_valid_ = true;
+}
+
 void ResourceTracker::ArmWriteWatch(uint32_t phys_addr, uint32_t len) {
   if (!phys_base_ || !len || uint64_t(phys_addr) + len > (uint64_t(kMirrorPages) << 12)) {
     return;
@@ -2527,7 +2550,19 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     }
   }
 
-  if (resolves_) {
+  if (resolve_flat_valid_) {
+    // Linear scan of at most a few entries, all in cache, instead of hashing into the map.
+    const uint32_t phys = PhysicalAddress(t.base_address);
+    for (uint32_t i = 0; i < resolve_flat_count_; ++i) {
+      if (resolve_flat_addr_[i] == phys) {
+        if (dbg_track && t.base_address == dbg_track) {
+          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={}", t.base_address,
+                      frame_);
+        }
+        return resolve_flat_tex_[i];
+      }
+    }
+  } else if (resolves_) {
     auto* rmap = static_cast<ResolveMap*>(resolves_);
     if (auto it = rmap->find(PhysicalAddress(t.base_address));
         it != rmap->end() && it->second.tex) {
@@ -3739,6 +3774,8 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
     old_ds->Release();
   }
   dst->Release();
+  // The bind path scans a flat mirror of this map; keep it in step.
+  RebuildResolveFlat();
 }
 
 void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height,
@@ -3800,6 +3837,8 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
   }
   if (dst) dst->Release();
   if (src) src->Release();
+  // The bind path scans a flat mirror of this map; keep it in step.
+  RebuildResolveFlat();
 }
 
 }  // namespace nx1::d3d9
