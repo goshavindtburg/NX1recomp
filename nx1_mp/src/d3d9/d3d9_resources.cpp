@@ -96,6 +96,13 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_texture_mirror, true, "GPU",
 REXCVAR_DEFINE_BOOL(nx1_d3d9_commit_textures, true, "GPU",
                     "Freeze a texture's decode after it has been drawn cleanly for 32 frames");
 
+/// Checkerboard hunt: log the full decode geometry of every texture >= 256x256, once per address.
+/// The artifact varies across launches, so the evidence is a diff of a good run against a bad one
+/// -- not anything visible within either.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_decode_log, false, "GPU",
+                    "Log decode geometry (address alignment, pitch, tiling, swizzle) for every "
+                    "texture >= 256x256, once per base address");
+
 /// The 32x32-table detile fast path. On by default because it is verified exhaustively against
 /// GetTiledOffset2D, but cvar-gated because it measured no performance benefit at all -- so if
 /// anything tile-shaped ever looks wrong, this is the cheapest thing in the renderer to rule
@@ -3163,6 +3170,28 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // it. The mirror itself armed the write-watch when it captured these pages in MirrorSnapshot.
   entry.watch_addr = t.base_address;
   entry.watch_size = uint32_t(guest_bytes);
+
+  // Checkerboard hunt. The artifact is intermittent ACROSS LAUNCHES, which points at something
+  // that varies with where the guest happened to allocate the texture -- a tiling/pitch
+  // assumption that holds for some base addresses and not others. Guest allocations move between
+  // runs, so the only way to see it is to log each large texture's full decode geometry and diff
+  // a good run against a bad one. Everything that feeds the detile is here; the alignment columns
+  // are the point, since Xenos tiling is defined in 32x32 blocks over a 4 KB-page layout.
+  if (REXCVAR_GET(nx1_d3d9_dbg_decode_log) && t.width >= 256 && t.height >= 256) {
+    static std::mutex dm;
+    static std::vector<uint32_t> decoded_seen;
+    std::lock_guard<std::mutex> dlk(dm);
+    if (std::find(decoded_seen.begin(), decoded_seen.end(), t.base_address) == decoded_seen.end()) {
+      decoded_seen.push_back(t.base_address);
+      REXGPU_INFO("nx1_d3d9: DECODEGEO {:08X} align4k={} align32k={} {}x{} fmt={} tiled={} "
+                  "pitchpx={} blockpitch={}x{} swizzle={:#05X} endian={} mip={}..{} packed={} "
+                  "bytes={} mipaddr={:08X}",
+                  t.base_address, t.base_address & 0xFFFu, t.base_address & 0x7FFFu, t.width,
+                  height, t.format, t.tiled ? 1 : 0, t.pitch_pixels, extent.block_pitch_h,
+                  extent.block_pitch_v, t.swizzle, t.endian, t.mip_min_level, t.mip_max_level,
+                  t.packed_mips ? 1 : 0, guest_bytes, t.mip_address);
+    }
+  }
   if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
       track && t.base_address == track && white_) {
     return white_;
