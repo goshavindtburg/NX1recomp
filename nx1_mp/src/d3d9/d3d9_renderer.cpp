@@ -629,6 +629,15 @@ void Renderer::SetRenderTarget(const uint8_t* base, uint32_t index, uint32_t gue
   if (shutting_down_.load(std::memory_order_acquire) || !device_ || index >= 4) {
     return;
   }
+  RecordedCommand& c = cmdbuf_.AddCommand(CommandKind::kSetRenderTarget);
+  c.rt_index = index;
+  c.surface = guest_surface;
+  ExecuteSetRenderTarget(base, c);
+}
+
+void Renderer::ExecuteSetRenderTarget(const uint8_t* base, const RecordedCommand& c) {
+  const uint32_t index = c.rt_index;
+  const uint32_t guest_surface = c.surface;
   if (!guest_surface) {
     if (index) {
       device_->SetRenderTarget(index, nullptr);  // MRT slot 0 must always stay bound
@@ -667,6 +676,16 @@ void Renderer::SetDepthStencil(const uint8_t* base, uint32_t guest_surface) {
   if (shutting_down_.load(std::memory_order_acquire) || !device_) {
     return;
   }
+  RecordedCommand& c = cmdbuf_.AddCommand(CommandKind::kSetDepthStencil);
+  c.surface = guest_surface;
+  ExecuteSetDepthStencil(base, c);
+}
+
+void Renderer::ExecuteSetDepthStencil(const uint8_t* base, const RecordedCommand& c) {
+  // Ordering-critical: GetDepthSurface sizes against current_rt_width_/height_, which the
+  // kSetRenderTarget command immediately before this one sets. The guest always binds its target
+  // then its depth, and honouring that order is exactly why these share one command list.
+  const uint32_t guest_surface = c.surface;
   current_depth_surface_ = guest_surface;
   if (!guest_surface) {
     device_->SetDepthStencilSurface(nullptr);
@@ -686,17 +705,48 @@ void Renderer::Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_
   if (shutting_down_.load(std::memory_order_acquire) || !device_) {
     return;
   }
-  ResolveCopy(base, dest_texture, src_rect, dest_point);
+  // Resolve the guest's stack-borne arguments to VALUES here -- the src rect, dest point and
+  // clear colour are all pointers into whatever the caller pushed, so a worker reading them late
+  // would read something else entirely. The destination TEXTURE stays an object address: that is
+  // a persistent allocation, the read-it-late class.
+  RecordedCommand& c = cmdbuf_.AddCommand(CommandKind::kResolve);
+  c.dest_texture = dest_texture;
+  c.clear_flags = flags;
+  c.clear_z = clear_z;
+  c.clear_stencil = clear_stencil;
+  c.has_rect = src_rect != 0;
+  if (src_rect) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      c.rect[i] = int32_t(GuestRead32(base, src_rect + i * 4));
+    }
+  }
+  c.has_dest_point = dest_point != 0;
+  if (dest_point) {
+    c.dest_point[0] = int32_t(GuestRead32(base, dest_point + 0));
+    c.dest_point[1] = int32_t(GuestRead32(base, dest_point + 4));
+  }
+  c.has_color = clear_color != 0;
+  if (clear_color) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      c.clear_color[i] = GuestReadF32(base, clear_color + i * 4);
+    }
+  }
+  ExecuteResolve(base, c);
+}
+
+void Renderer::ExecuteResolve(const uint8_t* base, const RecordedCommand& c) {
+  ResolveCopy(base, c);
   // A depth resolve blits through the pipeline, binding a texture and sampler state on
   // sampler 0 and leaving it unbound afterwards. BindTextures' shadow cannot see that, so
   // tell it to stop trusting itself. Resolves are a handful per frame; re-issuing the
   // sampler state on the next draw costs nothing next to getting it wrong.
   InvalidateStateShadow();
-  ClearEdram(base, flags, clear_color, clear_z, clear_stencil);
+  ClearEdram(c);
 }
 
-void Renderer::ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
-                           uint32_t dest_point) {
+void Renderer::ResolveCopy(const uint8_t* base, const RecordedCommand& c) {
+  const uint32_t dest_texture = c.dest_texture;
+
   if (!dest_texture) {
     return;
   }
@@ -726,17 +776,17 @@ void Renderer::ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t 
   // buffer is an INTZ texture precisely so it can be sampled -- no copy needed, we
   // just point the address at it. This is what the world's lighting was missing.
   RECT rect{0, 0, 0, 0};  // empty => whole surface
-  if (src_rect) {
-    rect.left = int32_t(GuestRead32(base, src_rect + 0));
-    rect.top = int32_t(GuestRead32(base, src_rect + 4));
-    rect.right = int32_t(GuestRead32(base, src_rect + 8));
-    rect.bottom = int32_t(GuestRead32(base, src_rect + 12));
+  if (c.has_rect) {
+    rect.left = c.rect[0];
+    rect.top = c.rect[1];
+    rect.right = c.rect[2];
+    rect.bottom = c.rect[3];
   }
   // Where this tile lands in the destination. D3DPOINT is {x, y}.
   POINT at{0, 0};
-  if (dest_point) {
-    at.x = int32_t(GuestRead32(base, dest_point + 0));
-    at.y = int32_t(GuestRead32(base, dest_point + 4));
+  if (c.has_dest_point) {
+    at.x = c.dest_point[0];
+    at.y = c.dest_point[1];
   }
 
   if (dest.format == 22 || dest.format == 23) {
@@ -755,8 +805,9 @@ void Renderer::ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t 
   }
 }
 
-void Renderer::ClearEdram(const uint8_t* base, uint32_t flags, uint32_t clear_color,
-                          float clear_z, uint32_t clear_stencil) {
+void Renderer::ClearEdram(const RecordedCommand& c) {
+  const uint32_t flags = c.clear_flags;
+
   // The Xbox 360 clears EDRAM on the way out of a resolve, and NX1 clears the frame no
   // other way -- D3DDevice_Clear is never called once. Without this the scene's colour
   // and depth buffers carry over frame to frame: under reverse-Z a stale depth buffer
@@ -775,12 +826,10 @@ void Renderer::ClearEdram(const uint8_t* base, uint32_t flags, uint32_t clear_co
   }
 
   D3DCOLOR color = 0;
-  if ((host_flags & D3DCLEAR_TARGET) && clear_color) {
-    auto to8 = [](float c) { return uint32_t(std::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f); };
-    color = D3DCOLOR_ARGB(to8(GuestReadF32(base, clear_color + 12)),  // a
-                          to8(GuestReadF32(base, clear_color + 0)),   // r
-                          to8(GuestReadF32(base, clear_color + 4)),   // g
-                          to8(GuestReadF32(base, clear_color + 8)));  // b
+  if ((host_flags & D3DCLEAR_TARGET) && c.has_color) {
+    auto to8 = [](float v) { return uint32_t(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    color = D3DCOLOR_ARGB(to8(c.clear_color[3]), to8(c.clear_color[0]), to8(c.clear_color[1]),
+                          to8(c.clear_color[2]));
   }
 
   // D3D9 clips Clear to the viewport, and the viewport still holds whatever the last
@@ -794,9 +843,9 @@ void Renderer::ClearEdram(const uint8_t* base, uint32_t flags, uint32_t clear_co
 
   // A depth surface without stencil rejects D3DCLEAR_STENCIL, and D3D9 then fails the
   // whole call -- clearing nothing. Drop back to a depth-only clear rather than lose it.
-  if (FAILED(device_->Clear(0, nullptr, host_flags, color, clear_z, clear_stencil)) &&
+  if (FAILED(device_->Clear(0, nullptr, host_flags, color, c.clear_z, c.clear_stencil)) &&
       (host_flags & D3DCLEAR_STENCIL)) {
-    device_->Clear(0, nullptr, host_flags & ~D3DCLEAR_STENCIL, color, clear_z, 0);
+    device_->Clear(0, nullptr, host_flags & ~D3DCLEAR_STENCIL, color, c.clear_z, 0);
   }
 
   if (have_saved) {

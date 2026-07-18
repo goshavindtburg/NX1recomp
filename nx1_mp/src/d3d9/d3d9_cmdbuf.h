@@ -232,7 +232,7 @@ struct RecordedCommand {
   /// kDraw: index into draws().
   uint32_t draw_index = 0;
 
-  // --- kClear --------------------------------------------------------------------------
+  // --- kClear and kResolve (shared: `kind` discriminates, and a command is never both) ---
   /// Xenos clear bits, NOT desktop D3DCLEAR_* -- the mapping happens at execute time because it
   /// also depends on whether a depth-stencil is bound, which an earlier command may change.
   uint32_t clear_flags = 0;
@@ -240,22 +240,21 @@ struct RecordedCommand {
   /// The guest supplied no colour vector, which suppresses D3DCLEAR_TARGET independently of the
   /// flag bits.
   bool has_color = false;
+  bool has_dest_point = false;
+  /// kClear: the _D3DRECT to clear. kResolve: the source rect to copy out of EDRAM.
   int32_t rect[4] = {};
+  /// kResolve only: where the band lands in the destination.
+  int32_t dest_point[2] = {};
   float clear_color[4] = {};  ///< r, g, b, a as the guest stored them
   float clear_z = 0.0f;
   uint32_t clear_stencil = 0;
 
   // --- kResolve ------------------------------------------------------------------------
-  /// DEFERRED-GAP: these are still guest ADDRESSES (src rect, dest point, clear colour), read at
-  /// execute time. Safe while execution is synchronous. Before the worker lands they need the
-  /// same treatment the clear payload got above -- resolve to values at record time.
+  /// The destination D3DBaseTexture. Left as a guest OBJECT address deliberately: unlike the
+  /// rect/point/colour above -- which the guest passes on its stack and which would be gone by
+  /// the time a worker read them -- a texture object is a persistent allocation, the same
+  /// read-it-late class as the shader objects and surface descriptors.
   uint32_t dest_texture = 0;
-  uint32_t src_rect = 0;
-  uint32_t dest_point = 0;
-  uint32_t resolve_flags = 0;
-  uint32_t resolve_clear_color = 0;
-  float resolve_clear_z = 0.0f;
-  uint32_t resolve_clear_stencil = 0;
 
   // --- kSetRenderTarget / kSetDepthStencil ---------------------------------------------
   uint32_t rt_index = 0;

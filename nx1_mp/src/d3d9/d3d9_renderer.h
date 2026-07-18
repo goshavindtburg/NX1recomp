@@ -174,13 +174,18 @@ class Renderer {
   /// reason as BindStreams: `base` is only for texture data.
   void BindTextures(const uint8_t* base, const RecordedDraw& d, uint64_t surface_key = 0);
   /// The copy half of a resolve (EDRAM -> host texture). Caller holds render_mutex_.
-  void ResolveCopy(const uint8_t* base, uint32_t dest_texture, uint32_t src_rect,
-                   uint32_t dest_point);
+  void ResolveCopy(const uint8_t* base, const RecordedCommand& c);
   /// The clear half of a resolve: wipe the bound colour target and/or depth-stencil,
   /// as the Xbox 360 does when a resolve carries the D3DRESOLVE_CLEAR* flags. Caller
   /// holds render_mutex_.
-  void ClearEdram(const uint8_t* base, uint32_t flags, uint32_t clear_color, float clear_z,
-                  uint32_t clear_stencil);
+  void ClearEdram(const RecordedCommand& c);
+
+  /// Execute halves of the remaining ordered commands. SetDepthStencil in particular MUST run in
+  /// command order: it sizes the depth surface against current_rt_width_/height_, which the
+  /// SetRenderTarget command before it sets.
+  void ExecuteSetRenderTarget(const uint8_t* base, const RecordedCommand& c);
+  void ExecuteSetDepthStencil(const uint8_t* base, const RecordedCommand& c);
+  void ExecuteResolve(const uint8_t* base, const RecordedCommand& c);
 
   /// Translate the guest's depth/blend/cull GPU-register shadows to D3D9.
   void ApplyRenderStates(const RecordedDraw& d);
