@@ -148,14 +148,17 @@ class ResourceTracker {
   /// Host pointer for a guest physical address, for the same probe.
   const uint8_t* PhysicalPointer(uint32_t phys_addr) const;
 
-  /// Untile + upload the texture bound to `sampler`, or nullptr if that fetch
-  /// constant holds no texture or an unsupported format.
+  /// Untile + upload the texture `t` describes, or nullptr if that fetch constant holds no
+  /// texture or an unsupported format. `sampler` is the slot it is bound to -- it keys the cache
+  /// and names the slot in diagnostics, but nothing here reads it back out of guest memory.
   ///
-  /// `out_fetch`, when given, receives the fetch constant this call already had to read.
-  /// The caller needs it for the LOD substitution and the sampler state, and re-reading it
-  /// meant six byte-swapped guest dwords twice per bound slot, ~15k slots a frame.
-  IDirect3DBaseTexture9* GetTexture(const uint8_t* base, uint32_t guest_device, uint32_t sampler,
-                                    TextureFetchConstant* out_fetch = nullptr);
+  /// Takes the DECODED fetch constant rather than (guest_device, sampler) so the caller's copy
+  /// is the only one: the caller needs it anyway for the LOD substitution and the sampler state,
+  /// and reading it twice per bound slot was six byte-swapped guest dwords across ~15k slots a
+  /// frame. It is also what lets a deferred executor call this with a RECORDED constant -- the
+  /// guest's live fetch constants are long overwritten by the time a worker runs.
+  IDirect3DBaseTexture9* GetTexture(const uint8_t* base, const TextureFetchConstant& t,
+                                    uint32_t sampler);
 
   /// Prefer-largest-resolution substitution, keyed on a draw's STABLE geometry surface. The engine
   /// streams world textures at CPU-side LODs: as a surface recedes it binds sampler 0/4/5 to a

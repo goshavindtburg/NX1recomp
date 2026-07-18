@@ -2443,9 +2443,9 @@ bool ResourceTracker::ConvertInlineIndices(uint32_t indices_addr, uint32_t index
   return true;
 }
 
-IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t guest_device,
-                                                   uint32_t sampler,
-                                                   TextureFetchConstant* out_fetch) {
+IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
+                                                   const TextureFetchConstant& t,
+                                                   uint32_t sampler) {
   if (!device_ || !textures_) {
     return nullptr;
   }
@@ -2469,10 +2469,6 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
     prof_lookup.sink = &prof_tex_.lookup_ns;
   }
 
-  const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, sampler);
-  if (out_fetch) {
-    *out_fetch = t;
-  }
   if (!t.valid || !t.base_address || !t.width || !t.height) {
     return nullptr;
   }

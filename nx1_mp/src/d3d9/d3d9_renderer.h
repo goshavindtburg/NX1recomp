@@ -179,7 +179,7 @@ class Renderer {
   /// shader's def mask: fxc parks `def` literals in ANY declared register whose uses were
   /// optimized away -- writing over one poisons every flattened cmp in the shader.
   void UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg, bool needs_inv_tex_dim,
-                           const uint8_t* base, uint32_t guest_device);
+                           const RecordedDraw& d);
 
   Renderer() = default;
   ~Renderer() { Shutdown(); }

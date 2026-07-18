@@ -43,14 +43,18 @@ uint32_t CommandBuffer::RecordConstantDelta(const uint8_t* base, uint32_t guest_
   // Raw bytes, in guest order, vertex stage first. No byte-swapping here on purpose: swapping
   // during capture is what made the first version cost 22.5 ms/frame, and it is work the
   // worker can do just as well.
+  // GuestPointer, NOT base + guest_device + offset -- the device is a physical-mirror EA. The
+  // same mistake in the fetch-constant copy rendered the entire game black; it stayed invisible
+  // until something actually read the captured bytes, so it is fixed here BEFORE the executor
+  // starts consuming these deltas rather than after it goes black too.
   size_t bytes = 0;
   if (vs_mask) {
-    bytes += AppendDirtyGroups(delta_pool_, base + guest_device + guest_device::kVsConstants,
-                               vs_mask);
+    bytes += AppendDirtyGroups(
+        delta_pool_, GuestPointer(base, guest_device + guest_device::kVsConstants), vs_mask);
   }
   if (ps_mask) {
-    bytes += AppendDirtyGroups(delta_pool_, base + guest_device + guest_device::kPsConstants,
-                               ps_mask);
+    bytes += AppendDirtyGroups(
+        delta_pool_, GuestPointer(base, guest_device + guest_device::kPsConstants), ps_mask);
   }
   d.bytes = uint32_t(bytes);
   return uint32_t(deltas_.size() - 1);

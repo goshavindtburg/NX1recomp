@@ -926,13 +926,12 @@ void Renderer::ResolveViewport(const RecordedDraw& d) {
 }
 
 void Renderer::UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg,
-                                   bool needs_inv_tex_dim, const uint8_t* base,
-                                   uint32_t guest_device) {
+                                   bool needs_inv_tex_dim, const RecordedDraw& d) {
   // ps_3_0 only exposes 224 float registers.
   if (base_reg + 2 > 224) {
     return;
   }
-  const AlphaTestState alpha = ReadAlphaTestState(base, guest_device);
+  const AlphaTestState& alpha = d.alpha;
 
   // The translator binds these at *fixed* offsets above the constant window:
   //   [0]     = alpha threshold
@@ -985,7 +984,8 @@ void Renderer::UploadPixelUniforms(const Sm3Shader& shader, uint32_t base_reg,
     if (!(mask & (1u << s))) {
       continue;
     }
-    const TextureFetchConstant t = ReadTextureFetchConstant(base, guest_device, s);
+    const TextureFetchConstant t =
+        DecodeTextureFetchConstant(reinterpret_cast<const uint8_t*>(d.fetch_constants[s]));
     if (t.valid && t.width && t.height) {
       dims[s * 4 + 0] = 1.0f / float(t.width);
       dims[s * 4 + 1] = 1.0f / float(t.height);
@@ -1142,7 +1142,7 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
       cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
       last_const_ps_ = ps;
     }
-    UploadPixelUniforms(*ps, HostConstantCount(*ps), ps->needs_inv_tex_dim, base, guest_device);
+    UploadPixelUniforms(*ps, HostConstantCount(*ps), ps->needs_inv_tex_dim, d);
   }
   sadd(prof_shbind_ns_, t_bind);
   last_const_ring_gen_ = ring_gen;
@@ -1379,11 +1379,15 @@ void Renderer::InvalidateStateShadow() {
 void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d,
                             uint64_t surface_key) {
   auto& tracker = ResourceTracker::Get();
-  // DEFERRED-GAP: the signature below and GetTexture both re-read the fetch constants out of
-  // guest memory, which d.fetch_constants already holds verbatim. Everything else this function
-  // needs (clamp modes, filters, gamma) is decoded from that same constant, so converting
-  // GetTexture to take a raw slot pointer closes the whole function at once.
-  (void)d;
+  // Fetch constants come from the RECORD, not from guest memory: d.fetch_constants holds all 32
+  // slots verbatim (big-endian, unswapped), so DecodeTextureFetchConstant reads them exactly as
+  // it reads a live guest pointer. Everything else this function needs -- clamp modes, filters,
+  // anisotropy, gamma -- is decoded from that same constant, so the whole function is now
+  // deferrable. `base` survives only for the texture DATA, which is bulk memory a worker reads
+  // late by design.
+  const auto slot_bytes = [&d](uint32_t sampler) {
+    return reinterpret_cast<const uint8_t*>(d.fetch_constants[sampler]);
+  };
   // A scene is ~5000 draws over 16 samplers, and consecutive draws overwhelmingly share
   // their textures and filters -- so shadow the sampler state and only touch D3D when it
   // actually changes. Issuing all of it unconditionally was 80k SetTexture and ~500k
@@ -1408,13 +1412,7 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const Re
     if (!(sampler_mask & (1u << sampler))) {
       continue;
     }
-    const uint32_t addr = FetchConstantAddr(guest_device, sampler);
-    const uint8_t* fc = addr >= 0xA0000000u ? GuestTranslatePhysical(addr) : base + addr;
-    if (!fc) {
-      sig_n = 0;  // cannot characterise this draw: fall through and bind it properly
-      break;
-    }
-    std::memcpy(&sig[sig_n], fc, 6 * sizeof(uint32_t));
+    std::memcpy(&sig[sig_n], slot_bytes(sampler), 6 * sizeof(uint32_t));
     sig_n += 6;
   }
   if (sig_n && last_sig_valid_ && last_sig_dwords_ == sig_n && last_sig_mask_ == sampler_mask &&
@@ -1440,10 +1438,10 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, const Re
     // NOTE: a fetch-constant memo was tried here and MEASURED NET-NEGATIVE (textures 8.05 ->
     // 9.27ms). Consecutive draws are usually different materials, so the constant differs, the
     // memo misses, and the compare is pure added cost. Don't re-add it without data.
-    // GetTexture hands back the fetch constant it already read; re-reading it here cost six
-    // byte-swapped guest dwords a second time on every bound slot.
-    TextureFetchConstant t{};
-    IDirect3DBaseTexture9* tex = tracker.GetTexture(base, guest_device, sampler, &t);
+    // Decoded once here and handed to GetTexture: the sampler state below needs the same
+    // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
+    const TextureFetchConstant t = DecodeTextureFetchConstant(slot_bytes(sampler));
+    IDirect3DBaseTexture9* tex = tracker.GetTexture(base, t, sampler);
     if (tex) {
       // For a static-geometry world draw, hold the highest-res texture this surface has shown and
       // substitute it when the engine swaps sampler to a receding (garbage) LOD -- see
@@ -1503,7 +1501,12 @@ void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, Reco
   // expensive: 32 slots x 6 dwords of GuestRead32 is 192 swapped reads per draw, which at
   // ~5000 draws was ~976k reads and several ms on the very thread this scheme exists to
   // unload. The executor swaps what it reads, on the worker.
-  std::memcpy(d.fetch_constants, base + guest_device + guest_device::kFetchConstants,
+  // GuestPointer, NOT base + guest_device + offset: the device is a physical-mirror EA and raw
+  // pointer arithmetic on it silently reads the wrong page. This exact line rendered the whole
+  // game black once already -- it was latent from the moment it was written, because nothing
+  // consumed the recorded constants until the texture path started reading them.
+  std::memcpy(d.fetch_constants,
+              GuestPointer(base, guest_device + guest_device::kFetchConstants),
               sizeof(d.fetch_constants));
 
   d.vs_object = BoundVertexShader(base, guest_device);

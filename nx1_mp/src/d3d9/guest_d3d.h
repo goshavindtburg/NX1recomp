@@ -181,16 +181,25 @@ const uint8_t* GuestTranslatePhysical(uint32_t guest_addr);
 /// above -- passing one of those through `base + addr` faults.
 const uint8_t* GuestTranslateGpuPhysical(uint32_t gpu_physical);
 
+/// Host pointer for a guest EA -- THE address translation every read here must go through.
+///
+/// `base + addr` alone is wrong for anything at 0xA0000000+, and the guest D3D::CDevice is
+/// exactly such a physical-mirror EA: a raw `base[device + field]` misses the 0xE0-heap page
+/// offset and reads garbage. That mistake has rendered the whole game black twice -- once as
+/// GuestTranslateGpuPhysical in read_register, once as a bulk memcpy of the device's fetch
+/// constants -- so it gets a name rather than being open-coded at each site. When adding a bulk
+/// copy out of the device (the deferred-translation recorder does several), translate the base
+/// address with this FIRST and then offset the host pointer.
+inline const uint8_t* GuestPointer(const uint8_t* base, uint32_t guest_addr) {
+  return guest_addr >= 0xA0000000u ? GuestTranslatePhysical(guest_addr) : base + guest_addr;
+}
+
 inline uint32_t GuestRead32(const uint8_t* base, uint32_t guest_addr) {
-  const uint8_t* host =
-      guest_addr >= 0xA0000000u ? GuestTranslatePhysical(guest_addr) : base + guest_addr;
-  return *reinterpret_cast<const rex::be<uint32_t>*>(host);
+  return *reinterpret_cast<const rex::be<uint32_t>*>(GuestPointer(base, guest_addr));
 }
 
 inline uint16_t GuestRead16(const uint8_t* base, uint32_t guest_addr) {
-  const uint8_t* host =
-      guest_addr >= 0xA0000000u ? GuestTranslatePhysical(guest_addr) : base + guest_addr;
-  return *reinterpret_cast<const rex::be<uint16_t>*>(host);
+  return *reinterpret_cast<const rex::be<uint16_t>*>(GuestPointer(base, guest_addr));
 }
 
 inline uint64_t GuestRead64(const uint8_t* base, uint32_t guest_addr) {
@@ -249,9 +258,7 @@ inline VertexFetchConstant ReadVertexFetchConstant(const uint8_t* base, uint32_t
 /// a physical-mirror EA, so the byte must be read through the mirror translation --
 /// a raw `base[device + ...]` misses the 0xE0-heap page offset and reads garbage.
 inline uint32_t StreamStride(const uint8_t* base, uint32_t device, uint32_t stream) {
-  const uint32_t addr = device + guest_device::kStreamStride + stream;
-  const uint8_t* host = addr >= 0xA0000000u ? GuestTranslatePhysical(addr) : base + addr;
-  return uint32_t(*host) * 4u;
+  return uint32_t(*GuestPointer(base, device + guest_device::kStreamStride + stream)) * 4u;
 }
 
 /// Sampler address (clamp) modes.
@@ -318,15 +325,14 @@ struct TextureFetchConstant {
   bool packed_mips;
 };
 
-/// Decode a `GPUTEXTURE_FETCH_CONSTANT` (6 dwords) at an arbitrary guest address.
-/// Used both for sampler slots and for a D3DBaseTexture's embedded Format (at
-/// texture + 0x1C), e.g. a resolve destination.
-inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint32_t addr) {
-  // Translate once for all six dwords. They are 24 contiguous bytes, so they cannot straddle
-  // the 0xA0000000 physical window, yet GuestRead32 re-tests it and recomputes the host
-  // pointer on every one -- and this runs ~21k times a frame (every bound sampler slot of
-  // every draw), where it was the largest part of the texture cache lookup.
-  const uint8_t* p = addr >= 0xA0000000u ? GuestTranslatePhysical(addr) : base + addr;
+/// Decode a `GPUTEXTURE_FETCH_CONSTANT` (6 dwords) from a host pointer at the constant's raw,
+/// big-endian bytes.
+///
+/// Split from the address-taking form so the deferred-translation recorder can decode the copy
+/// it captured: RecordedDraw::fetch_constants holds these 24 bytes verbatim (memcpy, no swap),
+/// so the same decode applies to a live guest pointer and to a recording without the two ever
+/// drifting apart.
+inline TextureFetchConstant DecodeTextureFetchConstant(const uint8_t* p) {
   const uint32_t d0 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 0);
   const uint32_t d1 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 4);
   const uint32_t d2 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 8);
@@ -371,6 +377,17 @@ inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint
     t.depth = (t.dimension == 3) ? 6 : (((d2 >> 26) & 0x3F) + 1);  // cube => 6 faces
   }
   return t;
+}
+
+/// Decode a `GPUTEXTURE_FETCH_CONSTANT` (6 dwords) at an arbitrary guest address.
+/// Used both for sampler slots and for a D3DBaseTexture's embedded Format (at
+/// texture + 0x1C), e.g. a resolve destination.
+inline TextureFetchConstant ReadTextureFetchConstantAt(const uint8_t* base, uint32_t addr) {
+  // Translate once for all six dwords. They are 24 contiguous bytes, so they cannot straddle
+  // the 0xA0000000 physical window, yet GuestRead32 re-tests it and recomputes the host
+  // pointer on every one -- and this runs ~21k times a frame (every bound sampler slot of
+  // every draw), where it was the largest part of the texture cache lookup.
+  return DecodeTextureFetchConstant(GuestPointer(base, addr));
 }
 
 /// The texture bound to `sampler` (its fetch constant at `device + 24*sampler`).
