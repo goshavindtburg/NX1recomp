@@ -232,7 +232,7 @@ bool Renderer::Initialize(HWND output_window) {
     return false;
   }
   ResourceTracker::Get().Initialize(device_);
-  InvalidateSamplerShadow();
+  InvalidateStateShadow();
 
   // A guest colour target the size of the display *is* the backbuffer, so the final
   // composite lands where Present can show it instead of in an orphaned texture.
@@ -357,6 +357,7 @@ void Renderer::Present() {
 
   const bool prof_on = REXCVAR_GET(nx1_d3d9_profile);
   ResourceTracker::Get().prof_enabled_ = prof_on;
+  ShaderCache::Get().prof_enabled_ = prof_on;
   if (prof_on) {
     static uint32_t prof_frames = 0;
     if (++prof_frames >= 60) {
@@ -376,6 +377,16 @@ void Renderer::Present() {
                   double(tp.why_dirty) / prof_frames, double(tp.why_zero) / prof_frames,
                   double(tp.decode_bytes) / (1024.0 * 1024.0 * prof_frames),
                   tp.decode_ns ? double(tp.decode_bytes) / double(tp.decode_ns) : 0.0);
+      REXGPU_INFO("nx1_d3d9: PROF/shd outer hash={:.2f} lookup={:.2f} bind+upload={:.2f} ms/frame",
+                  prof_hash_ns_ * tf, prof_lookup_ns_ * tf, prof_shbind_ns_ * tf);
+      prof_hash_ns_ = prof_lookup_ns_ = prof_shbind_ns_ = 0;
+      const auto sp = ShaderCache::Get().TakeShaderProfile();
+      REXGPU_INFO("nx1_d3d9: PROF/shd literals={:.2f} read={:.2f} window={:.2f} defs={:.2f} ms/frame "
+                  "| {:.0f} uploads/frame, {:.1f} regs + {:.1f} defs each",
+                  sp.literals_ns * tf, sp.read_ns * tf, sp.window_ns * tf, sp.defs_ns * tf,
+                  double(sp.calls) / prof_frames,
+                  sp.calls ? double(sp.registers) / double(sp.calls) : 0.0,
+                  sp.calls ? double(sp.def_writes) / double(sp.calls) : 0.0);
       REXGPU_INFO("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
                   prof_bind_calls_ ? 100.0 * double(prof_bind_skips_) / double(prof_bind_calls_)
                                    : 0.0,
@@ -541,7 +552,7 @@ void Renderer::Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_
   // sampler 0 and leaving it unbound afterwards. BindTextures' shadow cannot see that, so
   // tell it to stop trusting itself. Resolves are a handful per frame; re-issuing the
   // sampler state on the next draw costs nothing next to getting it wrong.
-  InvalidateSamplerShadow();
+  InvalidateStateShadow();
   ClearEdram(base, flags, clear_color, clear_z, clear_stencil);
 }
 
@@ -834,14 +845,29 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   // A pixel shader is optional: the depth pre-pass binds none, and that is exactly
   // when a vertex shader runs its second (predicated-Z) pass. Hashing pass 0 there
   // would look up microcode the GPU never executes.
+  // TEMP PROFILING: hashing the microcode vs looking the result up. HashGuestUcode XXH3s the
+  // whole shader twice per draw (~10k times a frame), which is the suspect for the ~2 ms of the
+  // shaders phase that UploadConstants does not account for.
+  const bool sprof = REXCVAR_GET(nx1_d3d9_profile);
+  const auto smark = [sprof] {
+    return sprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  };
+  const auto sadd = [sprof](uint64_t& sink, std::chrono::steady_clock::time_point t0) {
+    if (sprof) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
+  };
+
   const uint32_t vs_pass = VertexShaderPass(base, vs_object, /*has_pixel_shader=*/ps_object != 0);
+  const auto t_hash = smark();
   const uint64_t vs_hash =
       HashGuestUcode(ReadGuestUcode(base, vs_object, /*pixel_shader=*/false, vs_pass));
-  const Sm3Shader* vs = vs_hash ? cache.Lookup(vs_hash) : nullptr;
-
   const uint64_t ps_hash =
       ps_object ? HashGuestUcode(ReadGuestUcode(base, ps_object, /*pixel_shader=*/true)) : 0;
+  sadd(prof_hash_ns_, t_hash);
+
+  const auto t_look = smark();
+  const Sm3Shader* vs = vs_hash ? cache.Lookup(vs_hash) : nullptr;
   const Sm3Shader* ps = ps_hash ? cache.Lookup(ps_hash) : nullptr;
+  sadd(prof_lookup_ns_, t_look);
 
   if (!vs || (ps_object && !ps)) {
     // A handful of shaders do not lower to SM3, and a draw that wants one is silently
@@ -868,7 +894,11 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
 
 
 
-  device_->SetVertexShader(vs->vs);
+  const auto t_bind = smark();
+  if (vs->vs != bound_vs_) {
+    device_->SetVertexShader(vs->vs);
+    bound_vs_ = vs->vs;
+  }
   cache.UploadConstants(base, guest_device, *vs, /*pixel_stage=*/false);
   if (!NeedsHostNdcTransform(*vs)) {
     UploadVertexUniforms(*vs, HostConstantCount(*vs));
@@ -884,7 +914,11 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
     active_sampler_mask_ = 0xFFFFu;  // unwalkable VS: cannot rule out vertex-texture fetch
   }
 
-  device_->SetPixelShader(ps ? ps->ps : nullptr);
+  IDirect3DPixelShader9* const want_ps = ps ? ps->ps : nullptr;
+  if (want_ps != bound_ps_) {
+    device_->SetPixelShader(want_ps);
+    bound_ps_ = want_ps;
+  }
   // A draw with no pixel shader is a depth/shadow-only pass: the Xbox exports no
   // color, so nothing is written to the render target. On D3D9, SetPixelShader(null)
   // instead activates the fixed-function pixel pipeline, which *does* write color
@@ -893,11 +927,16 @@ bool Renderer::BindShadersAndConstants(const uint8_t* base, uint32_t guest_devic
   //
   // Otherwise honour the guest's own mask: it masks colour off to write destination alpha
   // alone (see ReadColorWriteMask).
-  device_->SetRenderState(D3DRS_COLORWRITEENABLE, ps ? ReadColorWriteMask(base, guest_device) : 0);
+  const uint32_t want_color_write = ps ? ReadColorWriteMask(base, guest_device) : 0;
+  if (want_color_write != bound_color_write_) {
+    device_->SetRenderState(D3DRS_COLORWRITEENABLE, want_color_write);
+    bound_color_write_ = want_color_write;
+  }
   if (ps) {
     cache.UploadConstants(base, guest_device, *ps, /*pixel_stage=*/true);
     UploadPixelUniforms(*ps, HostConstantCount(*ps), ps->needs_inv_tex_dim, base, guest_device);
   }
+  sadd(prof_shbind_ns_, t_bind);
 
   return true;
 }
@@ -1049,13 +1088,20 @@ void Renderer::ApplyRenderStates(const uint8_t* base, uint32_t guest_device) {
   device_->SetRenderState(D3DRS_CULLMODE, mode);
 }
 
-void Renderer::InvalidateSamplerShadow() {
+void Renderer::InvalidateStateShadow() {
   for (uint32_t s = 0; s < 16; ++s) {
     sampler_texture_[s] = kSamplerTextureUnknown;
     for (uint32_t i = 0; i < kSamplerStates; ++i) {
       sampler_state_[s][i] = kSamplerStateUnset;
     }
   }
+  bound_vs_ = kVertexShaderUnknown;
+  bound_ps_ = kPixelShaderUnknown;
+  bound_color_write_ = kColorWriteUnset;
+  ShaderCache::Get().InvalidateDefShadow();
+  // The draw-signature skip trusts that the device still holds the previous draw's bindings;
+  // once something else has rebound them that is no longer true.
+  last_sig_valid_ = false;
 }
 
 void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t surface_key) {

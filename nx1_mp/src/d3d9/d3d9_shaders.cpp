@@ -7,6 +7,7 @@
 
 #ifdef _WIN32
 
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -344,11 +345,21 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
   // constant file by D3D::SetLiteralShaderConstants and never reach the shadow -- so for those
   // registers the shadow reads zero. Resolve them from the shader's own definition table.
   // See ReadShaderLiterals in guest_d3d.h.
+  const auto pmark = [this] {
+    return prof_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  };
+  const auto padd = [this](uint64_t& sink, std::chrono::steady_clock::time_point t0) {
+    if (prof_enabled_) sink += uint64_t((std::chrono::steady_clock::now() - t0).count());
+  };
+  if (prof_enabled_) ++prof_.calls;
+
+  const auto t_lit = pmark();
   ShaderLiteral literals[16];
   const uint32_t shader_object = pixel_stage ? BoundPixelShader(base, guest_device)
                                              : BoundVertexShader(base, guest_device);
   const uint32_t literal_count =
       ReadShaderLiterals(base, shader_object, pixel_stage, literals, 16);
+  padd(prof_.literals_ns, t_lit);
   // The constant file is shared: a pixel shader's register r is file index 256 + r.
   const uint32_t file_base = pixel_stage ? 256u : 0u;
 
@@ -368,11 +379,21 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
       }
     }
     const uint32_t addr = ring.Resolve(pixel_stage, r, guest_constants_addr);
+    // Translate once for the whole float4. GuestReadF32 re-tests the 0xA0000000 physical
+    // window and recomputes the host pointer on every component, and this loop runs ~82k
+    // times a frame (10 registers x ~8.6k uploads).
+    //
+    // This MUST mirror GuestRead32 exactly: GuestTranslatePhysical, not the GpuPhysical
+    // variant the literal path above uses. Getting that wrong reads garbage for every
+    // constant the ring owns -- including the world matrix -- and renders the frame black.
+    const uint8_t* src = addr >= 0xA0000000u ? GuestTranslatePhysical(addr) : base + addr;
     for (uint32_t c = 0; c < 4; ++c) {
-      dst[c] = GuestReadF32(base, addr + c * 4);
+      const uint32_t bits = *reinterpret_cast<const rex::be<uint32_t>*>(src + c * 4);
+      std::memcpy(&dst[c], &bits, sizeof(float));
     }
   };
 
+  const auto t_read = pmark();
   if (e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS) {
     // Relative addressing: the shader can index any register, so upload all 256.
     count = kMaxHostConstants;
@@ -386,14 +407,30 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
     }
   }
 
+  padd(prof_.read_ns, t_read);
+  if (prof_enabled_) prof_.registers += count;
+
+  // Only when this stage's shader changed. Our own window upload deliberately steps AROUND
+  // this shader's def registers, so while the same shader stays bound nothing we issue can
+  // disturb them; it is a DIFFERENT shader's window covering those registers that makes the
+  // re-assert necessary at all. The two stages have separate D3D9 constant files, so a pixel
+  // upload can never clobber a vertex def or vice versa -- hence one slot per stage.
+  //
+  // Keys on the Sm3Shader address, which is stable because ShaderMap is a node-based
+  // std::unordered_map. Do not convert that map to FlatMap without revisiting this.
+  const uint32_t stage = pixel_stage ? 1u : 0u;
   if (count == 0) {
     // No window to upload, but the defs still need asserting (see below).
-    for (uint32_t d = 0; d < shader.def_count; ++d) {
-      if (pixel_stage) {
-        device_->SetPixelShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
-      } else {
-        device_->SetVertexShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+    if (last_def_shader_[stage] != &shader) {
+      for (uint32_t d = 0; d < shader.def_count; ++d) {
+        if (pixel_stage) {
+          device_->SetPixelShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+        } else {
+          device_->SetVertexShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+        }
       }
+      last_def_shader_[stage] = &shader;
+      if (prof_enabled_) prof_.def_writes += shader.def_count;
     }
     return;
   }
@@ -403,6 +440,7 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
   // uniform's uses were optimized away -- including inside [0, count). Writing over one feeds
   // garbage to every cmp fxc flattened: measured live, c19 def=(0,1,-1,-0) held literal-pool
   // garbage on every sun-shadow shader, which is what actually killed the sun shadows.
+  const auto t_win = pmark();
   uint32_t run = 0;
   while (run < count) {
     while (run < count && shader.IsDefRegister(run)) {
@@ -422,17 +460,25 @@ void ShaderCache::UploadConstants(const uint8_t* base, uint32_t guest_device,
     run = end;
   }
 
+  padd(prof_.window_ns, t_win);
+  const auto t_defs = pmark();
+
   // Re-assert the shader's own `def` literals. Skipping them above is necessary but NOT
   // sufficient: the runtime does not reapply defs on SetShader (measured -- see
   // Sm3Shader::defs), so a previous shader's window upload that legitimately covered these
   // registers would otherwise still be sitting in them for this shader's draw.
-  for (uint32_t d = 0; d < shader.def_count; ++d) {
-    if (pixel_stage) {
-      device_->SetPixelShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
-    } else {
-      device_->SetVertexShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+  if (last_def_shader_[stage] != &shader) {
+    for (uint32_t d = 0; d < shader.def_count; ++d) {
+      if (pixel_stage) {
+        device_->SetPixelShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+      } else {
+        device_->SetVertexShaderConstantF(shader.defs[d].reg, shader.defs[d].v, 1);
+      }
     }
+    last_def_shader_[stage] = &shader;
+    if (prof_enabled_) prof_.def_writes += shader.def_count;
   }
+  padd(prof_.defs_ns, t_defs);
 #endif
 }
 

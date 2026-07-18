@@ -91,12 +91,40 @@ class ShaderCache {
   void UploadConstants(const uint8_t* base, uint32_t guest_device, const Sm3Shader& shader,
                        bool pixel_stage);
 
+  /// TEMP PROFILING: where the shaders phase actually goes. It runs twice per draw and is now
+  /// the largest phase, and its parts have very different fixes -- guest reads want memoising,
+  /// D3D constant calls want eliding -- so the split has to be measured, not assumed.
+  struct ShaderProfile {
+    uint64_t literals_ns = 0;  ///< ReadShaderLiterals, re-read from guest memory every draw
+    uint64_t read_ns = 0;      ///< the read_register loop (literal scan + ring resolve + swaps)
+    uint64_t window_ns = 0;    ///< SetShaderConstantF for the compacted window
+    uint64_t defs_ns = 0;      ///< def re-assertion, one single-register D3D call per def
+    uint64_t calls = 0;        ///< UploadConstants invocations
+    uint64_t registers = 0;    ///< registers staged
+    uint64_t def_writes = 0;   ///< individual def constant writes issued
+  };
+  ShaderProfile TakeShaderProfile() {
+    ShaderProfile p = prof_;
+    prof_ = {};
+    return p;
+  }
+  bool prof_enabled_ = false;
+
+  /// Forget which shaders' `def` literals are believed to be live in the constant file, so the
+  /// next upload re-asserts them. Call whenever something outside UploadConstants may have
+  /// written the shader constant registers.
+  void InvalidateDefShadow() { last_def_shader_[0] = last_def_shader_[1] = nullptr; }
+
  private:
   ShaderCache() = default;
   ~ShaderCache() { Shutdown(); }
   ShaderCache(const ShaderCache&) = delete;
   ShaderCache& operator=(const ShaderCache&) = delete;
 
+  ShaderProfile prof_;
+  /// Last shader whose `def` literals were asserted, per stage (0 = vertex, 1 = pixel).
+  /// See UploadConstants for why same-shader repeats need no re-assert.
+  const Sm3Shader* last_def_shader_[2] = {nullptr, nullptr};
   IDirect3DDevice9Ex* device_ = nullptr;
   const uint8_t* bytecode_ = nullptr;  ///< decompressed blob
   void* bytecode_storage_ = nullptr;

@@ -215,6 +215,11 @@ class Renderer {
   bool last_sig_valid_ = false;
   uint64_t prof_bind_skips_ = 0;
   uint64_t prof_bind_calls_ = 0;
+  /// Splits the shaders phase outside UploadConstants: microcode hashing, cache lookup, and the
+  /// SetShader/uniform/colour-mask binding around them.
+  uint64_t prof_hash_ns_ = 0;
+  uint64_t prof_lookup_ns_ = 0;
+  uint64_t prof_shbind_ns_ = 0;
 
   /// TEMP PROFILING (nx1_d3d9_profile): per-phase nanoseconds accumulated over a frame,
   /// reported and reset in Present. Measures where the ~19us/draw actually goes.
@@ -257,10 +262,12 @@ class Renderer {
   // through: 0 is a legal D3DSAMP_* value, and nullptr is a legal texture binding, so
   // zeroing either would let a draw skip a call D3D never actually received.
   //
-  // Anything that binds a texture or sampler state outside BindTextures MUST call
-  // InvalidateSamplerShadow() -- ResourceTracker's depth blit does exactly that on sampler
-  // 0, and silently desyncing the shadow against it corrupted every later draw that
-  // happened to want the texture the shadow still believed was bound.
+  // Anything that binds a texture, sampler state, shader or the colour-write mask outside
+  // BindTextures/BindShadersAndConstants MUST call InvalidateStateShadow() --
+  // ResourceTracker's depth blit does exactly that (sampler 0, both shader stages and
+  // D3DRS_COLORWRITEENABLE, none of which it restores), and silently desyncing the shadow
+  // against it corrupted every later draw that happened to want the texture the shadow
+  // still believed was bound.
   static constexpr uint32_t kSamplerStates = 8;  ///< U, V, W address + mag, min, mip filter, aniso, sRGB
   static constexpr uint32_t kSamplerStateUnset = ~0u;
   /// Clamped to the adapter's D3DCAPS9::MaxAnisotropy at device creation; 1 = no aniso.
@@ -270,8 +277,24 @@ class Renderer {
   IDirect3DBaseTexture9* sampler_texture_[16];
   uint32_t sampler_state_[16][kSamplerStates];
 
-  /// Forget what we think is bound to the samplers, so the next draw re-issues all of it.
-  void InvalidateSamplerShadow();
+  /// The bound shader pair and colour-write mask, shadowed on the same principle as the
+  /// sampler state above: BindShadersAndConstants re-issued all three on EVERY draw, and at
+  /// ~5000 draws a frame that was ~1.4 ms of D3D calls that overwhelmingly changed nothing.
+  /// Sentinels again pick values a real binding cannot take -- nullptr is a legal pixel
+  /// shader (the depth-only pass) and 0 a legal colour mask -- so the first draw writes
+  /// through rather than trusting a zeroed shadow.
+  static inline IDirect3DVertexShader9* const kVertexShaderUnknown =
+      reinterpret_cast<IDirect3DVertexShader9*>(~uintptr_t(0));
+  static inline IDirect3DPixelShader9* const kPixelShaderUnknown =
+      reinterpret_cast<IDirect3DPixelShader9*>(~uintptr_t(0));
+  static constexpr uint32_t kColorWriteUnset = ~0u;
+  IDirect3DVertexShader9* bound_vs_ = kVertexShaderUnknown;
+  IDirect3DPixelShader9* bound_ps_ = kPixelShaderUnknown;
+  uint32_t bound_color_write_ = kColorWriteUnset;
+
+  /// Forget what we think is bound to the samplers and shader stages, so the next draw
+  /// re-issues all of it.
+  void InvalidateStateShadow();
 
   // The guest colour surface currently bound to MRT slot 0.
   uint32_t current_rt_surface_ = 0;
