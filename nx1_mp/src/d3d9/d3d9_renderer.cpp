@@ -408,6 +408,13 @@ void Renderer::Present() {
                   prof_stream_calls_ ? 100.0 * double(prof_stream_skips_) / double(prof_stream_calls_) : 0.0,
                   double(prof_stream_calls_) / prof_frames);
       prof_decl_skips_ = prof_decl_calls_ = prof_stream_skips_ = prof_stream_calls_ = 0;
+      const auto lp = ResourceTracker::Get().TakeLodProfile();
+      REXGPU_INFO("nx1_d3d9: PROF/lod calls={:.0f} no_surface={:.0f} fresh={:.1f} adopt={:.1f} "
+                  "equal={:.1f} (same={:.1f} diff={:.1f}) substitute={:.1f} per frame",
+                  double(lp.calls) / prof_frames, double(lp.no_surface) / prof_frames,
+                  double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
+                  double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
+                  double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
       REXGPU_INFO("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
                   prof_bind_calls_ ? 100.0 * double(prof_bind_skips_) / double(prof_bind_calls_)
                                    : 0.0,
@@ -1264,7 +1271,8 @@ void Renderer::BindTextures(const uint8_t* base, uint32_t guest_device, uint64_t
       // For a static-geometry world draw, hold the highest-res texture this surface has shown and
       // substitute it when the engine swaps sampler to a receding (garbage) LOD -- see
       // PreferLargestForSurface. surface_key 0 (UI / inline draws) leaves the binding untouched.
-      tex = tracker.PreferLargestForSurface(surface_key, sampler, t.format, tex, t.width, t.height);
+      tex = tracker.PreferLargestForSurface(surface_key, sampler, t.format, tex, t.width, t.height,
+                                            t.base_address);
     }
     if (tex != sampler_texture_[sampler]) {
       device_->SetTexture(sampler, tex);

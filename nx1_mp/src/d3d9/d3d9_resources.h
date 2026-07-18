@@ -153,9 +153,13 @@ class ResourceTracker {
   /// mixed into the retention key so a different-format texture the same surface binds to this sampler
   /// in another pass (e.g. a normal map in the depth pre-pass vs the albedo in the colour pass) is
   /// never substituted for this one. Returns the texture to actually bind.
+  /// `base_address` is the guest allocation this binding names. It is what distinguishes a
+  /// texture updating in place from the streaming pool swapping in a different allocation at
+  /// the same declared size -- see the equal-area branch.
   IDirect3DBaseTexture9* PreferLargestForSurface(uint64_t surface_key, uint32_t sampler,
                                                  uint32_t format, IDirect3DBaseTexture9* tex,
-                                                 uint32_t width, uint32_t height);
+                                                 uint32_t width, uint32_t height,
+                                                 uint32_t base_address);
 
   /// Untile + upload a 3D (volume) texture. The composite's colour-grading LUT is one, and an
   /// unbound sampler reads black -- which blacks out the entire composited frame.
@@ -374,6 +378,33 @@ class ResourceTracker {
   uint64_t tex_rebuilds_ = 0;   ///< layout changed -> host texture recreated
   uint64_t tex_failures_ = 0;   ///< CreateTexture/UpdateTexture failed
   uint64_t tex_evicted_ = 0;    ///< released by the age sweep
+
+ public:
+  /// TEMP PROFILING: why PreferLargestForSurface is or is not substituting. The confetti
+  /// appears when BACKING AWAY from a surface, which is exactly the case this is supposed to
+  /// cover, so the question is which of its branches the receding draw actually takes.
+  struct LodProfile {
+    uint64_t calls = 0;
+    uint64_t no_surface = 0;   ///< surface_key 0 -- UI/inline draw, lineage not tracked
+    uint64_t fresh = 0;        ///< first time this surface+sampler+format was seen
+    uint64_t adopt = 0;        ///< strictly larger -> becomes the retained texture
+    uint64_t equal = 0;        ///< same area -> pass the current one through
+    /// Of those, the ones where the current texture is a DIFFERENT object from the retained
+    /// one. equal_same is just the same texture rebound and is harmless; equal_diff is the
+    /// only case where this branch can hand back a different (possibly unstreamed) allocation
+    /// while bypassing a known-good retained texture. If this is ~0 the branch is innocent.
+    uint64_t equal_same = 0;
+    uint64_t equal_diff = 0;
+    uint64_t substitute = 0;   ///< smaller, retained texture served instead (the fix working)
+  };
+  LodProfile TakeLodProfile() {
+    LodProfile p = prof_lod_;
+    prof_lod_ = {};
+    return p;
+  }
+
+ private:
+  LodProfile prof_lod_;
   uint64_t mips_built_ = 0;            ///< chain generated here (block-compressed)
   uint64_t mips_auto_ = 0;             ///< chain left to the driver (uncompressed)
   uint64_t mips_skip_nochain_ = 0;     ///< guest declares mip_max_level == 0

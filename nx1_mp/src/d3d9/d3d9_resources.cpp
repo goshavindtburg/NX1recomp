@@ -33,6 +33,24 @@
 #include "d3d9_resources.h"
 #include "guest_d3d.h"
 
+/// Paint one PreferLargestForSurface branch white, to identify which one serves the confetti.
+///   1 = the `substitute` path (smaller than retained -> retained served)
+///   2 = the `equal` path (same area -> current served, retained bypassed)
+///   3 = the `adopt`/`fresh` path (largest yet seen -> becomes retained)
+/// Back away from a surface until it speckles; whichever mode turns it white is the branch
+/// that produced it. Off (0) by default.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_lod, 0, "GPU",
+                      "Debug: paint one prefer-largest LOD branch white (1=substitute, "
+                      "2=equal, 3=adopt)");
+
+/// Diagnostic: drop ONLY the CPU-built block-compressed mip chain, leaving the driver's
+/// auto-generated chains alone. nx1_d3d9_mips 0 disables both at once, which cannot tell our
+/// BC encoder apart from the driver's minification -- and with mips off entirely a minified
+/// surface aliases, which reads as speckle too. This isolates the half we wrote.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_bc_mips, true, "GPU",
+                    "Build mip chains for block-compressed textures on the CPU (diagnostic: "
+                    "set false to leave BC textures unmipped while keeping driver auto-mips)");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
                     "Give textures a mip chain, filtered down from level 0 by the driver. Off "
                     "leaves every minified surface aliasing (the coloured speckle).")
@@ -590,6 +608,10 @@ struct BestTexture {
   IDirect3DBaseTexture9* tex = nullptr;
   uint32_t area = 0;  ///< width * height of the retained texture
   uint64_t last_frame = 0;
+  /// Guest allocation the retained texture was decoded from. Same dimensions do NOT mean same
+  /// content: the streaming pool rebinds a different allocation at the same declared size, and
+  /// comparing addresses is what separates that from a texture updating in place.
+  uint32_t base_address = 0;
 };
 using BestTextureMap = FlatMap<BestTexture>;
 
@@ -2326,7 +2348,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
   const bool auto_mips = SupportsAutoMips(device_, host.d3d);
   const bool bc_mips = IsBlockCompressed(host.d3d);
   const bool want_mips = REXCVAR_GET(nx1_d3d9_mips) && (auto_mips || bc_mips);
-  const bool build_mips = want_mips && !auto_mips;
+  const bool build_mips = want_mips && !auto_mips && REXCVAR_GET(nx1_d3d9_bc_mips);
   const uint32_t levels = build_mips ? BcMipLevels(t.width, height) : 1;
 
   // Track how each texture's mip chain is provided (built here / driver auto-gen / skipped), so the
@@ -2543,8 +2565,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base, uint32_t
 IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface_key,
                                                                 uint32_t sampler, uint32_t format,
                                                                 IDirect3DBaseTexture9* tex,
-                                                                uint32_t width, uint32_t height) {
-  if (!surface_key || !tex || !best_textures_) return tex;
+                                                                uint32_t width, uint32_t height,
+                                                                uint32_t base_address) {
+  if (prof_enabled_) ++prof_lod_.calls;
+  if (!surface_key || !tex || !best_textures_) {
+    if (prof_enabled_ && !surface_key) ++prof_lod_.no_surface;
+    return tex;
+  }
   auto* map = static_cast<BestTextureMap*>(best_textures_);
   // Key on format as well as surface+sampler: the same geometry is drawn in several passes (shadow,
   // depth pre-pass, colour) that each bind a DIFFERENT texture to the same sampler, so conflating
@@ -2553,7 +2580,10 @@ IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface
   auto& b = (*map)[MixKey(MixKey(surface_key, sampler), format)];
   b.last_frame = frame_;
   const uint32_t area = width * height;
+  const uint32_t dbg = REXCVAR_GET(nx1_d3d9_dbg_lod);
+  if (prof_enabled_ && !b.tex) ++prof_lod_.fresh;
   if (area > b.area) {
+    if (prof_enabled_) ++prof_lod_.adopt;
     // STRICTLY larger -> the new best. Adopt it, holding a reference so it survives the base-keyed
     // cache evicting the entry it came from. Strictly-larger (not >=) is deliberate: a same-size
     // re-read of a texture whose slot was recycled to garbage must NOT replace the clean retained one.
@@ -2561,11 +2591,36 @@ IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface
     tex->AddRef();
     b.tex = tex;
     b.area = area;
-    return tex;
+    b.base_address = base_address;
+    return dbg == 3 && white_ ? white_ : tex;
   }
   // Same size: a fresh binding at the largest resolution (a render target, or updated content). Keep
   // the retained texture but show the current one -- nothing is frozen stale at full resolution.
-  if (area == b.area) return tex;
+  if (area == b.area) {
+    if (prof_enabled_) {
+      ++prof_lod_.equal;
+      if (b.tex == tex) {
+        ++prof_lod_.equal_same;
+      } else {
+        ++prof_lod_.equal_diff;
+      }
+    }
+    // Mode 4 narrows mode 2 to only the suspicious case: same area but a different texture
+    // object, i.e. the one binding where this branch can serve a fresh (possibly unstreamed)
+    // allocation in place of the retained one. Mode 2 painted ~68% of the scene white, which
+    // made the speckled surface impossible to pick out.
+    if (dbg == 4 && b.tex && b.tex != tex && white_) return white_;
+    // NOTE: serving the retained texture here was tried, keyed first on base_address and then
+    // on the texture object, to stop this branch handing back an unstreamed allocation. Painting
+    // the branch white (dbg_lod 4) DOES turn the speckled surfaces white, so the garbage is
+    // served through here -- but substituting the retained texture did not reduce the speckle
+    // at all, which means the retained texture carries the same bad texels. The fault is
+    // upstream of this function; do not re-attempt the substitution without new evidence.
+    b.base_address = base_address;
+    return dbg == 2 && white_ ? white_ : tex;
+  }
+  if (prof_enabled_ && b.tex) ++prof_lod_.substitute;
+  if (dbg == 1 && b.tex && white_) return white_;
   // Smaller than what this surface has shown before: a receding LOD. Serve the retained full-res,
   // whose host-built mip chain the driver minifies to clean pixels instead of the recycled garbage.
   return b.tex ? b.tex : tex;
