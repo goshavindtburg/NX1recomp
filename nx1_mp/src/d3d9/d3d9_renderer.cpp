@@ -1672,8 +1672,8 @@ void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, Reco
   // the same index-buffer range every frame (the index buffers plateau at a few hundred addresses),
   // so (ib address, draw range) keys the surface across its near/far LOD swaps. Mix in a golden-ratio
   // constant so start_index/index_count don't collide across nearby ranges.
-  d.index_buffer = ReadIndexBuffer(base, guest_device).base_address;
-  d.surface_key = uint64_t(d.index_buffer) ^ (uint64_t(d.start_index) * 0x9E3779B185EBCA87ull) ^
+  d.index_buffer = ReadIndexBuffer(base, guest_device);
+  d.surface_key = uint64_t(d.index_buffer.base_address) ^ (uint64_t(d.start_index) * 0x9E3779B185EBCA87ull) ^
                   (uint64_t(d.index_count) << 40) ^
                   (uint64_t(d.base_vertex_index) * 0xD1B54A32D192ED03ull);
 
@@ -1950,20 +1950,20 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
   // much of it we have to mirror. The guest's fetch constant would have us mirror the whole
   // pool the model happens to live in.
   //
-  // DEFERRED-GAP: GetIndexBuffer / GetDrawMaxIndex read the index-buffer descriptor and scan the
-  // index data itself out of guest memory. d.index_buffer carries the descriptor's base address;
-  // the index DATA is bulk memory the worker is meant to read late, on the same stability
-  // argument as the vertex data -- but the probe only ever covered vertex ranges. Index ranges
-  // need the same measurement before this is trusted.
+  // The index-buffer DESCRIPTOR comes from the record. It is device state that changes every
+  // draw, so re-reading it here meant the worker mirrored whatever the guest had bound tens of
+  // draws later -- one mesh's indices through another's vertices, i.e. the whole world as
+  // exploded spikes. The index DATA is still read late, which the stability probe does cover.
   auto t_ib = ptick();
   uint32_t index_size = 0;
-  IDirect3DIndexBuffer9* ib = ResourceTracker::Get().GetIndexBuffer(base, guest_device, &index_size);
+  IDirect3DIndexBuffer9* ib =
+      ResourceTracker::Get().GetIndexBuffer(base, d.index_buffer, &index_size);
   if (!ib) {
     padd(prof_indices_ns_, t_ib);
     return;
   }
   const uint32_t max_index =
-      ResourceTracker::Get().GetDrawMaxIndex(base, guest_device, start_index, index_count);
+      ResourceTracker::Get().GetDrawMaxIndex(d.index_buffer, start_index, index_count);
   const uint32_t needed_vertices = max_index ? base_vertex_index + max_index + 1 : 0;
   padd(prof_indices_ns_, t_ib);
 
@@ -1986,8 +1986,8 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
     // late purely by analogy with the vertex result, and index buffers are written by a
     // different part of the engine on a different schedule, so the analogy is worth nothing
     // until it is a number.
-    if (d.index_buffer && index_size) {
-      ProbeStability(ProbeKind::kIndex, d.index_buffer + start_index * index_size,
+    if (d.index_buffer.base_address && index_size) {
+      ProbeStability(ProbeKind::kIndex, d.index_buffer.base_address + start_index * index_size,
                      index_count * index_size);
     }
   }

@@ -2275,13 +2275,13 @@ void ResourceTracker::AdvanceFrame() {
   }
 }
 
-IDirect3DIndexBuffer9* ResourceTracker::GetIndexBuffer(const uint8_t* base, uint32_t guest_device,
+IDirect3DIndexBuffer9* ResourceTracker::GetIndexBuffer(const uint8_t* base,
+                                                       const IndexBufferState& state,
                                                        uint32_t* index_size) {
   *index_size = 0;
   if (!device_ || !index_buffers_) {
     return nullptr;
   }
-  const IndexBufferState state = ReadIndexBuffer(base, guest_device);
   if (!state.valid()) {
     return nullptr;
   }
@@ -2344,12 +2344,11 @@ IDirect3DIndexBuffer9* ResourceTracker::GetIndexBuffer(const uint8_t* base, uint
   return entry.ib;
 }
 
-uint32_t ResourceTracker::GetDrawMaxIndex(const uint8_t* base, uint32_t guest_device,
-                                          uint32_t start_index, uint32_t index_count) {
+uint32_t ResourceTracker::GetDrawMaxIndex(const IndexBufferState& state, uint32_t start_index,
+                                          uint32_t index_count) {
   if (!index_buffers_ || !index_ranges_ || !index_count) {
     return 0;
   }
-  const IndexBufferState state = ReadIndexBuffer(base, guest_device);
   if (!state.valid()) {
     return 0;
   }

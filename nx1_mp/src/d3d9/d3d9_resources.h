@@ -30,6 +30,7 @@ namespace nx1::d3d9 {
 
 struct TextureFetchConstant;  // guest_d3d.h
 struct VertexFetchConstant;   // guest_d3d.h
+struct IndexBufferState;      // guest_d3d.h
 
 inline constexpr uint32_t kMaxHostStreams = 4;
 
@@ -124,14 +125,14 @@ class ResourceTracker {
                                           uint32_t needed_vertices, uint32_t* vertex_count);
 
   /// Mirror the bound index buffer. `index_size` receives 2 or 4.
-  IDirect3DIndexBuffer9* GetIndexBuffer(const uint8_t* base, uint32_t guest_device,
+  IDirect3DIndexBuffer9* GetIndexBuffer(const uint8_t* base, const IndexBufferState& state,
                                         uint32_t* index_size);
 
   /// The highest vertex index the draw range [start_index, start_index + index_count)
   /// references, or 0 if it cannot be determined. Memoized per (index-buffer contents,
   /// range), so the scan runs once per distinct draw rather than every frame.
   /// GetIndexBuffer must have been called for this draw first.
-  uint32_t GetDrawMaxIndex(const uint8_t* base, uint32_t guest_device, uint32_t start_index,
+  uint32_t GetDrawMaxIndex(const IndexBufferState& state, uint32_t start_index,
                            uint32_t index_count);
 
   /// Convert an inline (user-pointer) vertex stream for a *UP draw: `count`

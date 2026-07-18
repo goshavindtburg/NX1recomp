@@ -174,8 +174,15 @@ struct RecordedDraw {
   uint32_t vs_object = 0;
   uint32_t ps_object = 0;
   uint32_t vs_pass = 0;
-  /// Guest D3DIndexBuffer address, and the declaration the streams were bound through.
-  uint32_t index_buffer = 0;
+  /// The bound index buffer's DESCRIPTOR, captured -- not the address to re-read it from.
+  ///
+  /// This is device state that changes every draw, exactly like the fetch constants. Reading it
+  /// at execute time meant the worker mirrored whatever index buffer the guest had bound by
+  /// THEN, tens of draws later, and drew one mesh's indices through another's vertices: the
+  /// whole world rendered as exploded spikes. The mistake was measuring that index DATA is
+  /// stable within a frame and crossing off index reads generally -- data and binding are
+  /// different things, and only the data was ever measured.
+  IndexBufferState index_buffer{};
   uint32_t vertex_declaration = 0;
   /// m_StreamStride[] for the streams we support, packed one byte per stream as the guest
   /// stores it.
