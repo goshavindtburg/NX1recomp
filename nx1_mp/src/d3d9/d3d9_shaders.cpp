@@ -20,6 +20,7 @@
 #include <rex/logging/macros.h>
 
 #include "d3d9_constants.h"
+
 #include "guest_d3d.h"
 
 #ifdef NX1_HAVE_SM3_SHADER_CACHE
@@ -27,6 +28,11 @@
 
 #include "nx1_sm3_shader_cache.h"
 #endif
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_literals, 0, "GPU",
+                      "Debug: report what c252-c255 resolve to for the first N distinct shaders, "
+                      "and whether each value came from the shader literal table or fell back to "
+                      "the shadow. Set it IN GAME -- at launch the budget is spent on menu shaders");
 
 namespace nx1::d3d9 {
 
@@ -392,6 +398,53 @@ uint32_t ShaderCache::ResolveConstants(const uint8_t* base, uint32_t guest_devic
       std::memcpy(&dst[c], &bits, sizeof(float));
     }
   };
+
+  // Literal-constant probe. 36 of the 46 pixel shaders that can output a varying alpha in this
+  // scene take that alpha from c252-c255 (typically `cndeq r7.___w, ..., c253.yyyy`), so what
+  // those four registers resolve to decides whether a premultiplied surface comes out
+  // transparent or opaque. They are loaded straight into the GPU constant file by
+  // D3D::SetLiteralShaderConstants and never reach the shadow, so if the shader's own literal
+  // table does not cover them the fallback path reads the shadow's ZERO -- a silent wrong value
+  // that looks like a legitimate constant. Report the PROVENANCE, not just the number: "0 from a
+  // literal" and "0 because nothing supplied it" are different bugs and identical in a value dump.
+  if (const uint32_t lit_budget = REXCVAR_GET(nx1_d3d9_dbg_literals)) {
+    static std::mutex lm;
+    static std::vector<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(lm);
+    if (std::find(seen.begin(), seen.end(), shader_object) == seen.end() && seen.size() < lit_budget) {
+      seen.push_back(shader_object);
+      for (uint32_t r = 252; r <= 255; ++r) {
+        const uint32_t index = r + file_base;
+        int from_literal = -1;
+        for (uint32_t i = 0; i < literal_count; ++i) {
+          if (index >= literals[i].reg && index < literals[i].reg + literals[i].float4s) {
+            from_literal = int(i);
+            break;
+          }
+        }
+        float v[4] = {};
+        read_register(r, v);
+        REXGPU_INFO("nx1_d3d9: LITERAL {} obj={:08X} c{} = {} {} {} {}  source={}",
+                    pixel_stage ? "PS" : "VS", shader_object, r, v[0], v[1], v[2], v[3],
+                    from_literal >= 0 ? "shader literal table" : "SHADOW/RING (likely zero)");
+      }
+      // literal_count==0 for EVERY shader would mean the literal path is dead rather than that
+      // these shaders have no literals, so report the field ReadShaderLiterals gives up on.
+      // def_offset==0 means the guest's definition-table pointer read as null: either the shader
+      // genuinely has no table, or the offsets we walk it with are wrong.
+      const uint32_t fn = shader_object + (pixel_stage ? guest_shader::kPsFunctionOffset
+                                                       : guest_shader::kVsFunctionOffset);
+      const uint32_t def_off = GuestRead32(
+          base, fn + guest_shader::kUcodePassArray + guest_shader::kDefinitionTableOffsetField);
+      const uint32_t phys = GuestRead32(base, shader_object + (pixel_stage
+                                                                   ? guest_shader::kPsPhysicalOffset
+                                                                   : guest_shader::kVsPhysicalOffset));
+      REXGPU_INFO("nx1_d3d9: LITERAL {} obj={:08X} literal_count={} file_base={} def_offset={:#x} "
+                  "physical={:08X} remapCount={}",
+                  pixel_stage ? "PS" : "VS", shader_object, literal_count, file_base, def_off, phys,
+                  e.remapCount);
+    }
+  }
 
   const auto t_read = pmark();
   if (e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS) {

@@ -78,6 +78,10 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_ps, 0, "GPU",
 /// loaded fastfile, so their ADDRESSES are stable across launches -- which is what makes a range
 /// search valid here when an index search would not be (discovery order shifts every run, and that
 /// has already produced one retracted conclusion in this investigation).
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_shaderid_n, 0, "GPU",
+                      "Debug: log the microcode hash of the first N distinct pixel-shader "
+                      "objects drawn. The hash names tools/new_shader_dump/shader_<HASH>.ucode.frag");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_ps_lo, 0, "GPU",
                       "Restrict the blend isolate/verify to draws whose pixel-shader object is >= "
                       "this value; 0 = no lower bound");
@@ -1320,6 +1324,32 @@ void Renderer::ResolveShadersAndConstants(const uint8_t* base, uint32_t guest_de
   const GuestUcode probe_marker{};
   const Sm3Shader* vs = resolve(vs_object, vs_pass, /*pixel_stage=*/false, &probe_marker);
   const Sm3Shader* ps = ps_object ? resolve(ps_object, 0, /*pixel_stage=*/true, nullptr) : nullptr;
+
+  // Name the microcode behind the isolated material. tools/new_shader_dump holds the readable
+  // disassembly as shader_<HASH>.ucode.frag, so the hash is what turns "this material renders
+  // wrong" into a shader you can actually read. One-shot per object, off unless the isolate is set.
+  // Two modes. With dbg_blend_ps set, name that one material. With dbg_shaderid_n set, name the
+  // first N DISTINCT materials seen -- which is what you want when the ps_object from a previous
+  // session no longer matches anything, since shader objects move between runs. Cross-reference
+  // the resulting list against BLENDPS by ps value; no bisection needed.
+  const uint32_t dbg_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps);
+  const uint32_t shaderid_n = REXCVAR_GET(nx1_d3d9_dbg_shaderid_n);
+  if (ps_object && ((dbg_ps && ps_object == dbg_ps) || shaderid_n)) {
+    static std::mutex sid_m;
+    static std::vector<uint32_t> sid_seen;
+    std::lock_guard<std::mutex> sid_lk(sid_m);
+    const bool fresh =
+        std::find(sid_seen.begin(), sid_seen.end(), ps_object) == sid_seen.end();
+    if (fresh && sid_seen.size() < (dbg_ps ? 1u : shaderid_n)) {
+      sid_seen.push_back(ps_object);
+      const GuestUcode pu = ReadGuestUcode(base, ps_object, /*pixel_stage=*/true, 0);
+      const GuestUcode vu = ReadGuestUcode(base, vs_object, /*pixel_stage=*/false, vs_pass);
+      REXGPU_INFO("nx1_d3d9: SHADERID ps={:08X} ucode_hash={:016X} dwords={} sm3={} | "
+                  "vs={:08X} ucode_hash={:016X} dwords={} sm3={}",
+                  ps_object, HashGuestUcode(pu), pu.dword_count, ps ? 1 : 0, vs_object,
+                  HashGuestUcode(vu), vu.dword_count, vs ? 1 : 0);
+    }
+  }
   // Only used by the cache-miss diagnostic below, and only on the slow path.
   const uint64_t vs_hash = vs ? 1 : 0;
   const uint64_t ps_hash = ps ? 1 : 0;

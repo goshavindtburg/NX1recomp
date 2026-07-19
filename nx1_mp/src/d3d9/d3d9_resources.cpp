@@ -3190,10 +3190,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       }
     }
     REXGPU_INFO("nx1_d3d9: TEXDUMP addr={:08X} fmt={} {}x{} dim={} depth={} pitch={} tiled={} "
-                "endian={} swizzle=0x{:03X} mips={} packed={} host=0x{:08X} src[0..31]= {}",
+                "endian={} swizzle=0x{:03X} mips={} packed={} host=0x{:08X} attribution={} "
+                "src[0..31]= {}",
                 t.base_address, t.format, t.width, height, t.dimension, t.depth, t.pitch_pixels,
                 t.tiled ? 1 : 0, t.endian, t.swizzle, t.mip_max_level, t.packed_mips ? 1 : 0,
-                uint32_t(host.d3d), src ? hex : "<null>");
+                uint32_t(host.d3d),
+                dump_draw_ ? "MATERIAL-FILTERED" : "UNFILTERED-next-rebuild",
+                src ? hex : "<null>");
 
     std::vector<Rgba8> img;
     if (IsBlockCompressed(host.d3d)) {
