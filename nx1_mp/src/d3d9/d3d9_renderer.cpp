@@ -47,13 +47,16 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_async, false, "GPU",
                     "Translate recorded GPU commands on a worker thread, overlapping our "
                     "translation with the guest's own between-draw logic");
 
-REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_isolate, -1, "GPU",
-                     "Make every draw using BLENDCFG #N write no colour, so it disappears. "
-                     "Cycle this to find which blend config a surface uses. Indices are per-run "
-                     "-- read them from the same run's log. -1 = off");
+// Target a blend config by VALUE (the Xenos colour factor pair), never by discovery index.
+// Indices shift between runs because they are assigned in first-seen order, which already cost
+// two runs and produced one wrong conclusion. src/dst are the numbers BLENDCFG prints.
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_src, -1, "GPU",
+                     "Xenos colour SRC factor of the draws to isolate/verify; -1 = off");
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_dst, -1, "GPU",
+                     "Xenos colour DST factor of the draws to isolate/verify; -1 = off");
 
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_blend_verify, false, "GPU",
-                    "With dbg_blend_isolate set, read the device's ACTUAL render states back "
+                    "With dbg_blend_src/dst set, read the device's ACTUAL render states back "
                     "for that config instead of hiding it -- tells apart \"we never issued the "
                     "blend\" from \"we issued it and it did not take\"");
 
@@ -1604,8 +1607,7 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   // setting isolate alone did nothing -- the index bookkeeping it depends on never ran. A debug
   // tool that silently no-ops is worse than no tool: it reads as "the theory is wrong" rather
   // than "the switch was off".
-  const int32_t blend_isolate = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_isolate));
-  if (REXCVAR_GET(nx1_d3d9_dbg_blend_log) || blend_isolate >= 0) {
+  if (REXCVAR_GET(nx1_d3d9_dbg_blend_log) || int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_src)) >= 0) {
     const uint64_t sig = uint64_t(blend.enabled) | (uint64_t(blend.color_src) << 1) |
                          (uint64_t(blend.color_dst) << 7) | (uint64_t(blend.color_op) << 13) |
                          (uint64_t(blend.alpha_src) << 17) | (uint64_t(blend.alpha_dst) << 23) |
@@ -1626,15 +1628,20 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
                   blend.color_op, blend.alpha_src, blend.alpha_dst, blend.alpha_op,
                   d.color_write_mask);
     }
-    // Attribution. Knowing WHICH of these configs the glass uses is the whole question, and the
-    // list alone cannot say. Setting nx1_d3d9_dbg_blend_isolate to an index makes every draw
-    // using that config write nothing, so it visibly disappears -- cycle the value in the F4
-    // overlay until the glass vanishes and the index is identified in seconds.
-    //
-    // Indices are assigned in DISCOVERY ORDER, so they are stable only within one run. Read them
-    // from the same run's log, not an earlier one.
-    if (blend_isolate >= 0 && it != seen.end() &&
-        size_t(blend_isolate) == size_t(it - seen.begin())) {
+    // Attribution. Set dbg_blend_src/dst to a factor pair from the BLENDCFG lines: with verify
+    // off those draws write no colour and visibly vanish (so you can confirm which surface uses
+    // them); with verify on they render normally and report their real device state and textures.
+    // Matched by VALUE, not by discovery index. Indices are assigned in the order configs are
+    // first seen, so they shift between runs -- and that already cost two runs and one wrong
+    // conclusion: a verify captured when #2 meant ONE->INVSRCALPHA was read against an
+    // identification made when #2 meant ZERO->SRCCOLOR. The Xenos factor pair is stable, so
+    // target that instead and the mistake cannot recur.
+    const int32_t want_src = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_src));
+    const int32_t want_dst = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_dst));
+    const bool value_match = want_src >= 0 && want_dst >= 0 &&
+                             uint32_t(want_src) == blend.color_src &&
+                             uint32_t(want_dst) == blend.color_dst;
+    if (value_match) {
       if (REXCVAR_GET(nx1_d3d9_dbg_blend_verify)) {
         // Ask D3D what it ACTUALLY has, rather than trusting our shadow.
         //
