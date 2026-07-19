@@ -55,6 +55,13 @@ REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_src, -1, "GPU",
 REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_dst, -1, "GPU",
                      "Xenos colour DST factor of the draws to isolate/verify; -1 = off");
 
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);  // defined in d3d9_resources.cpp
+
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_track_sampler, -1, "GPU",
+                     "With blend verify on, automatically point nx1_d3d9_dbg_track_addr at this "
+                     "sampler's texture in the matched draw. Avoids hand-copying an address "
+                     "between runs, which is invalid -- guest allocations move every launch");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_blend_verify, false, "GPU",
                     "With dbg_blend_src/dst set, read the device's ACTUAL render states back "
                     "for that config instead of hiding it -- tells apart \"we never issued the "
@@ -1699,6 +1706,12 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
           // BC broadcast-swizzle bug that made smoke sprites invisible. The address is what the
           // existing texture tooling keys on (nx1_d3d9_dbg_track_addr, TRACK/DECODE logging), so
           // printing it here is what turns "the shader is wrong" into something inspectable.
+          // Auto-arm the texture tracker on one of this draw's samplers, so no address ever has
+          // to be copied by hand between runs. Guest allocations MOVE between launches, and
+          // hand-carrying an address from an old log is how the muzzle-flash hunt wasted three
+          // rounds -- and it just happened again (the tracked address was a leftover from that
+          // very investigation). Setting it from inside the matched draw cannot go stale.
+          const int32_t track_slot = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_track_sampler));
           for (uint32_t s = 0; s < 16; ++s) {
             if (!(active_sampler_mask_ & (1u << s))) {
               continue;
@@ -1706,6 +1719,11 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
             const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(s));
             if (!t.valid || !t.base_address) {
               continue;
+            }
+            if (track_slot >= 0 && uint32_t(track_slot) == s) {
+              REXCVAR_SET(nx1_d3d9_dbg_track_addr, t.base_address);
+              REXGPU_INFO("nx1_d3d9: BLENDVERIFY   >>> tracking sampler{} tex={:08X} <<<", s,
+                          t.base_address);
             }
             REXGPU_INFO("nx1_d3d9: BLENDVERIFY   sampler{} tex={:08X} {}x{} fmt={} swizzle={:#05X} "
                         "gamma={} miplevels={}..{}",
