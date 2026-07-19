@@ -239,6 +239,35 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 
 void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
 {
+    // SetTextureLod was silently dropped, so every fetch that asked for an explicit mip level got
+    // the hardware's COMPUTED one instead. In this corpus that is 1999 shaders and every one of
+    // them is a tfetchCube -- and the cube coordinate we synthesise is a branch-selected value
+    // read back from cubeMapData, whose screen-space derivatives are meaningless. Computed LOD off
+    // a meaningless derivative picks a mip per quad at random, which on a reflection map is
+    // coloured speckle.
+    if (instr.opcode == FetchOpcode::SetTextureLod)
+    {
+        if (instr.isPredicated)
+        {
+            indent();
+            println("if ({}p0)", instr.predCondition ? "" : "!");
+            indent();
+            out += "{\n";
+            ++indentation;
+        }
+        indent();
+        print("xe_texture_lod = r{}.", instr.srcRegister);
+        out += SWIZZLES[instr.srcSwizzle & 0x3];
+        out += ";\n";
+        if (instr.isPredicated)
+        {
+            --indentation;
+            indent();
+            out += "}\n";
+        }
+        return;
+    }
+
     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
         return;
 
@@ -345,6 +374,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         out += "Bicubic";
 #endif
 
+    // Distinct name so the SM3/DXIL layers can lower it to an explicit-LOD sample. Only emitted
+    // where the guest actually asked for one, so everything else keeps computed LOD.
+    const bool explicitLod = instr.opcode == FetchOpcode::TextureFetch && instr.useRegLod;
+    if (explicitLod)
+        out += "Lod";
+
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
     printSrcRegister(componentCount);
 
@@ -357,6 +392,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         out += ", cubeMapData";
         break;
     }
+
+    if (explicitLod)
+        out += ", xe_texture_lod";
 
     out += ").";
 
@@ -1455,6 +1493,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         out += "\n";
     }
+
+    // The Xenos texture LOD register: written by SetTextureLod, read by any fetch with useRegLod.
+    // Zero-initialised so a fetch that reads it before any set still samples the top level rather
+    // than whatever happened to be in scope.
+    out += "\tfloat xe_texture_lod = 0.0;\n";
 
     constexpr uint32_t REGISTER_COUNT = 64;
     bool printedRegisters[REGISTER_COUNT]{};

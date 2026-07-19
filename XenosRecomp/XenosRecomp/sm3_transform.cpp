@@ -389,6 +389,17 @@ bool transformToSm3(const std::string& source, bool isPixelShader, uint32_t spec
     body = regexReplace(body,
         R"(tfetch3D\(s(\d+)_Texture3DDescriptorIndex,\s*s\1_SamplerDescriptorIndex,\s*([^)]+)\))",
         "tex3D(s$1, $2)");
+    // Explicit-LOD cube fetch. MUST be rewritten before the plain tfetchCube pattern, which would
+    // otherwise match the same text and leave the trailing LOD argument stranded.
+    //
+    // The guest sets the mip level itself (setTexLOD) for every cube fetch in this corpus -- 1999
+    // shaders, all of them tfetchCube. Dropping it left the hardware computing LOD from the
+    // derivatives of `cubeDir(...)`, which is a value branch-selected out of a stashed array
+    // rather than a smoothly varying expression; its derivatives carry no meaning, so the mip
+    // came out effectively per-quad random.
+    body = regexReplace(body,
+        R"(tfetchCubeLod\(s(\d+)_TextureCubeDescriptorIndex,\s*s\1_SamplerDescriptorIndex,\s*([^,]+),\s*cubeMapData,\s*([^)]+)\))",
+        "texCUBElod(s$1, float4(cubeDir(cubeMapData, ($2).z), $3))");
     body = regexReplace(body,
         R"(tfetchCube\(s(\d+)_TextureCubeDescriptorIndex,\s*s\1_SamplerDescriptorIndex,\s*([^,]+),\s*cubeMapData\))",
         "texCUBE(s$1, cubeDir(cubeMapData, ($2).z))");

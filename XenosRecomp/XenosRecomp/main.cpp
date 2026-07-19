@@ -1114,8 +1114,15 @@ int main(int argc, char** argv)
                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
             };
 
+        // `par`, NOT `par_unseq`. par_unseq additionally permits interleaving operations from
+        // different iterations WITHIN one thread, and it is undefined behaviour for the callable
+        // to allocate, take a lock, or touch thread_local storage -- processShader does all three
+        // (it builds strings, and the DXC compiler is thread_local). That is the long-standing
+        // "schedule-dependent shared-state corruption" this build has been crashing on: it is not
+        // a data race between threads at all, so mutexes never helped and TSan had nothing to find.
+        // `par` keeps the multithreading, and the speed with it.
         if (std::getenv("NX1_PARALLEL") != nullptr)
-            std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), processShader);
+            std::for_each(std::execution::par, shaders.begin(), shaders.end(), processShader);
         else
             std::for_each(std::execution::seq, shaders.begin(), shaders.end(), processShader);
 
