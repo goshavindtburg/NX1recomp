@@ -392,6 +392,8 @@ class ResourceTracker {
   /// copying anything. DrainMemoryWrites then dirties any texture whose watched range overlaps
   /// a write, which is what makes a live-read decode re-run once the data actually lands.
   void ArmWriteWatch(uint32_t phys_addr, uint32_t len);
+  /// Drop every mirror page so the next read re-copies from guest memory.
+  void MirrorInvalidateAll();
 
   void* layouts_ = nullptr;        ///< std::unordered_map<uint64_t, VertexLayout>*
   void* vertex_buffers_ = nullptr; ///< std::unordered_map<uint64_t, VertexBufferEntry>*

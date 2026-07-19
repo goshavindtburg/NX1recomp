@@ -150,6 +150,13 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_texture_mirror, true, "GPU",
 /// occupant -- freezing makes that permanent. Turn this off to find out which side of that
 /// trade an artifact is on: with committing disabled the write-watch keeps re-decoding, so a
 /// texture that was merely early will correct itself once its data lands.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_redecode_all, false, "GPU",
+                    "Debug: one-shot -- dirty EVERY cached texture so it re-decodes from its "
+                    "guest memory as it is right now, then clears itself. Answers the one "
+                    "question a tracked texture cannot when the guest never writes to it: is the "
+                    "source correct and our cached decode merely stale, or is the source itself "
+                    "wrong? If the speckle clears, we missed the write that filled it");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_writes_always_invalidate, true, "GPU",
                     "Honour a guest write even to a committed texture -- the reference model. "
                     "Off restores the old freeze, which cannot distinguish protecting a good "
@@ -2140,6 +2147,13 @@ const uint8_t* ResourceTracker::PhysicalPointer(uint32_t phys_addr) const {
   return TranslatePhysical(phys_addr);
 }
 
+void ResourceTracker::MirrorInvalidateAll() {
+  // Without this the re-decode would re-read the SNAPSHOT, which is exactly the data under
+  // suspicion. Dropping validity forces MirrorSnapshot to re-copy from guest memory.
+  for (auto& w : mirror_valid_) w = 0;
+  for (auto& w : watch_armed_) w = 0;
+}
+
 void ResourceTracker::ArmWriteWatch(uint32_t phys_addr, uint32_t len) {
   if (!phys_base_ || !len || uint64_t(phys_addr) + len > (uint64_t(kMirrorPages) << 12)) {
     return;
@@ -2254,6 +2268,21 @@ void ResourceTracker::DrainMemoryWrites() {
         }
       }
     }
+  }
+  // One-shot global invalidate. Placed here so it uses the same path a guest write would.
+  if (REXCVAR_GET(nx1_d3d9_dbg_redecode_all)) {
+    REXCVAR_SET(nx1_d3d9_dbg_redecode_all, false);
+    uint32_t n = 0;
+    for (auto [key, entry] : *textures) {
+      entry.dirty = true;
+      entry.committed = false;
+      entry.good_frames = 0;
+      entry.zero_retries = 0;
+      entry.retry_frame = 0;
+      ++n;
+    }
+    MirrorInvalidateAll();
+    REXGPU_INFO("nx1_d3d9: REDECODE forced {} cached textures to re-decode from current memory", n);
   }
   for (auto [key, entry] : *textures) {
     if (!entry.watch_size) continue;
@@ -3310,6 +3339,36 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       std::snprintf(path, sizeof(path), "texdump/tex_%08X_%ux%u_f%u.bmp", t.base_address, t.width,
                     height, t.format);
       DumpRgbaBmp(path, img, t.width, height);
+    }
+
+    // ALSO dump mip level 1, decoded from mip_address. Xenos keeps level 0 at base_address and
+    // levels 1..N at mip_address, and the streaming system fills them independently -- so a
+    // texture whose mip chain arrived but whose base did not leaves base_address holding a stale
+    // pool slot while the real image sits at mip_address. We build our mip chain from level 0,
+    // so a garbage base then poisons every distance. Dumping both is the only way to see which
+    // one actually holds the picture.
+    if (t.mip_address && t.mip_address != t.base_address && t.width > 1 && height > 1) {
+      const uint32_t mw = t.width >> 1, mh = height >> 1;
+      const rex::graphics::TextureExtent mx = rex::graphics::TextureExtent::Calculate(
+          fmt, mw, mh, /*depth=*/1, t.tiled, /*is_guest=*/true);
+      const size_t mbytes = size_t(mx.block_pitch_h) * mx.block_pitch_v * bpb;
+      if (const uint8_t* msrc = MirrorSnapshot(t.mip_address, uint32_t(mbytes))) {
+        const uint32_t mrow = mx.block_width * bpb;
+        uint8_t* mscratch = DetileScratch(size_t(mx.block_width) * mx.block_height * bpb);
+        DetileMip2D(mscratch, mrow, msrc, mx, bpb, t.endian, t.tiled, 0, 0);
+        std::vector<Rgba8> mimg;
+        if (IsBlockCompressed(host.d3d)) {
+          DecodeBcImage(host.d3d, mscratch, mrow, mw, mh, mimg);
+        }
+        if (!mimg.empty()) {
+          char mpath[256];
+          std::snprintf(mpath, sizeof(mpath), "texdump/mip1_%08X_%ux%u_f%u.bmp", t.mip_address, mw,
+                        mh, t.format);
+          DumpRgbaBmp(mpath, mimg, mw, mh);
+          REXGPU_INFO("nx1_d3d9: MIPDUMP base={:08X} -> mip1 from {:08X} ({}x{})", t.base_address,
+                      t.mip_address, mw, mh);
+        }
+      }
     }
   }
 
