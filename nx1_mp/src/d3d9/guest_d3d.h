@@ -300,6 +300,11 @@ struct TextureFetchConstant {
   uint32_t format;        ///< xenos::TextureFormat
   uint32_t endian;        ///< xenos::Endian (0=none,1=8in16,2=8in32,3=16in32)
   bool gamma;             ///< TextureSign::kGamma on RGB: hardware linearizes on fetch
+  /// The RAW per-component TextureSign (0=unsigned, 1=signed, 2=biased/2x-1, 3=gamma), X,Y,Z,W.
+  /// `gamma` above collapses these to a single flag, which is only the whole story when all four
+  /// agree. The reference backend switches on each component separately -- sign 1 even reads a
+  /// differently-typed view of the same bytes -- so keep the raw field to see what we are dropping.
+  uint32_t sign[4];
   bool tiled;
   uint32_t pitch_pixels;  ///< row pitch in texels (dword0.pitch << 5); 0 => derive from width
   uint32_t width;         ///< texels
@@ -353,6 +358,10 @@ inline TextureFetchConstant DecodeTextureFetchConstant(const uint8_t* p) {
   // fetch. NX1 flags its colour maps and every resolve of a k_8_8_8_8_GAMMA target this
   // way -- mirror it with D3DSAMP_SRGBTEXTURE or the whole frame reads a gamma curve dark.
   t.gamma = ((d0 >> 2) & 0x3) == 3;
+  // Per-component signs live at bits 2-3 (X), 4-5 (Y), 6-7 (Z), 8-9 (W).
+  for (uint32_t c = 0; c < 4; ++c) {
+    t.sign[c] = (d0 >> (2 + 2 * c)) & 0x3;
+  }
   t.pitch_pixels = ((d0 >> 22) & 0x1FF) << 5;
   t.tiled = ((d0 >> 31) & 0x1) != 0;
   t.clamp_u = (d0 >> 10) & 0x7;

@@ -290,6 +290,13 @@ class ResourceTracker {
   IDirect3DDevice9Ex* device_ = nullptr;
   IDirect3DPixelShader9* depth_blit_ps_ = nullptr;
   bool depth_blit_failed_ = false;
+  /// 1x1 opaque white -- also the substitute for the debug "force this sampler high" probe,
+  /// which distinguishes "this sample's VALUE is wrong" from "this sample is unstable" by
+  /// replacing it with something provably constant.
+ public:
+  IDirect3DBaseTexture9* WhiteTexture() const { return white_; }
+
+ private:
   /// 1x1 opaque white, bound in place of a texture we cannot yet produce (the
   /// resolved scene depth and the shadow maps -- Xenos fmt 23 -- which need real
   /// render-target support). Sampling an *unbound* sampler returns 0, which reads as

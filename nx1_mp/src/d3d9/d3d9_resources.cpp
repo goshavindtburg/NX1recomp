@@ -3200,11 +3200,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     // The SAMPLER is the whole point when a shader names its inputs by slot (tf0, tf6...): a
     // dump that does not say which slot it filled cannot be matched to the shader that reads it.
     REXGPU_INFO("nx1_d3d9: TEXDUMP sampler={} addr={:08X} fmt={} {}x{} dim={} depth={} pitch={} tiled={} "
-                "endian={} swizzle=0x{:03X} mips={} packed={} host=0x{:08X} attribution={} "
-                "src[0..31]= {}",
+                "endian={} swizzle=0x{:03X} sign={}{}{}{} mips={} packed={} host=0x{:08X} "
+                "attribution={} src[0..31]= {}",
                 sampler, t.base_address, t.format, t.width, height, t.dimension, t.depth,
                 t.pitch_pixels,
-                t.tiled ? 1 : 0, t.endian, t.swizzle, t.mip_max_level, t.packed_mips ? 1 : 0,
+                t.tiled ? 1 : 0, t.endian, t.swizzle,
+                t.sign[0], t.sign[1], t.sign[2], t.sign[3],
+                t.mip_max_level, t.packed_mips ? 1 : 0,
                 uint32_t(host.d3d),
                 dump_draw_ ? "MATERIAL-FILTERED" : "UNFILTERED-next-rebuild",
                 src ? hex : "<null>");

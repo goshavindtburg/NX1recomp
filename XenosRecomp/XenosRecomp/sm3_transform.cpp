@@ -62,13 +62,26 @@ struct CubeMapData
 // A 0-based index made the first (and usually only) cube in a shader return .w = 0, so p0 was
 // false on every pixel and every shadow tap was dead code -- the world rendered lit but
 // perfectly flat. Keep this in step with cubeDir's threshold below.
+// .z must ALSO be non-zero, for a different reason than .w. Hardware returns 2x the major-axis
+// magnitude there, and the guest divides by it to project the face coordinates:
+//     cube r0, r10.xxzy, r10.yzxx
+//     rcp r3.x, |r0.z|              ; 1 / major axis
+//     mul r0.yz, r0.yyxx, r3.x
+// Returning 0.0 made that rcp(0) = INF, which fxc's safe-rcp idiom then clamps to c17.y =
+// FLT_MAX rather than discarding -- 3.4e38 flows into the colour and any surface whose
+// specular mask is non-zero overflows to white. (Intact window glass: opaque white pane,
+// correct alpha. Killing its specular sampler "fixed" it only by multiplying the huge value
+// by zero.) tfetchCube ignores these coordinates and looks the direction up via
+// cubeMapDirections, so only the magnitude has to be right for the arithmetic to be sane.
 float4 cube(float4 value, inout CubeMapData d)
 {
     if (d.cubeMapIndex == 0) d.cubeMapDirections[0] = value.xyz;
     else                     d.cubeMapDirections[1] = value.xyz;
     float idx = (float)d.cubeMapIndex;
     d.cubeMapIndex++;
-    return float4(0.0, 0.0, 0.0, idx + 1.0);
+    float ma = max(abs(value.x), max(abs(value.y), abs(value.z)));
+    // A degenerate (zero) direction would put us straight back to rcp(0); keep it finite.
+    return float4(0.0, 0.0, 2.0 * max(ma, 1e-8), idx + 1.0);
 }
 
 float3 cubeDir(CubeMapData d, float sel)
