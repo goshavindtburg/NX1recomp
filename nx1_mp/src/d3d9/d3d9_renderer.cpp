@@ -1684,8 +1684,16 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
         static std::mutex vm;
         static int32_t reported_for = -1;
         std::lock_guard<std::mutex> vlk(vm);
-        const int32_t target_key = (want_src << 8) | want_dst;
-        if (reported_for != target_key) {
+        // Latch on the target AND the sampler being tracked, and only once the tracker has
+        // actually been armed. Latching on the first match anywhere meant a MENU draw claimed the
+        // one-shot -- it matched 1->7 but had no sampler 10, so it reported nothing, marked the
+        // target done, and silently ignored every in-game draw afterwards. Two runs lost to that.
+        // A one-shot must fire on the first USEFUL event, not the first event.
+        const int32_t track_slot_key = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_track_sampler));
+        const int32_t target_key = (want_src << 16) | (want_dst << 8) | (track_slot_key & 0xFF);
+        const bool want_arm = track_slot_key >= 0;
+        const bool armable = !want_arm || (active_sampler_mask_ & (1u << (track_slot_key & 0xF)));
+        if (reported_for != target_key && armable) {
           reported_for = target_key;
           DWORD be = 0, sb = 0, db = 0, sep = 0, cw = 0, af = 0;
           device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &be);
