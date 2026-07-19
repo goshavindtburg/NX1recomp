@@ -1958,6 +1958,14 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     last_sig_valid_ = false;
   }
 
+  // Aim the texture dump at ONE material. Shape filters (size/format) were tried first and matched
+  // nothing: the dimensions a material binds change between runs, so a filter copied from an older
+  // log silently selects no texture at all, which reads exactly like "the texture is fine".
+  // ps_object names the material and is stable for the life of the loaded fastfile.
+  if (const uint32_t dump_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps)) {
+    tracker.SetDumpDraw(d.ps_object == dump_ps);
+  }
+
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
     if (!(sampler_mask & (1u << sampler))) {
       continue;
@@ -2020,6 +2028,9 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
       }
     }
   }
+  // Never let the dump flag survive this draw, or the next material's textures get attributed to
+  // the one being investigated.
+  tracker.SetDumpDraw(false);
 }
 
 void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, RecordedDraw& d) {

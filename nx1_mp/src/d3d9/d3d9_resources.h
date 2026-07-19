@@ -171,6 +171,13 @@ class ResourceTracker {
   /// and reading it twice per bound slot was six byte-swapped guest dwords across ~15k slots a
   /// frame. It is also what lets a deferred executor call this with a RECORDED constant -- the
   /// guest's live fetch constants are long overwritten by the time a worker runs.
+  /// Dump every texture the NEXT draw binds, regardless of the size/format dump filter. Set from
+  /// the renderer when a draw matches the material isolate, because filtering the dump by shape
+  /// only ever finds "some texture that looks like the one we want" -- the sizes and formats a
+  /// material binds change between runs, so a shape filter aimed from an old log matches nothing
+  /// and reads as "the texture is fine".
+  void SetDumpDraw(bool on) { dump_draw_ = on; }
+
   IDirect3DBaseTexture9* GetTexture(const uint8_t* base, const TextureFetchConstant& t,
                                     uint32_t sampler);
 
@@ -472,6 +479,7 @@ class ResourceTracker {
   /// Writes that dirtied an entry which HAD committed -- only possible with commit-freeze off.
   /// Arming proof for that experiment: zero means the toggle never reached a frozen entry.
   uint64_t unfrozen_writes_ = 0;
+  bool dump_draw_ = false;  ///< see SetDumpDraw
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;

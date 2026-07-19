@@ -73,6 +73,21 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_texdump, 0, "GPU",
                       "Debug: dump the next N texture decodes (fetch constant + image)");
 
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_texdump_maxdim, 0, "GPU",
+                      "Debug: with dbg_texdump, only dump textures whose width AND height are <= "
+                      "this (0 = any size). Aims the dump at the engine's small swapped-in LODs");
+
+/// Xenos format filter, +1 so that 0 can mean "any" (format 0 is a real format). Size alone is too
+/// coarse: a size-filtered dump returns whichever small texture happens to rebuild first, and
+/// reasoning about the wrong one produced a fix for a real but unrelated bug.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_texdump_force, false, "GPU",
+                    "Debug: force textures matching the dump filter to re-decode, so a texture "
+                    "that is cached and never rewritten can still be dumped");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_texdump_fmt1, 0, "GPU",
+                      "Debug: with dbg_texdump, only dump textures whose Xenos format is "
+                      "(this value - 1); 0 = any format");
+
 /// Honour the packed-mip tile offset when detiling level 0 (see the long note at the decode).
 /// Kept toggleable because it changes the source addressing of every packed texture at once, and
 /// an A/B is the only honest way to show it is the fix rather than a plausible story.
@@ -1122,27 +1137,73 @@ uint16_t Pack565(Rgba8 c) {
 /// and each texel takes the nearest of the four palette entries. Endpoints are forced into
 /// c0 >= c1 so the block always decodes in 4-colour mode -- a 3-colour block would introduce
 /// transparent texels that were never in the source.
-void EncodeBc1Color(const Rgba8 in[16], uint8_t* dst) {
-  Rgba8 lo = in[0], hi = in[0];
-  for (uint32_t i = 1; i < 16; ++i) {
-    lo.r = std::min(lo.r, in[i].r); hi.r = std::max(hi.r, in[i].r);
-    lo.g = std::min(lo.g, in[i].g); hi.g = std::max(hi.g, in[i].g);
-    lo.b = std::min(lo.b, in[i].b); hi.b = std::max(hi.b, in[i].b);
+/// `allow_punchthrough` must be true ONLY for real DXT1. BC1 encodes its 1-bit alpha in the
+/// ORDERING of the endpoints -- c0 <= c1 selects the punch-through palette where index 3 is
+/// transparent -- so a colour block that unconditionally sorts c0 >= c1 silently declares "fully
+/// opaque" no matter what the source alpha said. That is what this function used to do, and it is
+/// why generated mips turned punch-through surfaces (glass, fences, foliage) solid: level 0 is the
+/// guest's own blocks and samples correctly, while every level we build below it lost the alpha.
+/// DXT3/DXT5 carry alpha in a separate block and their colour block must stay in opaque mode, so
+/// enabling punch-through there would corrupt them instead -- hence the flag rather than sniffing
+/// the alpha channel alone.
+void EncodeBc1Color(const Rgba8 in[16], uint8_t* dst, bool allow_punchthrough) {
+  bool any_transparent = false;
+  bool any_opaque = false;
+  for (uint32_t i = 0; i < 16; ++i) {
+    if (in[i].a < 128) {
+      any_transparent = true;
+    } else {
+      any_opaque = true;
+    }
+  }
+  const bool punchthrough = allow_punchthrough && any_transparent;
+
+  // Fit the endpoints over the OPAQUE texels only. A transparent texel's colour is meaningless
+  // (the decoder emits {0,0,0,0} for it), so letting it into the min/max drags both endpoints
+  // toward black and greys out the texels that are actually visible.
+  Rgba8 lo{255, 255, 255, 255}, hi{0, 0, 0, 0};
+  if (punchthrough && any_opaque) {
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (in[i].a < 128) continue;
+      lo.r = std::min(lo.r, in[i].r); hi.r = std::max(hi.r, in[i].r);
+      lo.g = std::min(lo.g, in[i].g); hi.g = std::max(hi.g, in[i].g);
+      lo.b = std::min(lo.b, in[i].b); hi.b = std::max(hi.b, in[i].b);
+    }
+  } else {
+    lo = in[0];
+    hi = in[0];
+    for (uint32_t i = 1; i < 16; ++i) {
+      lo.r = std::min(lo.r, in[i].r); hi.r = std::max(hi.r, in[i].r);
+      lo.g = std::min(lo.g, in[i].g); hi.g = std::max(hi.g, in[i].g);
+      lo.b = std::min(lo.b, in[i].b); hi.b = std::max(hi.b, in[i].b);
+    }
   }
   uint16_t c0 = Pack565(hi);
   uint16_t c1 = Pack565(lo);
-  if (c0 < c1) std::swap(c0, c1);
+  if (punchthrough) {
+    // c0 <= c1 selects the punch-through palette. Equal endpoints are fine and stay in it.
+    if (c0 > c1) std::swap(c0, c1);
+  } else if (c0 < c1) {
+    std::swap(c0, c1);
+  }
   dst[0] = uint8_t(c0 & 0xFF);
   dst[1] = uint8_t(c0 >> 8);
   dst[2] = uint8_t(c1 & 0xFF);
   dst[3] = uint8_t(c1 >> 8);
 
   Rgba8 pal[4];
-  Bc1Palette(dst, /*punchthrough=*/false, pal);
+  Bc1Palette(dst, punchthrough, pal);
+  // In punch-through mode index 3 IS the transparent slot, so opaque texels may only choose from
+  // 0..2; letting them pick 3 would punch holes in solid pixels.
+  const uint32_t usable = punchthrough ? 3u : 4u;
   uint32_t bits = 0;
   for (uint32_t i = 0; i < 16; ++i) {
+    if (punchthrough && in[i].a < 128) {
+      bits |= 3u << (2 * i);
+      continue;
+    }
     uint32_t best = 0, best_err = ~0u;
-    for (uint32_t p = 0; p < 4; ++p) {
+    for (uint32_t p = 0; p < usable; ++p) {
       const int dr = int(in[i].r) - int(pal[p].r);
       const int dg = int(in[i].g) - int(pal[p].g);
       const int db = int(in[i].b) - int(pal[p].b);
@@ -1202,7 +1263,8 @@ void EncodeBcBlock(D3DFORMAT fmt, const Rgba8 in[16], uint8_t* dst) {
   } else if (fmt == D3DFMT_DXT5) {
     EncodeBc4(in, 3, dst);
   }
-  EncodeBc1Color(in, fmt == D3DFMT_DXT1 ? dst : dst + 8);
+  EncodeBc1Color(in, fmt == D3DFMT_DXT1 ? dst : dst + 8,
+                 /*allow_punchthrough=*/fmt == D3DFMT_DXT1);
 }
 
 /// Encode an RGBA image back to BC. Texels past the edge of a partial block repeat the last
@@ -2687,6 +2749,24 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       REXCVAR_GET(nx1_d3d9_commit_textures)) {
     entry.committed = true;
   }
+  // Debug: force ONE fresh decode of a texture matching the dump filter.
+  //
+  // The dump lives in the rebuild path, so a texture that is decoded once and thereafter served
+  // from the early-out below can never be dumped -- which is exactly the case worth inspecting.
+  // A texture whose guest memory is never written after our first decode is never dirtied, never
+  // rebuilt, and we serve that first decode forever; if it was taken before the data landed, the
+  // texture is permanently wrong and no amount of watching for writes will tell us. Dropping the
+  // entry here makes the next bind take the full path and report the bytes as they are NOW.
+  if (REXCVAR_GET(nx1_d3d9_dbg_texdump) && REXCVAR_GET(nx1_d3d9_dbg_texdump_force)) {
+    const uint32_t fdim = REXCVAR_GET(nx1_d3d9_dbg_texdump_maxdim);
+    const uint32_t ffmt1 = REXCVAR_GET(nx1_d3d9_dbg_texdump_fmt1);
+    if (dump_draw_ || ((!fdim || (t.width <= fdim && height <= fdim)) &&
+                       (!ffmt1 || t.format == ffmt1 - 1))) {
+      entry.dirty = true;
+      entry.committed = false;
+    }
+  }
+
   // Valid-texture early-out. A built texture whose layout still matches and that the write-watch
   // has not dirtied IS the answer -- nothing below can change that, so none of it needs to run.
   //
@@ -3087,7 +3167,18 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     }
   }
 
-  if (const uint32_t tex_dump_left = REXCVAR_GET(nx1_d3d9_dbg_texdump); tex_dump_left && dst) {
+  // Size gate. Dumping the "next N decodes" catches whichever textures happen to be rebuilt, and
+  // at ~1500 bindings a frame that is never the one under investigation. The surfaces in question
+  // (opaque glass, receding-LOD confetti) are the engine's SMALL swapped-in LODs -- the isolated
+  // glass material samples 16x16 and 8x8 -- so bounding the dump by dimension aims it at that
+  // population without needing an address that moves every launch.
+  const uint32_t dump_maxdim = REXCVAR_GET(nx1_d3d9_dbg_texdump_maxdim);
+  const uint32_t dump_fmt1 = REXCVAR_GET(nx1_d3d9_dbg_texdump_fmt1);
+  const bool dump_size_ok = dump_draw_ ||
+                            ((!dump_maxdim || (t.width <= dump_maxdim && height <= dump_maxdim)) &&
+                             (!dump_fmt1 || t.format == dump_fmt1 - 1));
+  if (const uint32_t tex_dump_left = REXCVAR_GET(nx1_d3d9_dbg_texdump);
+      tex_dump_left && dst && dump_size_ok) {
     REXCVAR_SET(nx1_d3d9_dbg_texdump, tex_dump_left - 1);
     // The raw guest bytes first: all-zero says the data never arrived, anything else says it
     // is present and we are decoding it wrong. That single distinction is what separates a
