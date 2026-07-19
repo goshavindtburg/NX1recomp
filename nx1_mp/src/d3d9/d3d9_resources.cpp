@@ -75,6 +75,21 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 /// the mirror off and committing off (which make a sprite re-decode whenever the guest writes
 /// it) firing a weapon will capture the muzzle flash on the spot -- the targeting problem that
 /// otherwise makes these sprites impossible to catch.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_retry_partial, false, "GPU",
+                    "Re-decode a texture whose guest source had EMPTY pages, instead of keeping "
+                    "that decode forever. The mirror snapshots on first touch, so a texture first "
+                    "seen mid-stream is captured half-written and held that way for the session -- "
+                    "which is a permanent speckle on whichever surfaces bind it. Uses the same "
+                    "exponential backoff as the decoded-to-nothing case, so a pool that never "
+                    "arrives does not re-decode every frame");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_partial_src, 0, "GPU",
+                      "Debug: report up to N textures decoded from an INCOMPLETE guest source "
+                      "(one or more all-zero 4 KB pages inside the declared range), plus a hash of "
+                      "the decoded result. A texture that decodes to garbage only while its "
+                      "surface speckles is not a decode bug -- it is being decoded from data that "
+                      "is not all there yet, and this says so directly");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_texdump, 0, "GPU",
                       "Debug: dump the next N texture decodes (fetch constant + image)");
 
@@ -3112,6 +3127,36 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     }
   }
 
+  uint32_t partial_pages = 0;
+  // Blanket partial-source check: same measurement the tracked-address path makes, but for
+  // EVERY texture, so a transiently-corrupt one does not have to be named in advance. The
+  // decoded hash is logged alongside so successive decodes of the same address can be compared:
+  // a hash that changes while the page coverage is incomplete is a decode of a half-written
+  // source, which is exactly what "garbage only while it speckles" looks like.
+  if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_partial_src);
+      (budget || REXCVAR_GET(nx1_d3d9_retry_partial)) && src && dst) {
+    uint32_t pages_total = 0, pages_empty = 0;
+    for (size_t off = 0; off < guest_bytes; off += 4096) {
+      const size_t end = (off + 4096 < guest_bytes) ? off + 4096 : guest_bytes;
+      uint32_t nz = 0;
+      for (size_t i = off; i < end && nz == 0; ++i) nz += src[i] != 0 ? 1 : 0;
+      ++pages_total;
+      pages_empty += nz == 0 ? 1 : 0;
+    }
+    partial_pages = pages_empty;
+    if (pages_empty && budget) {
+      uint64_t h = 1469598103934665603ull;
+      const size_t hashed = size_t(dst_row_bytes) * extent.block_height;
+      for (size_t i = 0; i < hashed; i += 64) {
+        h = (h ^ dst[i]) * 1099511628211ull;
+      }
+      REXCVAR_SET(nx1_d3d9_dbg_partial_src, budget - 1);
+      REXGPU_WARN("nx1_d3d9: PARTIALSRC {:08X} fmt={} {}x{} EMPTY {}/{} pages -- decoded hash "
+                  "{:016X} (frame {})",
+                  t.base_address, t.format, t.width, height, pages_empty, pages_total, h, frame_);
+    }
+  }
+
   if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
       track && t.base_address == track) {
     // Whole-texture coverage, per 4 KB page. A texture can span 32 pages while the write
@@ -3340,7 +3385,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   entry.dirty = false;
   // A broadcast-swizzle sprite that came out fully transparent is not resident yet: keep it dirty
   // (re-decode next bind) and never let it commit, so it recovers the moment its pool streams in.
-  if (swizzle_all_zero) {
+  // A decode made from a source with holes is provisional for the same reason a fully-empty one
+  // is: the pages have not all arrived. Keeping it caches a permanently speckled texture.
+  const bool partial = partial_pages != 0 && REXCVAR_GET(nx1_d3d9_retry_partial);
+  if (swizzle_all_zero || partial) {
     entry.dirty = true;
     entry.good_frames = 0;
     entry.committed = false;
