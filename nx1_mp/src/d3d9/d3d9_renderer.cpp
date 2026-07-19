@@ -501,7 +501,9 @@ IDirect3DQuery9* Renderer::PickBegin(const RecordedDraw& d) {
   }
   IDirect3DQuery9* q = pick_queries_[pick_count_];
   pick_entries_[pick_count_] = {d.ps_object, d.vs_object,
-                                d.ps && d.ps->entry ? d.ps->entry->hash : 0ull};
+                                d.ps && d.ps->entry ? d.ps->entry->hash : 0ull,
+                                current_rt_surface_, d.depth.write_enabled,
+                                d.depth.test_enabled && d.depth.compare_function != 7};
   q->Issue(D3DISSUE_BEGIN);
   return q;
 }
@@ -514,10 +516,17 @@ void Renderer::PickEnd(IDirect3DQuery9* q) {
 }
 
 void Renderer::RequestPick(int x, int y) {
-  std::lock_guard<std::mutex> lock(render_mutex_);
+  // NO LOCK. This is called from two places that must not contend: the WndProc (window thread)
+  // and the overlay's own draw, which runs from Present() -- and Present already holds
+  // render_mutex_. Taking it here recursively on a non-recursive mutex crashed the game the
+  // moment hover mode issued its first pick.
+  //
+  // Lock-free is sound for this: the coordinates are plain ints published BEFORE the flag that
+  // makes them live, and the consumer only reads them once it sees the flag. A torn value would
+  // at worst pick a neighbouring pixel for one frame.
   pick_x_ = x;
   pick_y_ = y;
-  pick_requested_ = true;
+  pick_requested_.store(true, std::memory_order_release);
 }
 
 void Renderer::BeginFrame() {
@@ -534,22 +543,24 @@ void Renderer::BeginFrame() {
   ShaderCache::Get().PollDebugRebuild();
 
   // Arm the shader picker for exactly this frame.
-  if ((pick_requested_ || REXCVAR_GET(nx1_d3d9_dbg_pick)) && !pick_active_) {
+  if ((pick_requested_.load(std::memory_order_acquire) || REXCVAR_GET(nx1_d3d9_dbg_pick)) &&
+      !pick_active_) {
     D3DVIEWPORT9 vp{};
     if (SUCCEEDED(device_->GetViewport(&vp))) {
       const LONG half = LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_size) ? REXCVAR_GET(nx1_d3d9_dbg_pick_size) : 8) / 2;
       // A requested pick centres on the clicked pixel; the cvar path falls back to screen centre.
-      const LONG cx = pick_requested_ ? LONG(pick_x_)
+      const bool from_request = pick_requested_.load(std::memory_order_acquire);
+      const LONG cx = from_request ? LONG(pick_x_)
                                       : LONG(vp.X + vp.Width / 2) +
                                             LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_ox));
-      const LONG cy = pick_requested_ ? LONG(pick_y_)
+      const LONG cy = from_request ? LONG(pick_y_)
                                       : LONG(vp.Y + vp.Height / 2) +
                                             LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_oy));
       pick_box_ = RECT{cx - half, cy - half, cx + half + 1, cy + half + 1};
       device_->SetScissorRect(&pick_box_);
       device_->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
       pick_active_ = true;
-      pick_requested_ = false;
+      pick_requested_.store(false, std::memory_order_relaxed);
       pick_count_ = 0;
       pick_results_.clear();
       REXGPU_INFO("nx1_d3d9: PICK armed -- box {}x{} at ({}, {})", half * 2 + 1, half * 2 + 1, cx,
@@ -591,15 +602,43 @@ void Renderer::Present() {
       if (hr != S_OK || pixels == 0) continue;
       ++hits;
       const PickEntry& e = pick_entries_[i];
-      pick_results_.push_back({e.ps_object, e.vs_object, e.ps_hash, uint32_t(pixels), uint32_t(i)});
-      REXGPU_INFO("nx1_d3d9: PICK hit draw #{} pixels={} ps={:08X} vs={:08X} ucode=0x{:016X} "
-                  "-- dbg_oc0_lo32={} , shader_{:016X}.ucode.frag",
-                  i, pixels, e.ps_object, e.vs_object, e.ps_hash,
-                  uint32_t(e.ps_hash & 0xFFFFFFFFu), e.ps_hash);
+      pick_results_.push_back(
+          {e.ps_object, e.vs_object, e.ps_hash, uint32_t(pixels), uint32_t(i), e.rt_surface, false,
+           e.depth_write, e.depth_test});
+      // Every field the selection heuristic uses, so a wrong pick can be diagnosed from the log
+      // instead of by guessing which filter rejected the surface.
+      REXGPU_INFO("nx1_d3d9: PICK hit #{} px={} ps={:08X} vs={:08X} rt={:08X} ztest={} zwrite={} "
+                  "ucode=0x{:016X} lo32={}",
+                  i, pixels, e.ps_object, e.vs_object, e.rt_surface, e.depth_test ? 1 : 0,
+                  e.depth_write ? 1 : 0, e.ps_hash, uint32_t(e.ps_hash & 0xFFFFFFFFu));
     }
-    REXGPU_INFO("nx1_d3d9: PICK done -- {} of {} draws covered the box; the LAST hit above is "
-                "the frontmost surface",
-                hits, pick_count_);
+    // The MAIN pass is whichever target the last covering draw wrote: the scene is composed
+    // last, after the shadow and reflection passes. Everything on another target was never on
+    // screen at that pixel and must not be ranked against it.
+    if (!pick_results_.empty()) {
+      // The scene target is where DEPTH-TESTED geometry with a real shader is drawn -- NOT the
+      // target of the last draw. NX1 renders the world to an EDRAM surface and then composites
+      // to a different one, so taking the last hit's target made the composite the reference and
+      // labelled every world surface "other pass", which is exactly backwards.
+      uint32_t main_rt = pick_results_.back().rt_surface;
+      for (size_t n = pick_results_.size(); n-- > 0;) {
+        if (pick_results_[n].depth_test && pick_results_[n].ps_object) {
+          main_rt = pick_results_[n].rt_surface;
+          break;
+        }
+      }
+      uint32_t kept = 0;
+      for (auto& r : pick_results_) {
+        r.main_pass = (r.rt_surface == main_rt);
+        kept += r.main_pass ? 1 : 0;
+      }
+      REXGPU_INFO("nx1_d3d9: PICK done -- {} of {} draws covered the box; {} on the main target "
+                  "{:08X}, the rest are other passes (shadow / reflection) and are not on screen "
+                  "at that pixel",
+                  hits, pick_count_, kept, main_rt);
+    } else {
+      REXGPU_INFO("nx1_d3d9: PICK done -- no draw covered the box ({} draws tested)", pick_count_);
+    }
     device_->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
     pick_active_ = false;
     pick_count_ = 0;
@@ -1637,7 +1676,30 @@ bool Renderer::BindShadersAndConstants(const RecordedDraw& d) {
     active_sampler_mask_ = 0xFFFFu;  // unwalkable VS: cannot rule out vertex-texture fetch
   }
 
-  IDirect3DPixelShader9* const want_ps = ps ? ps->ps : nullptr;
+  // Material highlight: bind a purpose-built magenta shader for ONE material. Patching the
+  // cached shader instead would key on the microcode HASH, and NX1 shares a handful of
+  // ubershaders across most of the world -- so "paint this" lit up half the scene and every
+  // surface reported the same shader. Binding per ps_object is material-accurate.
+  IDirect3DPixelShader9* want_ps = ps ? ps->ps : nullptr;
+  // d.ps_object must be non-zero to be an identity at all: plenty of draws carry 0, so matching
+  // on it paints all of them at once.
+  if (const uint32_t paint_ps = REXCVAR_GET(nx1_d3d9_dbg_highlight_ps);
+      paint_ps && d.ps_object && d.ps_object == paint_ps && want_ps) {
+    if (!magenta_ps_) {
+      // Hand-assembled ps_3_0: def c0, 1,0,1,1 / mov oC0, c0 / end.
+      static const DWORD kMagenta[] = {
+          0xFFFF0300u,                          // ps_3_0
+          0x05000051u, 0xA00F0000u,             // def c0, ...
+          0x3F800000u, 0x00000000u, 0x3F800000u, 0x3F800000u,
+          0x02000001u, 0x800F0800u, 0xA0E40000u,  // mov oC0, c0
+          0x0000FFFFu,                          // end
+      };
+      device_->CreatePixelShader(kMagenta, &magenta_ps_);
+    }
+    if (magenta_ps_) {
+      want_ps = magenta_ps_;
+    }
+  }
   if (want_ps != bound_ps_) {
     device_->SetPixelShader(want_ps);
     bound_ps_ = want_ps;

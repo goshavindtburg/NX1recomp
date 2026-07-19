@@ -143,6 +143,21 @@ class Renderer {
     uint64_t ps_hash;
     uint32_t pixels;
     uint32_t draw_index;
+    /// The render target this draw was writing. The pick box is in WINDOW coordinates but the
+    /// occlusion query measures whatever target is bound, so shadow-map and reflection passes
+    /// report hits at the same box despite not being on screen there at all. Without this the
+    /// list mixes passes and the "nearest" ranking compares draws that are not comparable.
+    uint32_t rt_surface;
+    bool main_pass;
+    /// Did this draw WRITE depth? A full-screen composite or post quad covers every pixel, is
+    /// drawn last, and does not write depth -- so it is the frontmost hit wherever you point,
+    /// and highlighting it paints the whole screen. The surface actually being LOOKED at is the
+    /// last one that won the depth test and wrote it.
+    bool depth_write;
+    /// Depth TEST enabled with a real comparison (not "always"). This is what separates world
+    /// geometry from a composite: the composite covers every pixel and does not depth-test at
+    /// all, so it wins any "frontmost" ranking wherever you point.
+    bool depth_test;
   };
 
   /// Ask for a pick at a WINDOW-space pixel on the next frame. The frame it runs on renders
@@ -158,7 +173,9 @@ class Renderer {
   void PickEnd(IDirect3DQuery9* q);
 
  public:
-  bool pick_pending() const { return pick_requested_ || pick_active_; }
+  bool pick_pending() const {
+    return pick_requested_.load(std::memory_order_acquire) || pick_active_;
+  }
   /// Draws that covered the picked pixel, in submission order. The LAST entry is frontmost.
   const std::vector<PickResult>& pick_results() const { return pick_results_; }
 
@@ -331,6 +348,8 @@ class Renderer {
   /// draw sites return early on it. Reset per draw, so it never leaks to the next one.
   /// Frame counter for the blinking picker highlight.
   uint32_t highlight_frame_ = 0;
+  /// Tiny solid-magenta ps_3_0, built on first use, bound in place of ONE material's shader.
+  IDirect3DPixelShader9* magenta_ps_ = nullptr;
   bool hide_draw_ = false;
   bool hide_reported_ = false;
 
@@ -343,9 +362,12 @@ class Renderer {
     uint32_t ps_object;
     uint32_t vs_object;
     uint64_t ps_hash;
+    uint32_t rt_surface;
+    bool depth_write;
+    bool depth_test;
   };
   bool pick_active_ = false;
-  bool pick_requested_ = false;
+  std::atomic<bool> pick_requested_{false};
   int pick_x_ = 0, pick_y_ = 0;
   RECT pick_box_{};
   std::vector<IDirect3DQuery9*> pick_queries_;

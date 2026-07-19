@@ -48,6 +48,12 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_lo32, 0, "GPU",
                       "final colour write to output dbg_oc0_reg instead of the shaded result");
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_reg, 0, "GPU",
                       "Debug: temp register index to display via dbg_oc0_lo32");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_solid_lo32, 0, "GPU",
+                      "Debug: draw the shader with these low-32 hash bits as SOLID MAGENTA, body "
+                      "discarded. Wireframe highlighting is easy to miss on a large flat surface; "
+                      "this is not. Keyed on the microcode hash, so it survives a restart -- "
+                      "unlike ps_object, which is a guest address reassigned on every fastfile load");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_force_branch, 0, "GPU",
                       "Debug: for the dbg_oc0_lo32 shader, force the final colour select to one "
                       "side -- 1 = always the first operand (the lit path), 2 = always the second "
@@ -433,6 +439,63 @@ bool RewriteColorOutput(const DWORD* code, uint32_t dword_count, uint32_t reg,
 /// are usually not what the instruction under investigation read from it.
 ///
 /// ps_3_0 requires all four components of COLOR0 to be written, so the emitted mov is unmasked.
+/// Replace a shader's entire body with a solid MAGENTA output, so the surfaces it draws are
+/// unmistakable on screen.
+///
+/// Wireframe highlighting is too easy to miss: a large flat wall is only an outline and one
+/// diagonal, and picking the wrong row then reads as "the picker returned the wrong material".
+/// This leaves nothing to interpret.
+///
+/// No `def` is inserted -- fxc already emits one containing both 1.0 and 0.0 (typically
+/// `def cN, 1, -0, -1, 0`), so magenta is just a swizzle of it: (1, 0, 1, 1).
+bool RewriteSolidColor(const DWORD* code, uint32_t dword_count, std::vector<DWORD>& patched) {
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51, kDcl = 0x1F;
+  constexpr uint32_t kColorOutRegType = 8, kConstRegType = 2;
+
+  uint32_t def_reg = 0, c_one = 0, c_zero = 0;
+  bool have_def = false;
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (!have_def && op == kDef && len == 5 && i + 5 < dword_count) {
+      float v[4];
+      std::memcpy(v, &code[i + 2], sizeof(v));
+      bool z = false, o = false;
+      for (uint32_t c = 0; c < 4; ++c) {
+        if (!z && v[c] == 0.0f) { c_zero = c; z = true; }
+        if (!o && v[c] == 1.0f) { c_one = c; o = true; }
+      }
+      if (z && o) {
+        def_reg = code[i + 1] & 0x7FF;
+        have_def = true;
+      }
+    }
+    // First instruction that is neither a declaration nor a literal: the body starts here, and
+    // everything the shader would have done can be thrown away.
+    if (op != kDef && op != kDcl && have_def) {
+      if (i + 3 >= dword_count) return false;
+      patched.assign(code, code + dword_count);
+      patched[i] = (2u << 24) | 1u;  // mov, length 2
+      patched[i + 1] = 0x80000000u | (0xFu << 16) | ((kColorOutRegType >> 3) << 11) | 0u;
+      const uint32_t swz = (c_one & 3u) | ((c_zero & 3u) << 2) | ((c_one & 3u) << 4) |
+                           ((c_one & 3u) << 6);  // (1, 0, 1, 1) = magenta
+      patched[i + 2] = 0x80000000u | (swz << 16) | ((kConstRegType & 7u) << 28) |
+                       (((kConstRegType >> 3) & 3u) << 11) | (def_reg & 0x7FF);
+      patched[i + 3] = kEnd;
+      return true;
+    }
+    i += 1 + len;
+  }
+  return false;
+}
+
 bool RewriteEarlyOut(const DWORD* code, uint32_t dword_count, uint32_t reg, uint32_t at_dword,
                      uint32_t reg_type, uint32_t swz, uint32_t negate,
                      std::vector<DWORD>& patched, uint32_t& at_out) {
@@ -475,6 +538,7 @@ bool RewriteEarlyOut(const DWORD* code, uint32_t dword_count, uint32_t reg, uint
 // PollDebugRebuild precedes them in this file.
 bool RewriteForceBranch(const DWORD* code, uint32_t dword_count, uint32_t side,
                         std::vector<DWORD>& patched);
+bool RewriteSolidColor(const DWORD* code, uint32_t dword_count, std::vector<DWORD>& patched);
 
 void ShaderCache::PollDebugRebuild() {
 #ifdef NX1_HAVE_SM3_SHADER_CACHE
@@ -493,13 +557,15 @@ void ShaderCache::PollDebugRebuild() {
   {
     static std::mutex om;
     static uint32_t last_lo = 0, last_reg = 0xFFFFFFFFu, last_at = 0xFFFFFFFFu,
-                   last_mix = 0xFFFFFFFFu, last_dump = 0xFFFFFFFFu;
+                   last_mix = 0xFFFFFFFFu, last_dump = 0xFFFFFFFFu,
+                   last_solid = 0xFFFFFFFFu;
     const uint32_t oc0_lo = REXCVAR_GET(nx1_d3d9_dbg_oc0_lo32);
     const uint32_t oc0_reg = REXCVAR_GET(nx1_d3d9_dbg_oc0_reg);
     // EVERY input the rewrite depends on has to be watched here, not just the register: leaving
     // dbg_oc0_at out meant changing it rebuilt nothing and the screen kept showing the previous
     // mode, while the log line said so and was not read.
     const uint32_t oc0_at_watch = REXCVAR_GET(nx1_d3d9_dbg_oc0_at);
+    const uint32_t solid_lo = REXCVAR_GET(nx1_d3d9_dbg_solid_lo32);
     const uint32_t oc0_mix = (REXCVAR_GET(nx1_d3d9_dbg_oc0_neg) << 24) |
                              (REXCVAR_GET(nx1_d3d9_dbg_force_branch) << 16) |
                              (REXCVAR_GET(nx1_d3d9_dbg_oc0_type) << 8) |
@@ -508,7 +574,8 @@ void ShaderCache::PollDebugRebuild() {
     const uint32_t dump_watch = REXCVAR_GET(nx1_d3d9_dbg_dump_sm3_lo32);
     std::lock_guard<std::mutex> olk(om);
     if (oc0_lo != last_lo || oc0_reg != last_reg || oc0_at_watch != last_at ||
-        oc0_mix != last_mix || dump_watch != last_dump) {
+        oc0_mix != last_mix || dump_watch != last_dump || solid_lo != last_solid) {
+      last_solid = solid_lo;
       last_dump = dump_watch;
       last_mix = oc0_mix;
       // Announce the selection BEFORE acting on it, and count what matched. Silence here is
@@ -521,12 +588,15 @@ void ShaderCache::PollDebugRebuild() {
       last_at = oc0_at_watch;
       uint32_t matched = 0, rewritten = 0;
       const uint32_t dump_lo = REXCVAR_GET(nx1_d3d9_dbg_dump_sm3_lo32);
+      static uint32_t last_solid_seen = 0;
+      if (solid_lo) last_solid_seen = solid_lo;
       for (auto& [hash, sh] : *map) {
         const uint32_t lo32 = uint32_t(hash & 0xFFFFFFFFu);
         // The DUMP target is its own selection: gating it behind the oC0 probe's filter meant a
         // shader could only be dumped once that probe had already been pointed at it, which is
         // backwards -- the dump is how you find the offsets the probe needs.
-        if ((lo32 != last_lo && lo32 != oc0_lo && lo32 != dump_lo) || !sh.entry ||
+        if ((lo32 != last_lo && lo32 != oc0_lo && lo32 != dump_lo && lo32 != solid_lo &&
+             lo32 != last_solid_seen) || !sh.entry ||
             !(sh.entry->flags & NX1_SM3_PIXEL_SHADER)) {
           continue;
         }
@@ -556,7 +626,9 @@ void ShaderCache::PollDebugRebuild() {
         ++matched;
         if (oc0_lo && lo32 == oc0_lo) {
           const bool ok =
-              force_side ? RewriteForceBranch(code, sh.entry->bytecodeSize / 4, force_side, shown)
+              (solid_lo && lo32 == solid_lo)
+                  ? RewriteSolidColor(code, sh.entry->bytecodeSize / 4, shown)
+              : force_side ? RewriteForceBranch(code, sh.entry->bytecodeSize / 4, force_side, shown)
               : oc0_at   ? RewriteEarlyOut(code, sh.entry->bytecodeSize / 4, oc0_reg, oc0_at,
                                            oc0_ty, oc0_sw,
                                            REXCVAR_GET(nx1_d3d9_dbg_oc0_neg), shown, at)

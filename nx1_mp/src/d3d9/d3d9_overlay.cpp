@@ -40,6 +40,7 @@ REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_texdump);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_hide_matched);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_highlight_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_solo_ps);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_solid_lo32);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_blend_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_pick_size);
 REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_ox);
@@ -401,11 +402,46 @@ void Overlay::DrawPicker() {
   ImGui::Separator();
 
   Renderer& r = Renderer::Get();
+
+  // Hover mode: re-pick under the cursor on a throttle and paint whatever is there magenta.
+  // A pick frame clamps the scissor to a small box, so it does not refresh the display -- with
+  // NX1 resolving and us blitting, the previous frame simply stays up. The cost is therefore
+  // DROPPED FRAMES rather than a black strobe, which is what makes this usable at all.
+  static bool hover_mode = false;
+  ImGui::Checkbox("hover: paint whatever is under the cursor", &hover_mode);
+  ImGui::SameLine();
+  ImGui::TextDisabled("(costs frames -- one pick per update)");
+  if (hover_mode) {
+    static int throttle = 0;
+    const ImGuiIO& hio = ImGui::GetIO();
+    if (++throttle >= 8 && !r.pick_pending() && !hio.WantCaptureMouse) {
+      throttle = 0;
+      Renderer::Get().RequestPick(int(hio.MousePos.x), int(hio.MousePos.y));
+      pick_awaiting_ = true;
+    }
+  }
+
   if (pick_awaiting_ && !r.pick_pending()) {
     pick_awaiting_ = false;
-    if (!r.pick_results().empty()) {
-      REXCVAR_SET(nx1_d3d9_dbg_highlight_ps, r.pick_results().back().ps_object);
+    // Paint the nearest MAIN-PASS hit. Other-pass draws (shadow, reflection) report coverage at
+    // the same box without being on screen there, so painting those would highlight something
+    // the cursor is not over.
+    const auto& res = r.pick_results();
+    // Skip ps_object == 0. Many draws are recorded without a shader object, and 0 is not an
+    // identity -- painting it matches every one of them and turns the whole screen magenta.
+    uint32_t paint = 0;
+    for (size_t n = res.size(); n-- > 0;) {
+      // Depth-TESTED, not depth-writing. With a depth prepass the colour draw tests EQUAL and
+      // writes nothing, so requiring a write selects the prepass -- which carries ps_object 0
+      // and cannot be identified at all. The composite is excluded instead by the fact that it
+      // does not depth-test.
+      if (res[n].main_pass && res[n].depth_test && res[n].ps_object != 0) {
+        paint = res[n].ps_object;
+        break;
+      }
     }
+    // By MATERIAL. Keying on the shader hash painted every surface sharing that ubershader.
+    REXCVAR_SET(nx1_d3d9_dbg_highlight_ps, paint);
   }
   if (pick_awaiting_) {
     ImGui::TextUnformatted("picking...");
@@ -418,24 +454,42 @@ void Overlay::DrawPicker() {
     // Only the frontmost matters almost always -- it is the surface you aimed at. The rest is
     // everything the pixel was drawn through (sky, terrain, decals, post) and is noise unless
     // you are specifically chasing overdraw, so it is collapsed by default.
-    static bool show_all = true;
-    ImGui::Text("%zu draw(s) covered the pixel", hits.size());
+    // Other-pass draws are hidden by default. The pick box is in window coordinates but the
+    // occlusion query measures whatever render target is bound, so shadow-map and reflection
+    // passes report hits at the same box while not being on screen there -- which is why
+    // clicking a wall used to return the ground, a barrel or a fence.
+    static bool show_all = false;
+    static bool show_other_passes = false;
+    size_t main_hits = 0;
+    for (const auto& h : hits) main_hits += h.main_pass ? 1 : 0;
+    ImGui::Text("%zu draw(s) on screen at that pixel", main_hits);
+    if (main_hits != hits.size()) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("(+%zu from other passes)", hits.size() - main_hits);
+    }
+    ImGui::Checkbox("show all depths", &show_all);
     ImGui::SameLine();
-    ImGui::Checkbox("show all", &show_all);
+    ImGui::Checkbox("include other passes", &show_other_passes);
     ImGui::TextDisabled("Nearest first. Deeper entries are what the surface was drawn over.");
     ImGui::Spacing();
     // FRONTMOST FIRST. It was last, which put the one entry that matters below the fold as soon
     // as the list scrolled -- so the visible rows were the skybox and whatever was drawn behind,
     // and 'hide this' on those looked like the picker returning the wrong material.
-    const size_t shown = show_all ? hits.size() : 1;
-    for (size_t n = 0; n < shown; ++n) {
+    size_t emitted = 0;
+    for (size_t n = 0; n < hits.size(); ++n) {
       const size_t i = hits.size() - 1 - n;
       const auto& h = hits[i];
-      const bool front = (n == 0);
+      if (!h.main_pass && !show_other_passes) continue;
+      if (!show_all && emitted >= 1) break;
+      const bool front = (emitted == 0);
+      ++emitted;
       ImGui::PushStyleColor(ImGuiCol_Text, front ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
                                                  : ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
-      ImGui::Text("%s draw #%u  px=%u  ps=%08X  vs=%08X", front ? "->" : "  ", h.draw_index,
-                  h.pixels, h.ps_object, h.vs_object);
+      ImGui::Text("%s draw #%u  px=%u  ps=%08X  vs=%08X%s", front ? "->" : "  ", h.draw_index,
+                  h.pixels, h.ps_object, h.vs_object,
+                  h.main_pass ? (h.depth_test ? (h.ps_object ? "" : "   [depth prepass]")
+                                              : "   [no depth test - overlay/composite]")
+                              : "   [OTHER PASS - not on screen here]");
       ImGui::PopStyleColor();
       ImGui::SameLine();
       char buf[160];
@@ -467,6 +521,15 @@ void Overlay::DrawPicker() {
       const bool lit = REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) == h.ps_object;
       if (ImGui::Button(lit ? "unhighlight" : "highlight")) {
         REXCVAR_SET(nx1_d3d9_dbg_highlight_ps, lit ? 0u : h.ps_object);
+      }
+      ImGui::SameLine();
+      const bool magenta = REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) == h.ps_object;
+      if (ImGui::Button(magenta ? "unpaint" : "PAINT PINK")) {
+        REXCVAR_SET(nx1_d3d9_dbg_highlight_ps, magenta ? 0u : h.ps_object);
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Draw this MATERIAL as solid magenta. Keyed on ps_object, so only the "
+                          "one material lights up -- most of the world shares a few ubershaders.");
       }
       ImGui::SameLine();
       const bool solo = REXCVAR_GET(nx1_d3d9_dbg_solo_ps) == h.ps_object;
