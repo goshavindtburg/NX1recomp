@@ -1691,8 +1691,17 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
         // A one-shot must fire on the first USEFUL event, not the first event.
         const int32_t track_slot_key = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_track_sampler));
         const int32_t target_key = (want_src << 16) | (want_dst << 8) | (track_slot_key & 0xFF);
+        // Require a REAL texture in that slot, not just a mask bit. active_sampler_mask_ is
+        // 0xFFFF whenever the shader could not be walked ("bind everything"), so testing the bit
+        // said yes for slot 10 on a draw that had nothing bound there -- it latched, printed
+        // samplers 0..8, and armed nothing. Decoding the fetch constant is the actual question.
         const bool want_arm = track_slot_key >= 0;
-        const bool armable = !want_arm || (active_sampler_mask_ & (1u << (track_slot_key & 0xF)));
+        bool armable = !want_arm;
+        if (want_arm && (active_sampler_mask_ & (1u << (track_slot_key & 0xF)))) {
+          const TextureFetchConstant probe =
+              DecodeTextureFetchConstant(d.texture_fetch(uint32_t(track_slot_key) & 0xF));
+          armable = probe.valid && probe.base_address != 0;
+        }
         if (reported_for != target_key && armable) {
           reported_for = target_key;
           DWORD be = 0, sb = 0, db = 0, sep = 0, cw = 0, af = 0;
