@@ -2760,8 +2760,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   if (REXCVAR_GET(nx1_d3d9_dbg_texdump) && REXCVAR_GET(nx1_d3d9_dbg_texdump_force)) {
     const uint32_t fdim = REXCVAR_GET(nx1_d3d9_dbg_texdump_maxdim);
     const uint32_t ffmt1 = REXCVAR_GET(nx1_d3d9_dbg_texdump_fmt1);
-    if (dump_draw_ || ((!fdim || (t.width <= fdim && height <= fdim)) &&
-                       (!ffmt1 || t.format == ffmt1 - 1))) {
+    if (dump_filter_active_ ? dump_draw_
+                            : ((!fdim || (t.width <= fdim && height <= fdim)) &&
+                               (!ffmt1 || t.format == ffmt1 - 1))) {
       entry.dirty = true;
       entry.committed = false;
     }
@@ -3174,9 +3175,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // population without needing an address that moves every launch.
   const uint32_t dump_maxdim = REXCVAR_GET(nx1_d3d9_dbg_texdump_maxdim);
   const uint32_t dump_fmt1 = REXCVAR_GET(nx1_d3d9_dbg_texdump_fmt1);
-  const bool dump_size_ok = dump_draw_ ||
-                            ((!dump_maxdim || (t.width <= dump_maxdim && height <= dump_maxdim)) &&
-                             (!dump_fmt1 || t.format == dump_fmt1 - 1));
+  const bool dump_size_ok =
+      dump_filter_active_
+          ? dump_draw_
+          : ((!dump_maxdim || (t.width <= dump_maxdim && height <= dump_maxdim)) &&
+             (!dump_fmt1 || t.format == dump_fmt1 - 1));
   if (const uint32_t tex_dump_left = REXCVAR_GET(nx1_d3d9_dbg_texdump);
       tex_dump_left && dst && dump_size_ok) {
     REXCVAR_SET(nx1_d3d9_dbg_texdump, tex_dump_left - 1);
@@ -3189,10 +3192,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         std::snprintf(hex + i * 3, 4, "%02X ", src[i]);
       }
     }
-    REXGPU_INFO("nx1_d3d9: TEXDUMP addr={:08X} fmt={} {}x{} dim={} depth={} pitch={} tiled={} "
+    // The SAMPLER is the whole point when a shader names its inputs by slot (tf0, tf6...): a
+    // dump that does not say which slot it filled cannot be matched to the shader that reads it.
+    REXGPU_INFO("nx1_d3d9: TEXDUMP sampler={} addr={:08X} fmt={} {}x{} dim={} depth={} pitch={} tiled={} "
                 "endian={} swizzle=0x{:03X} mips={} packed={} host=0x{:08X} attribution={} "
                 "src[0..31]= {}",
-                t.base_address, t.format, t.width, height, t.dimension, t.depth, t.pitch_pixels,
+                sampler, t.base_address, t.format, t.width, height, t.dimension, t.depth,
+                t.pitch_pixels,
                 t.tiled ? 1 : 0, t.endian, t.swizzle, t.mip_max_level, t.packed_mips ? 1 : 0,
                 uint32_t(host.d3d),
                 dump_draw_ ? "MATERIAL-FILTERED" : "UNFILTERED-next-rebuild",

@@ -78,6 +78,13 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_ps, 0, "GPU",
 /// loaded fastfile, so their ADDRESSES are stable across launches -- which is what makes a range
 /// search valid here when an index search would not be (discovery order shifts every run, and that
 /// has already produced one retracted conclusion in this investigation).
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_idx_lo, 0, "GPU",
+                      "Debug: with idx_hi, restrict the blend isolate to BLENDPS discovery "
+                      "indices [lo, hi). Indices are stable within a session, so a whole "
+                      "bisection can be walked in one run without recomputing value midpoints");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_idx_hi, 0, "GPU",
+                      "Debug: upper bound (exclusive) of the BLENDPS index range; 0 = disabled");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_shaderid_n, 0, "GPU",
                       "Debug: log the microcode hash of the first N distinct pixel-shader "
                       "objects drawn. The hash names tools/new_shader_dump/shader_<HASH>.ucode.frag");
@@ -1722,6 +1729,16 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
                        (want_dst < 0 || uint32_t(want_dst) == blend.color_dst);
     // Enumerate the distinct MATERIALS behind the matching draws before narrowing to one, so the
     // list is complete even while a filter is active.
+    // Discovery index of this material, or -1 while the list is still filling. Indices are stable
+    // WITHIN a session (the list is append-only), which is all an index-based bisection needs --
+    // and the whole search happens in one session because ps_object values do not survive across
+    // launches. This is what lets the search run end to end without recomputing value midpoints
+    // between every round.
+    // 128 was hit in a real scene, which silently put every later material beyond the reach of an
+    // index search. Sized well clear of that now, and the FULL line still says so if it is ever
+    // reached again.
+    static constexpr size_t kMaxBlendPsMaterials = 512;
+    int32_t ps_index = -1;
     if (value_match) {
       static std::mutex pm;
       static std::vector<std::pair<uint32_t, uint64_t>> ps_seen;  // ps_object -> draw count
@@ -1730,7 +1747,9 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
                               [&d](const auto& e) { return e.first == d.ps_object; });
       if (pit != ps_seen.end()) {
         ++pit->second;
-      } else if (ps_seen.size() < 128) {
+        ps_index = int32_t(pit - ps_seen.begin());
+      } else if (ps_seen.size() < kMaxBlendPsMaterials) {
+        ps_index = int32_t(ps_seen.size());
         ps_seen.push_back({d.ps_object, 1});
         REXGPU_INFO("nx1_d3d9: BLENDPS #{} ps={:08X} vs={:08X} -- set nx1_d3d9_dbg_blend_ps to "
                     "this ps value to isolate this material by itself",
@@ -1738,9 +1757,11 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
         // Say when the list is truncated. A capped list that does not announce itself reads as a
         // COMPLETE enumeration, and a search over it would silently exclude the answer -- the
         // same class of quiet-truncation error as an unarmed filter reading as a real negative.
-        if (ps_seen.size() == 128) {
-          REXGPU_INFO("nx1_d3d9: BLENDPS list FULL at 128 -- more materials exist but are not "
-                      "listed; a search over this list is NOT exhaustive");
+        if (ps_seen.size() == kMaxBlendPsMaterials) {
+          REXGPU_INFO("nx1_d3d9: BLENDPS list FULL at {} -- more materials exist but are not "
+                      "listed; an INDEX search cannot reach them (they get no index) and a search "
+                      "over this list is NOT exhaustive",
+                      kMaxBlendPsMaterials);
         }
       }
     }
@@ -1752,6 +1773,15 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
     const uint32_t ps_hi = REXCVAR_GET(nx1_d3d9_dbg_blend_ps_hi);
     if ((ps_lo && d.ps_object < ps_lo) || (ps_hi && d.ps_object > ps_hi)) {
       value_match = false;
+    }
+    // Index range, half-open [idx_lo, idx_hi). idx_hi 0 disables it. A material that has not been
+    // assigned an index yet (list still filling, or full) can never be selected, so it is excluded
+    // rather than silently swept in with everything else.
+    if (const uint32_t idx_hi = REXCVAR_GET(nx1_d3d9_dbg_blend_idx_hi)) {
+      const uint32_t idx_lo = REXCVAR_GET(nx1_d3d9_dbg_blend_idx_lo);
+      if (ps_index < 0 || uint32_t(ps_index) < idx_lo || uint32_t(ps_index) >= idx_hi) {
+        value_match = false;
+      }
     }
     if (value_match) {
       ++prof_blend_match_draws_;
@@ -1992,9 +2022,8 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
   // nothing: the dimensions a material binds change between runs, so a filter copied from an older
   // log silently selects no texture at all, which reads exactly like "the texture is fine".
   // ps_object names the material and is stable for the life of the loaded fastfile.
-  if (const uint32_t dump_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps)) {
-    tracker.SetDumpDraw(d.ps_object == dump_ps);
-  }
+  const uint32_t dump_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps);
+  tracker.SetDumpDraw(dump_ps != 0, dump_ps != 0 && d.ps_object == dump_ps);
 
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
     if (!(sampler_mask & (1u << sampler))) {
@@ -2060,7 +2089,7 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
   }
   // Never let the dump flag survive this draw, or the next material's textures get attributed to
   // the one being investigated.
-  tracker.SetDumpDraw(false);
+  tracker.SetDumpDraw(false, false);
 }
 
 void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, RecordedDraw& d) {

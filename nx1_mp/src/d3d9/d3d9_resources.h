@@ -176,7 +176,14 @@ class ResourceTracker {
   /// only ever finds "some texture that looks like the one we want" -- the sizes and formats a
   /// material binds change between runs, so a shape filter aimed from an old log matches nothing
   /// and reads as "the texture is fine".
-  void SetDumpDraw(bool on) { dump_draw_ = on; }
+  /// `filter_active` says a material filter is SET; `matched` says this draw is the one. When a
+  /// filter is active it is AUTHORITATIVE -- the size/format filters no longer widen the dump.
+  /// They used to be OR-ed with it, so clearing them to "any size, any format" (the natural way
+  /// to stop them interfering) made every texture pass and silently bypassed the material filter.
+  void SetDumpDraw(bool filter_active, bool matched) {
+    dump_filter_active_ = filter_active;
+    dump_draw_ = matched;
+  }
 
   IDirect3DBaseTexture9* GetTexture(const uint8_t* base, const TextureFetchConstant& t,
                                     uint32_t sampler);
@@ -479,7 +486,8 @@ class ResourceTracker {
   /// Writes that dirtied an entry which HAD committed -- only possible with commit-freeze off.
   /// Arming proof for that experiment: zero means the toggle never reached a frozen entry.
   uint64_t unfrozen_writes_ = 0;
-  bool dump_draw_ = false;  ///< see SetDumpDraw
+  bool dump_draw_ = false;           ///< see SetDumpDraw
+  bool dump_filter_active_ = false;  ///< see SetDumpDraw
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;
