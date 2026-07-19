@@ -13,6 +13,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging/macros.h>
+#include <rex/math.h>
 #include <rex/string/buffer.h>
 #include <rex/system/kernel_state.h>
 
@@ -71,6 +72,19 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 /// otherwise makes these sprites impossible to catch.
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_texdump, 0, "GPU",
                       "Debug: dump the next N texture decodes (fetch constant + image)");
+
+/// Honour the packed-mip tile offset when detiling level 0 (see the long note at the decode).
+/// Kept toggleable because it changes the source addressing of every packed texture at once, and
+/// an A/B is the only honest way to show it is the fix rather than a plausible story.
+/// DEFAULT OFF. Measured with the counters below: armed (207 offsets genuinely applied) and the
+/// opaque-glass symptom was unchanged. It matches what the SDK's GetMipLocation does for mip 0, so
+/// it is probably more correct than passing (0,0) -- but "probably more correct" with no observed
+/// benefit is exactly the kind of change that has cost this renderer black screens before. Left in,
+/// off, with its instrumentation, so the next investigation starts from a measured negative rather
+/// than re-deriving the theory.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_packed_mip_offset, false, "GPU",
+                    "Apply the Xenos packed-mip sub-tile offset when decoding level 0 of a "
+                    "texture whose mip tail is packed (textures <= 16 texels)");
 
 /// Read texture texels from the CPU mirror rather than live guest memory.
 ///
@@ -1961,6 +1975,13 @@ void ResourceTracker::LogCacheStats() {
       device_->GetAvailableTextureMem() / (1024 * 1024));
   REXGPU_INFO("nx1_d3d9: mipgen built={} auto={} skipped(no chain declared)={} skipped(fmt)={}",
               mips_built_, mips_auto_, mips_skip_nochain_, mips_skip_unsupported_);
+  REXGPU_INFO("nx1_d3d9: packedmip enabled={} small_decodes={} packed_decodes={} offsets_applied={}"
+              " ({})",
+              REXCVAR_GET(nx1_d3d9_packed_mip_offset) ? 1 : 0, small_decodes_, packed_decodes_,
+              packed_offsets_,
+              packed_offsets_ ? "ARMED -- level 0 is being read from a shifted sub-tile origin"
+              : packed_decodes_ ? "INERT -- packed textures seen but the offset resolved to (0,0)"
+                                : "NOT ARMED -- no decode declared a packed mip tail");
   REXGPU_INFO("nx1_d3d9: commit freeze={} unfrozen_writes={} ({})",
               REXCVAR_GET(nx1_d3d9_commit_textures) ? "on" : "OFF", unfrozen_writes_,
               REXCVAR_GET(nx1_d3d9_commit_textures)
@@ -2912,6 +2933,34 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   const uint32_t dst_row_bytes =
       host.opaque_block ? extent.block_width * bpb : uint32_t(locked.Pitch);
   auto* dst = static_cast<uint8_t*>(locked.Pitch >= 0 ? locked.pBits : nullptr);
+  // PACKED MIP TAIL: level 0 is not necessarily at offset (0,0).
+  //
+  // Once a texture's levels shrink to 16 texels or less, Xenos stops giving each level its own
+  // image and packs the whole tail into ONE 32x32-block tile, side by side. The SDK models this --
+  // TextureInfo::GetMipLocation short-circuits mip 0 to base_address but STILL asks
+  // GetPackedTileOffset for its offset when has_packed_mips is set -- and DetileMip2D has taken
+  // offset_x/offset_y for exactly this reason all along. Every level-0 call site here passed the
+  // (0,0) default, so for any packed texture we detiled from the wrong corner of the shared tile
+  // and got whichever sibling level happened to sit there.
+  //
+  // This is why it hits SMALL textures specifically. The material behind the opaque-glass bug
+  // samples 16x16, 8x8 and 64x64; large surfaces never take the packed path, which is why the
+  // world looks right while these resolve to a flat block of a neighbour's texels -- white on the
+  // glass, white on the sky, speckle at distance. Same defect, three long-standing symptoms.
+  uint32_t packed_ox = 0, packed_oy = 0;
+  if (t.packed_mips && REXCVAR_GET(nx1_d3d9_packed_mip_offset)) {
+    rex::graphics::TextureInfo::GetPackedTileOffset(rex::next_pow2(t.width), rex::next_pow2(height),
+                                                    fmt, /*packed_tile=*/0, &packed_ox, &packed_oy);
+  }
+  // Arming proof. Three counters, because "the glass is still white" has three different meanings
+  // and they are indistinguishable without this: the flag is never set on the textures we care
+  // about (small_decodes high, packed_decodes 0), the flag is set but the offset comes back (0,0)
+  // so the change is a no-op (packed_decodes high, packed_offsets 0), or it really did relocate
+  // the read and did not help (packed_offsets high). Only the third is evidence against the fix.
+  if (t.width <= 16 || height <= 16) ++small_decodes_;
+  if (t.packed_mips) ++packed_decodes_;
+  if (packed_ox || packed_oy) ++packed_offsets_;
+
   /// Where the mip builder reads level 0 from. Defaults to the mapped surface, but the
   /// block-compressed path below redirects it to a normal-RAM copy -- see the comment there.
   const uint8_t* mip_source = dst;
@@ -2920,7 +2969,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // Detile the compressed colour blocks, then decode to A8R8G8B8 applying the channel swizzle
       // (the compressed host format cannot honour a broadcast swizzle) -- see src_bc above.
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
       DecodeBcColorSwizzledToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                                   extent.block_height, t.width, height, src_bc, bpb, t.swizzle);
       // A broadcast-swizzle sprite that decodes to all zero is not resident yet: its texel pool has
@@ -2936,14 +2985,14 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     } else if (host.decode == TexDecode::kDXN) {
       // CPU-decode DXN normal maps with the hardware RGGG swizzle (see PickHostTextureFormat).
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
       DecodeDXNToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                       extent.block_height, t.width, height);
     } else if (host.decode != TexDecode::kNone) {
       // CPU-decode single-channel BC-alpha: detile the compressed 8-byte blocks
       // into a linear scratch buffer, then expand each block to A8R8G8B8 (v,v,v,v).
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled);
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
       DecodeBCAlphaToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                           extent.block_height, t.width, height,
                           host.decode == TexDecode::kDXT5A);
@@ -2957,7 +3006,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // built from it. That is the distance speckle on block-compressed surfaces.
       const size_t level0_bytes = size_t(extent.block_height) * dst_row_bytes;
       uint8_t* staged = DetileScratch(level0_bytes);
-      DetileMip2D(staged, dst_row_bytes, src, extent, bpb, t.endian, t.tiled);
+      DetileMip2D(staged, dst_row_bytes, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
       const Swizzle32 swz = MakeSwizzle32(t.swizzle);
       if (host.swizzle32 && !swz.identity) {
         for (uint32_t by = 0; by < extent.block_height; ++by) {
@@ -2967,7 +3016,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       std::memcpy(dst, staged, level0_bytes);
       mip_source = staged;
     } else {
-      DetileMip2D(dst, dst_row_bytes, src, extent, bpb, t.endian, t.tiled);
+      DetileMip2D(dst, dst_row_bytes, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
       const Swizzle32 swz = MakeSwizzle32(t.swizzle);
       if (host.swizzle32 && !swz.identity) {
         for (uint32_t by = 0; by < extent.block_height; ++by) {

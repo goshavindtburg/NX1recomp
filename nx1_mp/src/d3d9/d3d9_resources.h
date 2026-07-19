@@ -472,6 +472,11 @@ class ResourceTracker {
   /// Writes that dirtied an entry which HAD committed -- only possible with commit-freeze off.
   /// Arming proof for that experiment: zero means the toggle never reached a frozen entry.
   uint64_t unfrozen_writes_ = 0;
+  /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
+  /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
+  uint64_t small_decodes_ = 0;
+  uint64_t packed_decodes_ = 0;
+  uint64_t packed_offsets_ = 0;
 
  public:
   /// TEMP PROFILING: why PreferLargestForSurface is or is not substituting. The confetti
