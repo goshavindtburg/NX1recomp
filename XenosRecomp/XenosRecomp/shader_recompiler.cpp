@@ -930,21 +930,32 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             print("exp2({})", op(SCALAR_0));
             break;
 
+        // The "c" variants are CLAMPED: Xenos replaces an infinite result with the finite
+        // extreme of the same sign (log2(0) = -INF -> -FLT_MAX, rcp(0) = +INF -> +FLT_MAX).
+        // clamp(v, -FLT_MAX, FLT_MAX) expresses exactly that and leaves every finite v alone.
+        //
+        // The lower bound was +FLT_MIN, which forces the result POSITIVE and so discards every
+        // negative one. log2(x) is negative for all x < 1 -- which is essentially every specular
+        // base, dot product and normalised value in the game -- so `pow(x, n)`, emitted as
+        // exp2(n * log2(x)), lost its ability to return anything below 1 and saturated instead
+        // of falling off. Whole materials rendered blown out: intact window glass came out solid
+        // white while its alpha, textures, constants and predicates were all provably correct.
+        // Same error on rcp/rsq, where it also flipped the sign of any negative reciprocal.
         case AluScalarOpcode::Logc:
         case AluScalarOpcode::Log:
-            print("clamp(log2({}), FLT_MIN, FLT_MAX)", op(SCALAR_0));
+            print("clamp(log2({}), -FLT_MAX, FLT_MAX)", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::Rcpc:
         case AluScalarOpcode::Rcpf:
         case AluScalarOpcode::Rcp:
-            print("clamp(rcp({}), FLT_MIN, FLT_MAX)", op(SCALAR_0));
+            print("clamp(rcp({}), -FLT_MAX, FLT_MAX)", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::Rsqc:
         case AluScalarOpcode::Rsqf:
         case AluScalarOpcode::Rsq:
-            print("clamp(rsqrt({}), FLT_MIN, FLT_MAX)", op(SCALAR_0));
+            print("clamp(rsqrt({}), -FLT_MAX, FLT_MAX)", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::Subs:
