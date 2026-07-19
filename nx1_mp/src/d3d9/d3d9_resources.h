@@ -469,6 +469,9 @@ class ResourceTracker {
   uint64_t tex_rebuilds_ = 0;   ///< layout changed -> host texture recreated
   uint64_t tex_failures_ = 0;   ///< CreateTexture/UpdateTexture failed
   uint64_t tex_evicted_ = 0;    ///< released by the age sweep
+  /// Writes that dirtied an entry which HAD committed -- only possible with commit-freeze off.
+  /// Arming proof for that experiment: zero means the toggle never reached a frozen entry.
+  uint64_t unfrozen_writes_ = 0;
 
  public:
   /// TEMP PROFILING: why PreferLargestForSurface is or is not substituting. The confetti

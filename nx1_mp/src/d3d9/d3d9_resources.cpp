@@ -1961,6 +1961,12 @@ void ResourceTracker::LogCacheStats() {
       device_->GetAvailableTextureMem() / (1024 * 1024));
   REXGPU_INFO("nx1_d3d9: mipgen built={} auto={} skipped(no chain declared)={} skipped(fmt)={}",
               mips_built_, mips_auto_, mips_skip_nochain_, mips_skip_unsupported_);
+  REXGPU_INFO("nx1_d3d9: commit freeze={} unfrozen_writes={} ({})",
+              REXCVAR_GET(nx1_d3d9_commit_textures) ? "on" : "OFF", unfrozen_writes_,
+              REXCVAR_GET(nx1_d3d9_commit_textures)
+                  ? "expected 0 while frozen"
+                  : (unfrozen_writes_ ? "ARMED -- frozen textures are honouring writes"
+                                      : "NOT ARMED -- no frozen entry saw a write, test is void"));
 }
 
 // Physical-memory write-watch callback. Runs on whatever guest thread wrote the memory, under the
@@ -2083,11 +2089,16 @@ void ResourceTracker::DrainMemoryWrites() {
   if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track) {
     // Span of the tracked texture, so writes to ANY of its pages show up -- the base page
     // alone tells us nothing about a texture that covers 32 of them.
+    // One page is the FALLBACK when no entry claims this address, not a measurement. Say so in
+    // the log: reading the placeholder as the texture's real size is what produced a phantom
+    // "watch_size is far too small" defect that cost a round of investigation.
     uint32_t span = 4096;
+    bool span_known = false;
     if (auto* tex_map = static_cast<TextureMap*>(textures_)) {
       for (auto [key, e] : *tex_map) {
         if (e.watch_addr == track && e.watch_size) {
           span = e.watch_size;
+          span_known = true;
           break;
         }
       }
@@ -2095,8 +2106,9 @@ void ResourceTracker::DrainMemoryWrites() {
     for (const auto& [addr, len] : writes) {
       if (addr < track + span && addr + len > track) {
         REXGPU_INFO("nx1_d3d9: TRACK {:08X} WRITE frame={} range={:08X}+{} (+{} into a {} byte "
-                    "texture)",
-                    track, frame_, addr, len, addr > track ? addr - track : 0, span);
+                    "window, {})",
+                    track, frame_, addr, len, addr > track ? addr - track : 0, span,
+                    span_known ? "the entry's real watch_size" : "ASSUMED 1 page, no entry found");
       }
     }
   }
@@ -2125,7 +2137,17 @@ void ResourceTracker::DrainMemoryWrites() {
     if (!entry.watch_size) continue;
     const uint32_t a0 = entry.watch_addr;
     const uint32_t a1 = entry.watch_addr + entry.watch_size;
-    if (entry.committed) continue;  // settled texture: frozen against the pool's later garbage
+    // Settled texture: frozen against the pool's later garbage. The cvar is honoured HERE, at the
+    // point of use, not only at the commit site -- `committed` is one-way and survives the cvar
+    // going false, so gating only the commit meant toggling it off mid-session left every
+    // already-frozen texture frozen. That made the toggle look like a null result when it had
+    // simply never reached the entries under investigation.
+    if (entry.committed && REXCVAR_GET(nx1_d3d9_commit_textures)) continue;
+    // Arming proof for the commit-freeze experiment. A frozen entry reaching the dirty test only
+    // happens with the cvar off, so a non-zero count is direct evidence the toggle took effect on
+    // real entries. Zero means the experiment did NOT run and a null visual result says nothing --
+    // the failure mode that has already voided this test once.
+    if (entry.committed) ++unfrozen_writes_;
     for (const auto& [addr, len] : writes) {
       if (addr < a1 && addr + len > a0) {
         entry.dirty = true;

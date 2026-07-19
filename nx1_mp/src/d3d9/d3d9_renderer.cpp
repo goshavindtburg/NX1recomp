@@ -57,6 +57,34 @@ REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_dst, -1, "GPU",
 
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);  // defined in d3d9_resources.cpp
 
+/// Narrow the blend isolate to a SINGLE material, keyed by its guest pixel-shader object.
+///
+/// Every identifier this investigation used before was unstable, and each one produced a
+/// confident wrong answer: BLENDCFG discovery indices shift between runs, guest texture addresses
+/// move between launches, and sampler slots move between draws IN THE SAME FRAME -- the same four
+/// textures appear at s9..s12 in one draw and s8..s11 in the next, which made a "sampler 10 moved"
+/// report fire on every unrelated draw and look like pool reallocation. The shader object is fixed
+/// for the life of the loaded fastfile, so it names a material rather than a position.
+///
+/// It also fixes the isolate's real weakness: `1->7` alone hides glass AND hud AND minimap
+/// together, so "the glass vanished" never distinguished the glass from everything sharing its
+/// blend mode. Take a value from the BLENDPS lines to hide exactly one material.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_ps, 0, "GPU",
+                      "Restrict the blend isolate/verify to draws using this guest pixel-shader "
+                      "object (from the BLENDPS log lines); 0 = all matching draws");
+
+/// Binary search over the material list. One blend mode covers 32+ materials, so testing them one
+/// at a time is 32 runs; halving the shader-object range is five. Shader objects live in the
+/// loaded fastfile, so their ADDRESSES are stable across launches -- which is what makes a range
+/// search valid here when an index search would not be (discovery order shifts every run, and that
+/// has already produced one retracted conclusion in this investigation).
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_ps_lo, 0, "GPU",
+                      "Restrict the blend isolate/verify to draws whose pixel-shader object is >= "
+                      "this value; 0 = no lower bound");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_ps_hi, 0, "GPU",
+                      "Restrict the blend isolate/verify to draws whose pixel-shader object is <= "
+                      "this value; 0 = no upper bound");
+
 REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_track_sampler, -1, "GPU",
                      "With blend verify on, automatically point nx1_d3d9_dbg_track_addr at this "
                      "sampler's texture in the matched draw. Avoids hand-copying an address "
@@ -1659,9 +1687,42 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
     // rather than "the filter was never armed".
     const int32_t want_src = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_src));
     const int32_t want_dst = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_dst));
-    const bool value_match = (want_src >= 0 || want_dst >= 0) &&
-                             (want_src < 0 || uint32_t(want_src) == blend.color_src) &&
-                             (want_dst < 0 || uint32_t(want_dst) == blend.color_dst);
+    bool value_match = (want_src >= 0 || want_dst >= 0) &&
+                       (want_src < 0 || uint32_t(want_src) == blend.color_src) &&
+                       (want_dst < 0 || uint32_t(want_dst) == blend.color_dst);
+    // Enumerate the distinct MATERIALS behind the matching draws before narrowing to one, so the
+    // list is complete even while a filter is active.
+    if (value_match) {
+      static std::mutex pm;
+      static std::vector<std::pair<uint32_t, uint64_t>> ps_seen;  // ps_object -> draw count
+      std::lock_guard<std::mutex> plk(pm);
+      auto pit = std::find_if(ps_seen.begin(), ps_seen.end(),
+                              [&d](const auto& e) { return e.first == d.ps_object; });
+      if (pit != ps_seen.end()) {
+        ++pit->second;
+      } else if (ps_seen.size() < 128) {
+        ps_seen.push_back({d.ps_object, 1});
+        REXGPU_INFO("nx1_d3d9: BLENDPS #{} ps={:08X} vs={:08X} -- set nx1_d3d9_dbg_blend_ps to "
+                    "this ps value to isolate this material by itself",
+                    ps_seen.size() - 1, d.ps_object, d.vs_object);
+        // Say when the list is truncated. A capped list that does not announce itself reads as a
+        // COMPLETE enumeration, and a search over it would silently exclude the answer -- the
+        // same class of quiet-truncation error as an unarmed filter reading as a real negative.
+        if (ps_seen.size() == 128) {
+          REXGPU_INFO("nx1_d3d9: BLENDPS list FULL at 128 -- more materials exist but are not "
+                      "listed; a search over this list is NOT exhaustive");
+        }
+      }
+    }
+    if (const uint32_t want_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps);
+        want_ps && d.ps_object != want_ps) {
+      value_match = false;
+    }
+    const uint32_t ps_lo = REXCVAR_GET(nx1_d3d9_dbg_blend_ps_lo);
+    const uint32_t ps_hi = REXCVAR_GET(nx1_d3d9_dbg_blend_ps_hi);
+    if ((ps_lo && d.ps_object < ps_lo) || (ps_hi && d.ps_object > ps_hi)) {
+      value_match = false;
+    }
     if (value_match) {
       ++prof_blend_match_draws_;
     }
@@ -1682,7 +1743,13 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
         // error as the discovery-order indices: state from one configuration leaking into a
         // reading of another.
         static std::mutex vm;
-        static int32_t reported_for = -1;
+        static uint64_t reported_for = ~uint64_t(0);
+        // The address the tracker was last pointed at. A pure one-shot armed once and then went
+        // stale the moment the streaming pool handed this material a different allocation -- every
+        // TRACK line afterwards described a dead address that is never bound, which reads exactly
+        // like "the texture is fine, nothing is writing it". Re-arming on CHANGE keeps the tracker
+        // on the live texture AND turns the move itself into the signal we are hunting.
+        static uint32_t last_armed_addr = 0;
         std::lock_guard<std::mutex> vlk(vm);
         // Latch on the target AND the sampler being tracked, and only once the tracker has
         // actually been armed. Latching on the first match anywhere meant a MENU draw claimed the
@@ -1690,19 +1757,47 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
         // target done, and silently ignored every in-game draw afterwards. Two runs lost to that.
         // A one-shot must fire on the first USEFUL event, not the first event.
         const int32_t track_slot_key = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_track_sampler));
-        const int32_t target_key = (want_src << 16) | (want_dst << 8) | (track_slot_key & 0xFF);
+        // The MATERIAL FILTER has to be part of the latch key. Without it, narrowing ps_lo/ps_hi
+        // left the one-shot believing it had already reported -- so five bisection rounds ran with
+        // the verify silently producing nothing, and the only lines in the log were stale ones
+        // describing a different set of draws. Same failure as the target_key fix that preceded it:
+        // a latch is only safe when its key covers everything that changes what it would report.
+        const uint64_t target_key = (uint64_t(uint32_t(want_src)) << 40) |
+                                    (uint64_t(uint32_t(want_dst)) << 32) |
+                                    (uint64_t(uint32_t(track_slot_key)) << 24) |
+                                    (uint64_t(ps_lo) ^ (uint64_t(ps_hi) << 12) ^
+                                     (uint64_t(REXCVAR_GET(nx1_d3d9_dbg_blend_ps)) << 20));
         // Require a REAL texture in that slot, not just a mask bit. active_sampler_mask_ is
         // 0xFFFF whenever the shader could not be walked ("bind everything"), so testing the bit
         // said yes for slot 10 on a draw that had nothing bound there -- it latched, printed
         // samplers 0..8, and armed nothing. Decoding the fetch constant is the actual question.
         const bool want_arm = track_slot_key >= 0;
         bool armable = !want_arm;
+        uint32_t probe_addr = 0;
         if (want_arm && (active_sampler_mask_ & (1u << (track_slot_key & 0xF)))) {
           const TextureFetchConstant probe =
               DecodeTextureFetchConstant(d.texture_fetch(uint32_t(track_slot_key) & 0xF));
           armable = probe.valid && probe.base_address != 0;
+          probe_addr = probe.base_address;
         }
-        if (reported_for != target_key && armable) {
+        const bool moved = probe_addr != 0 && probe_addr != last_armed_addr;
+        // REPORTING and ARMING are separate concerns. Requiring `armable` to report meant that
+        // naming a sampler the matched material does not bind silenced the verify entirely -- the
+        // tool answered "nothing matched" when it had matched 18 draws a frame and simply declined
+        // to speak. Report on the first draw for a target regardless; arm only when the requested
+        // slot really holds a texture, and re-report when that texture's address changes.
+        if (reported_for != target_key || (moved && armable)) {
+          // Only meaningful once ONE material is selected. Sampler slots are per-draw, not per
+          // material, so without the filter this compares slot 10 across unrelated draws and
+          // reports every one as a reallocation -- it fired continuously within a single
+          // millisecond and looked exactly like the pool churning.
+          if (moved && last_armed_addr != 0 &&
+              (REXCVAR_GET(nx1_d3d9_dbg_blend_ps) || ps_lo || ps_hi)) {
+            REXGPU_INFO("nx1_d3d9: BLENDVERIFY sampler{} MOVED {:08X} -> {:08X} -- this MATERIAL's "
+                        "texels are at a new guest address; the old one is now someone else's data",
+                        track_slot_key, last_armed_addr, probe_addr);
+          }
+          last_armed_addr = probe_addr;
           reported_for = target_key;
           DWORD be = 0, sb = 0, db = 0, sep = 0, cw = 0, af = 0;
           device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &be);
@@ -1711,10 +1806,14 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
           device_->GetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, &sep);
           device_->GetRenderState(D3DRS_COLORWRITEENABLE, &cw);
           device_->GetRenderState(D3DRS_ALPHATESTENABLE, &af);
-          REXGPU_INFO("nx1_d3d9: BLENDVERIFY device says blendenable={} src={} dst={} "
-                      "separate={} colourwrite={:#x} alphatest={} || we intended enable={} "
-                      "src={} dst={} mask={:#x}",
-                      be, sb, db, sep, cw, af, blend.enabled ? 1 : 0,
+          // Name the MATERIAL in the report. Without it the block says nothing about which of the
+          // matched draws it describes, so a range covering several materials produced a texture
+          // list that could not be attributed -- and the first-drawn material claims the one-shot,
+          // which is not necessarily the one being hunted.
+          REXGPU_INFO("nx1_d3d9: BLENDVERIFY ps={:08X} vs={:08X} device says blendenable={} "
+                      "src={} dst={} separate={} colourwrite={:#x} alphatest={} || we intended "
+                      "enable={} src={} dst={} mask={:#x}",
+                      d.ps_object, d.vs_object, be, sb, db, sep, cw, af, blend.enabled ? 1 : 0,
                       uint32_t(HostBlendFactor(blend.color_src)),
                       uint32_t(HostBlendFactor(blend.color_dst)), d.color_write_mask);
           // Name the textures this draw samples. With the blend proven correct, an opaque result
