@@ -29,6 +29,10 @@
 #include "nx1_sm3_shader_cache.h"
 #endif
 
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_sm3_lo32, 0, "GPU",
+                      "Debug: write the translated SM3 bytecode of the shader whose microcode "
+                      "hash has these low 32 bits, to sm3_<hash>.bin next to the exe");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_literals, 0, "GPU",
                       "Debug: report what c252-c255 resolve to for the first N distinct shaders, "
                       "and whether each value came from the shader literal table or fell back to "
@@ -257,6 +261,26 @@ const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
   Sm3Shader shader{};
   shader.entry = found;
   const auto* code = reinterpret_cast<const DWORD*>(bytecode_ + found->bytecodeOffset);
+
+  // Dump the TRANSLATED bytecode for one shader, selected by the low 32 bits of its microcode
+  // hash (cvars are 32-bit; the full hash does not fit). Everything upstream of the translation
+  // -- texture data, decode, literal constants, guest microcode -- has been verified correct for
+  // the glass material, so what the translator actually emitted is the remaining unknown, and it
+  // cannot be read off a log line.
+  if (const uint32_t want_lo = REXCVAR_GET(nx1_d3d9_dbg_dump_sm3_lo32);
+      want_lo && uint32_t(ucode_hash & 0xFFFFFFFFu) == want_lo) {
+    char path[128];
+    std::snprintf(path, sizeof(path), "sm3_%016llX.bin", static_cast<unsigned long long>(ucode_hash));
+    if (FILE* f = std::fopen(path, "wb")) {
+      std::fwrite(code, 1, found->bytecodeSize, f);
+      std::fclose(f);
+      REXGPU_INFO("nx1_d3d9: SM3DUMP wrote {} ({} bytes, {} dwords, flags={:#x}, remapCount={})",
+                  path, found->bytecodeSize, found->bytecodeSize / 4, found->flags,
+                  found->remapCount);
+    } else {
+      REXGPU_ERROR("nx1_d3d9: SM3DUMP could not open {}", path);
+    }
+  }
   // fxc parks its `def` literals in any declared register whose uploads the optimizer proved
   // dead -- including registers INSIDE the remap window -- so every constant write must go
   // around them AND re-assert the values (the runtime does not reapply defs on SetShader).

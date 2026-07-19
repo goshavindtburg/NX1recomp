@@ -42,6 +42,11 @@
 ///   3 = the `adopt`/`fresh` path (largest yet seen -> becomes retained)
 /// Back away from a surface until it speckles; whichever mode turns it white is the branch
 /// that produced it. Off (0) by default.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_prefer_largest, true, "GPU",
+                    "Substitute the highest-resolution texture a surface has shown when the "
+                    "engine swaps a sampler to a smaller (often unstreamed) LOD. Turn OFF to "
+                    "bind exactly what the guest asked for");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_lod, 0, "GPU",
                       "Debug: paint one prefer-largest LOD branch white (1=substitute, "
                       "2=equal, 3=adopt)");
@@ -3385,6 +3390,13 @@ IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface
                                                                 uint32_t width, uint32_t height,
                                                                 uint32_t base_address) {
   if (prof_enabled_) ++prof_lod_.calls;
+  // Master off switch. This function SUBSTITUTES a different texture than the one GetTexture
+  // resolved, and it does so after the texture dump has already run -- so every dump taken to
+  // investigate a surface shows the texture we looked up, not necessarily the one the GPU is
+  // handed. Being able to take it out of the path is the only way to tell those apart.
+  if (!REXCVAR_GET(nx1_d3d9_prefer_largest)) {
+    return tex;
+  }
   if (!surface_key || !tex || !best_textures_) {
     if (prof_enabled_ && !surface_key) ++prof_lod_.no_surface;
     return tex;

@@ -85,6 +85,10 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_idx_lo, 0, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_idx_hi, 0, "GPU",
                       "Debug: upper bound (exclusive) of the BLENDPS index range; 0 = disabled");
 
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_force_zero_src_ps, 0, "GPU",
+                      "Debug: force SRCBLEND=ZERO for draws using this pixel-shader object, so "
+                      "only dst*(1-alpha) remains and the shader's real alpha becomes visible");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_shaderid_n, 0, "GPU",
                       "Debug: log the microcode hash of the first N distinct pixel-shader "
                       "objects drawn. The hash names tools/new_shader_dump/shader_<HASH>.ucode.frag");
@@ -1664,7 +1668,18 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   const BlendState& blend = d.blend;
   SetRenderStateCached(D3DRS_ALPHABLENDENABLE, blend.enabled ? TRUE : FALSE);
   SetRenderStateCached(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
-  SetRenderStateCached(D3DRS_SRCBLEND, HostBlendFactor(blend.color_src));
+  // Diagnostic override for ONE material. Under premultiplied ONE->INVSRCALPHA the result is
+  // src.rgb + dst*(1-alpha), so a SATURATED src.rgb paints the surface solid white no matter what
+  // alpha is -- indistinguishable on screen from alpha being wrong. Forcing SRCBLEND to ZERO
+  // removes src from the equation entirely: what remains is dst*(1-alpha), so the background shows
+  // through in exact proportion to the alpha the shader really produced. That separates "our alpha
+  // is 1" from "our colour is blown out", which nothing measured so far can.
+  D3DBLEND host_src = HostBlendFactor(blend.color_src);
+  if (const uint32_t force_ps = REXCVAR_GET(nx1_d3d9_dbg_force_zero_src_ps);
+      force_ps && d.ps_object == force_ps) {
+    host_src = D3DBLEND_ZERO;
+  }
+  SetRenderStateCached(D3DRS_SRCBLEND, host_src);
   SetRenderStateCached(D3DRS_DESTBLEND, HostBlendFactor(blend.color_dst));
   SetRenderStateCached(D3DRS_BLENDOP, HostBlendOp(blend.color_op));
   SetRenderStateCached(D3DRS_SRCBLENDALPHA, HostBlendFactor(blend.alpha_src));
