@@ -1652,11 +1652,17 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
         // because its shadow disagrees with the device (the hazard InvalidateStateShadow exists
         // for). Reading the state back is the only way to tell "we never issued it" apart from
         // "we issued it and it did not take".
+        // Keyed on the TARGET, not a plain one-shot. A bare `static bool reported` latched on the
+        // first match ever, so changing dbg_blend_src/dst mid-session silently kept reporting the
+        // old configuration -- a stale line read as if it described the new target. Same class of
+        // error as the discovery-order indices: state from one configuration leaking into a
+        // reading of another.
         static std::mutex vm;
-        static bool reported = false;
+        static int32_t reported_for = -1;
         std::lock_guard<std::mutex> vlk(vm);
-        if (!reported) {
-          reported = true;
+        const int32_t target_key = (want_src << 8) | want_dst;
+        if (reported_for != target_key) {
+          reported_for = target_key;
           DWORD be = 0, sb = 0, db = 0, sep = 0, cw = 0, af = 0;
           device_->GetRenderState(D3DRS_ALPHABLENDENABLE, &be);
           device_->GetRenderState(D3DRS_SRCBLEND, &sb);
