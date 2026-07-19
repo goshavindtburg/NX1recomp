@@ -56,7 +56,8 @@ REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_src, -1, "GPU",
 REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_dst, -1, "GPU",
                      "Xenos colour DST factor of the draws to isolate/verify; -1 = off");
 
-REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);  // defined in d3d9_resources.cpp
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_sampler_n);  // defined in d3d9_resources.cpp
 
 /// Narrow the blend isolate to a SINGLE material, keyed by its guest pixel-shader object.
 ///
@@ -91,6 +92,12 @@ REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_pick_ox, 0, "GPU",
                      "unoffset pick returns the weapon rather than what you are aiming at");
 REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_pick_oy, 0, "GPU",
                      "Debug: vertical offset of the pick point from the screen centre");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pick_ignore_lo32, 0, "GPU",
+                      "Debug: drop hits from the shader with these low-32 hash bits when picking. "
+                      "The viewmodel is drawn late and close, so it wins the nearest-hit ranking "
+                      "whenever it covers the box. Keyed on the hash, not ps_object, so it "
+                      "survives a restart");
 
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pick_size, 8, "GPU",
                       "Debug: side length in pixels of the picker box at the screen centre");
@@ -515,6 +522,24 @@ void Renderer::PickEnd(IDirect3DQuery9* q) {
   }
 }
 
+void Renderer::PickIgnoreToggle(uint32_t lo32) {
+  if (!lo32) return;
+  for (auto it = pick_ignore_.begin(); it != pick_ignore_.end(); ++it) {
+    if (*it == lo32) {
+      pick_ignore_.erase(it);
+      return;
+    }
+  }
+  pick_ignore_.push_back(lo32);
+}
+
+bool Renderer::PickIsIgnored(uint32_t lo32) const {
+  for (uint32_t v : pick_ignore_) {
+    if (v == lo32) return true;
+  }
+  return false;
+}
+
 void Renderer::RequestPick(int x, int y) {
   // NO LOCK. This is called from two places that must not contend: the WndProc (window thread)
   // and the overlay's own draw, which runs from Present() -- and Present already holds
@@ -600,6 +625,8 @@ void Renderer::Present() {
            ++spin) {
       }
       if (hr != S_OK || pixels == 0) continue;
+      // Ignored shaders (the viewmodel is three of them on its own).
+      if (PickIsIgnored(uint32_t(pick_entries_[i].ps_hash & 0xFFFFFFFFu))) continue;
       ++hits;
       const PickEntry& e = pick_entries_[i];
       pick_results_.push_back(
@@ -616,16 +643,32 @@ void Renderer::Present() {
     // last, after the shadow and reflection passes. Everything on another target was never on
     // screen at that pixel and must not be ranked against it.
     if (!pick_results_.empty()) {
-      // The scene target is where DEPTH-TESTED geometry with a real shader is drawn -- NOT the
-      // target of the last draw. NX1 renders the world to an EDRAM surface and then composites
-      // to a different one, so taking the last hit's target made the composite the reference and
-      // labelled every world surface "other pass", which is exactly backwards.
-      uint32_t main_rt = pick_results_.back().rt_surface;
-      for (size_t n = pick_results_.size(); n-- > 0;) {
-        if (pick_results_[n].depth_test && pick_results_[n].ps_object) {
-          main_rt = pick_results_[n].rt_surface;
-          break;
+      // The scene target is the one carrying the MOST depth-writing geometry. Picking it from a
+      // single draw (the last hit, or the last depth-tested hit) kept choosing the composite or
+      // the viewmodel and then filtering the real surface OUT -- which is what made the picker
+      // report the ground, a barrel or the gun when a wall was clicked.
+      //
+      // Within that target the ranking is then provably right: with depth test AND depth write
+      // on, the LAST draw to pass at a pixel is the nearest one, because anything closer that
+      // came later would also have passed and anything farther would have failed. So the only
+      // job here is to restrict the candidates to real opaque geometry.
+      std::vector<std::pair<uint32_t, uint32_t>> rt_votes;
+      for (const auto& r : pick_results_) {
+        // ps_object != 0 is essential, not incidental. A depth-only / shadow pass writes depth
+        // for EVERY draw and carries no pixel shader at all, so counting depth-writing draws
+        // alone elected that target over the real scene (measured: 6 shaderless votes vs 2 real
+        // ones) and every pick then resolved to something invisible.
+        if (!r.depth_test || !r.depth_write || !r.ps_object) continue;
+        bool found = false;
+        for (auto& v : rt_votes) {
+          if (v.first == r.rt_surface) { ++v.second; found = true; break; }
         }
+        if (!found) rt_votes.emplace_back(r.rt_surface, 1u);
+      }
+      uint32_t main_rt = pick_results_.back().rt_surface;
+      uint32_t best_votes = 0;
+      for (const auto& v : rt_votes) {
+        if (v.second > best_votes) { best_votes = v.second; main_rt = v.first; }
       }
       uint32_t kept = 0;
       for (auto& r : pick_results_) {
@@ -2336,6 +2379,17 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // Decoded once here and handed to GetTexture: the sampler state below needs the same
     // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
     const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(sampler));
+    // Re-point the address tracker at whatever this material binds RIGHT NOW. Following a fixed
+    // address does not work while the streaming pool is reassigning them -- an address copied
+    // out of a dump is frequently a different texture by the time it is entered, which reads as
+    // "POLL and WRITE but never BIND or DECODE".
+    if (const uint32_t track_n = REXCVAR_GET(nx1_d3d9_dbg_track_sampler_n);
+        track_n && dump_ps && d.ps_object == dump_ps && sampler == track_n - 1 && t.base_address &&
+        REXCVAR_GET(nx1_d3d9_dbg_track_addr) != t.base_address) {
+      REXCVAR_SET(nx1_d3d9_dbg_track_addr, t.base_address);
+      REXGPU_INFO("nx1_d3d9: TRACKFOLLOW ps={:08X} sampler={} -> {:08X} ({}x{} fmt={})",
+                  dump_ps, sampler, t.base_address, t.width, t.height, t.format);
+    }
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, t, sampler);
     // Debug: unbind chosen sampler slots for ONE material, so a sample that is suspected of
     // saturating the output can be removed and the result observed. A NULL texture reads as zero,

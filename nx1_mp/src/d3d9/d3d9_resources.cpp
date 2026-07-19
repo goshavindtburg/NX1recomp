@@ -66,6 +66,14 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipfill, 0, "GPU",
 /// renders as garbage and the log answers the question the screen cannot -- is this memory
 /// ever written with good data, is it a resolve destination we are failing to track, or does
 /// nothing ever touch it? Hex, e.g. 05091000.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_sampler_n, 0, "GPU",
+                      "Debug: with dbg_blend_ps set, RE-POINT dbg_track_addr at whatever texture "
+                      "that material currently binds to this sampler (1 = sampler 0, 2 = sampler "
+                      "1, ...). Tracking a fixed ADDRESS is unreliable here: the streaming pool "
+                      "reassigns addresses, so by the time an address from a dump is entered it "
+                      "often belongs to something else -- which shows up as POLL/WRITE lines with "
+                      "no BIND or DECODE at all");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
                       "Debug: log every write/resolve/decode touching this guest address, and "
                       "paint whatever samples it solid white so it can be identified on screen");
@@ -142,6 +150,11 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_texture_mirror, true, "GPU",
 /// occupant -- freezing makes that permanent. Turn this off to find out which side of that
 /// trade an artifact is on: with committing disabled the write-watch keeps re-decoding, so a
 /// texture that was merely early will correct itself once its data lands.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_writes_always_invalidate, true, "GPU",
+                    "Honour a guest write even to a committed texture -- the reference model. "
+                    "Off restores the old freeze, which cannot distinguish protecting a good "
+                    "decode from preserving a bad one");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_commit_textures, true, "GPU",
                     "Freeze a texture's decode after it has been drawn cleanly for 32 frames");
 
@@ -689,6 +702,12 @@ struct TextureEntry {
   /// is the confetti-on-backup. A texture drawn cleanly for kCommitFrames is settled, so we commit
   /// it: stop honouring writes and hold the good decode. good_frames counts frames it has been drawn.
   uint32_t good_frames = 0;
+  /// Was the decode that produced this texture made from a source with EMPTY pages? Such a
+  /// decode must never be committed: committing stops honouring writes, so a texture decoded
+  /// before its contents streamed in is frozen as garbage for the rest of the session. Measured
+  /// exactly that -- source went 0 -> 8121/8192 nonzero AFTER the entry committed, and it then
+  /// reported dirty=0 committed=1 on every subsequent frame and never re-decoded.
+  bool decoded_from_partial = false;
   bool committed = false;
   /// Consecutive fully-transparent decodes of a broadcast-swizzle sprite, and the frame before
   /// which not to bother trying again. A sprite whose texel pool never streams in (this build has
@@ -2245,7 +2264,19 @@ void ResourceTracker::DrainMemoryWrites() {
     // going false, so gating only the commit meant toggling it off mid-session left every
     // already-frozen texture frozen. That made the toggle look like a null result when it had
     // simply never reached the entries under investigation.
-    if (entry.committed && REXCVAR_GET(nx1_d3d9_commit_textures)) continue;
+    // A guest write ALWAYS invalidates, exactly as the reference does -- it tracks per-range
+    // validity and reloads on write, and has no notion of freezing a texture at all.
+    //
+    // The freeze was meant to protect a good decode from the pool recycling the slot underneath
+    // it, but it cannot tell that case from the one it caused: a texture decoded from a slot the
+    // pool had NOT yet filled is frozen as garbage for the session. Measured directly -- source
+    // 0 -> 8151/8192 nonzero AFTER commit, then dirty=0 committed=1 forever, never re-decoded.
+    // And it cannot be fixed by inspecting content: a recycled slot holds the PREVIOUS texture's
+    // bytes, which are complete and non-zero, so "is the source populated" answers yes.
+    if (entry.committed && REXCVAR_GET(nx1_d3d9_commit_textures) &&
+        !REXCVAR_GET(nx1_d3d9_writes_always_invalidate)) {
+      continue;
+    }
     // Arming proof for the commit-freeze experiment. A frozen entry reaching the dirty test only
     // happens with the cvar off, so a non-zero count is direct evidence the toggle took effect on
     // real entries. Zero means the experiment did NOT run and a null visual result says nothing --
@@ -2764,9 +2795,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // After kCommitFrames it is settled: DrainMemoryWrites stops honouring writes to it, so the
   // streaming pool's later garbage-recycle can't re-poison the decode (the confetti-on-backup).
   constexpr uint32_t kCommitFrames = 32;
+  // NOT for a decode made from an incomplete source. "Drawn cleanly for 32 frames" only means
+  // nothing crashed; a texture whose pool slot was still empty renders 32 clean frames of
+  // garbage just as readily, and committing it makes that permanent.
   if (entry.tex && entry.last_frame != frame_ && entry.layout_key == layout_key &&
-      !entry.committed && ++entry.good_frames >= kCommitFrames &&
-      REXCVAR_GET(nx1_d3d9_commit_textures)) {
+      !entry.committed && !entry.decoded_from_partial &&
+      ++entry.good_frames >= kCommitFrames && REXCVAR_GET(nx1_d3d9_commit_textures)) {
     entry.committed = true;
   }
   // Debug: force ONE fresh decode of a texture matching the dump filter.
@@ -3133,8 +3167,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // decoded hash is logged alongside so successive decodes of the same address can be compared:
   // a hash that changes while the page coverage is incomplete is a decode of a half-written
   // source, which is exactly what "garbage only while it speckles" looks like.
-  if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_partial_src);
-      (budget || REXCVAR_GET(nx1_d3d9_retry_partial)) && src && dst) {
+  // ALWAYS measured, not just when a diagnostic is on: the commit gate below depends on it, and
+  // gating the measurement behind a debug cvar would leave the fix inert in a normal run. Each
+  // page stops at its first non-zero byte, so a populated texture costs one byte per page.
+  const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_partial_src);
+  if (src && dst) {
     uint32_t pages_total = 0, pages_empty = 0;
     for (size_t off = 0; off < guest_bytes; off += 4096) {
       const size_t end = (off + 4096 < guest_bytes) ? off + 4096 : guest_bytes;
@@ -3387,6 +3424,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // (re-decode next bind) and never let it commit, so it recovers the moment its pool streams in.
   // A decode made from a source with holes is provisional for the same reason a fully-empty one
   // is: the pages have not all arrived. Keeping it caches a permanently speckled texture.
+  // Independent of the retry cvar: even without retrying, a partial decode must not be frozen.
+  entry.decoded_from_partial = partial_pages != 0;
   const bool partial = partial_pages != 0 && REXCVAR_GET(nx1_d3d9_retry_partial);
   if (swizzle_all_zero || partial) {
     entry.dirty = true;

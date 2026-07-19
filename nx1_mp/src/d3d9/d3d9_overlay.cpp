@@ -41,6 +41,7 @@ REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_hide_matched);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_highlight_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_solo_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_solid_lo32);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_pick_ignore_lo32);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_blend_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_pick_size);
 REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_ox);
@@ -401,14 +402,19 @@ void Overlay::DrawPicker() {
 
   ImGui::Separator();
 
-  Renderer& r = Renderer::Get();
-
   // Hover mode: re-pick under the cursor on a throttle and paint whatever is there magenta.
   // A pick frame clamps the scissor to a small box, so it does not refresh the display -- with
   // NX1 resolving and us blitting, the previous frame simply stays up. The cost is therefore
   // DROPPED FRAMES rather than a black strobe, which is what makes this usable at all.
   static bool hover_mode = false;
+  Renderer& r = Renderer::Get();
   ImGui::Checkbox("hover: paint whatever is under the cursor", &hover_mode);
+  if (const size_t nign = r.PickIgnoreCount()) {
+    ImGui::SameLine();
+    char lbl[48];
+    std::snprintf(lbl, sizeof(lbl), "clear %zu ignore%s", nign, nign == 1 ? "" : "s");
+    if (ImGui::Button(lbl)) r.PickIgnoreClear();
+  }
   ImGui::SameLine();
   ImGui::TextDisabled("(costs frames -- one pick per update)");
   if (hover_mode) {
@@ -431,11 +437,12 @@ void Overlay::DrawPicker() {
     // identity -- painting it matches every one of them and turns the whole screen magenta.
     uint32_t paint = 0;
     for (size_t n = res.size(); n-- > 0;) {
-      // Depth-TESTED, not depth-writing. With a depth prepass the colour draw tests EQUAL and
-      // writes nothing, so requiring a write selects the prepass -- which carries ps_object 0
-      // and cannot be identified at all. The composite is excluded instead by the fact that it
-      // does not depth-test.
-      if (res[n].main_pass && res[n].depth_test && res[n].ps_object != 0) {
+      // Opaque scene geometry only: depth test AND depth write, on the scene target, with a
+      // real shader object. Within that set the LAST hit is provably the nearest -- that is what
+      // passing the depth test last means. Everything excluded here is excluded for a reason
+      // that showed up in practice: the composite does not depth-test, the depth prepass has no
+      // shader object, and other render targets were never on screen at that pixel.
+      if (res[n].main_pass && res[n].depth_test && res[n].depth_write && res[n].ps_object != 0) {
         paint = res[n].ps_object;
         break;
       }
@@ -475,11 +482,26 @@ void Overlay::DrawPicker() {
     // FRONTMOST FIRST. It was last, which put the one entry that matters below the fold as soon
     // as the list scrolled -- so the visible rows were the skybox and whatever was drawn behind,
     // and 'hide this' on those looked like the picker returning the wrong material.
-    size_t emitted = 0;
+    // Order the LIST by the same rule the selection uses, or the two disagree and the top row is
+    // a depth-prepass draw (ps_object 0) that cannot be identified or painted. Qualifying opaque
+    // geometry first, nearest first within it; everything else after.
+    std::vector<size_t> order;
     for (size_t n = 0; n < hits.size(); ++n) {
       const size_t i = hits.size() - 1 - n;
       const auto& h = hits[i];
+      if (h.main_pass && h.depth_test && h.depth_write && h.ps_object != 0) order.push_back(i);
+    }
+    for (size_t n = 0; n < hits.size(); ++n) {
+      const size_t i = hits.size() - 1 - n;
+      const auto& h = hits[i];
+      if (h.main_pass && h.depth_test && h.depth_write && h.ps_object != 0) continue;
       if (!h.main_pass && !show_other_passes) continue;
+      order.push_back(i);
+    }
+    size_t emitted = 0;
+    for (size_t oi = 0; oi < order.size(); ++oi) {
+      const size_t i = order[oi];
+      const auto& h = hits[i];
       if (!show_all && emitted >= 1) break;
       const bool front = (emitted == 0);
       ++emitted;
@@ -530,6 +552,16 @@ void Overlay::DrawPicker() {
       if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Draw this MATERIAL as solid magenta. Keyed on ps_object, so only the "
                           "one material lights up -- most of the world shares a few ubershaders.");
+      }
+      ImGui::SameLine();
+      const uint32_t lo = uint32_t(h.ps_hash & 0xFFFFFFFFull);
+      const bool ignored = lo && r.PickIsIgnored(lo);
+      if (ImGui::Button(ignored ? "un-ignore" : "IGNORE")) {
+        r.PickIgnoreToggle(lo);
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Drop this shader from future picks. Ignores ACCUMULATE -- the "
+                          "viewmodel is three shaders (hands, weapon, sight), so ignore each.");
       }
       ImGui::SameLine();
       const bool solo = REXCVAR_GET(nx1_d3d9_dbg_solo_ps) == h.ps_object;

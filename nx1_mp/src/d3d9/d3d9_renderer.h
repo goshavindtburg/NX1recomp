@@ -165,6 +165,14 @@ class Renderer {
   /// coverage there) -- one odd-looking frame, then normal.
   void RequestPick(int x, int y);
 
+  /// Shaders dropped from pick results. A LIST, not one slot: the viewmodel alone is three
+  /// separate shaders (hands, weapon, sight), so a single-entry ignore can never cover it.
+  /// Keyed on the low 32 bits of the microcode hash, which is stable across restarts.
+  void PickIgnoreToggle(uint32_t lo32);
+  bool PickIsIgnored(uint32_t lo32) const;
+  void PickIgnoreClear() { pick_ignore_.clear(); }
+  size_t PickIgnoreCount() const { return pick_ignore_.size(); }
+
  private:
   /// Bracket one draw in an occlusion query while a pick is armed. EVERY draw path must use
   /// these: a path without them is invisible to the picker, and a surface drawn through it can
@@ -370,6 +378,7 @@ class Renderer {
   std::atomic<bool> pick_requested_{false};
   int pick_x_ = 0, pick_y_ = 0;
   RECT pick_box_{};
+  std::vector<uint32_t> pick_ignore_;
   std::vector<IDirect3DQuery9*> pick_queries_;
   std::vector<PickEntry> pick_entries_;
   std::vector<PickResult> pick_results_;
