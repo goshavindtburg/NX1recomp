@@ -33,6 +33,11 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_sm3_lo32, 0, "GPU",
                       "Debug: write the translated SM3 bytecode of the shader whose microcode "
                       "hash has these low 32 bits, to sm3_<hash>.bin next to the exe");
 
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_const_obj, 0, "GPU",
+                      "Debug: guest shader object whose constant register to report");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_const_reg, 0, "GPU",
+                      "Debug: HOST constant register index to report for dbg_const_obj");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_literals, 0, "GPU",
                       "Debug: report what c252-c255 resolve to for the first N distinct shaders, "
                       "and whether each value came from the shader literal table or fell back to "
@@ -481,6 +486,44 @@ uint32_t ShaderCache::ResolveConstants(const uint8_t* base, uint32_t guest_devic
     count = e.remapCount;
     for (uint32_t i = 0; i < count; ++i) {
       read_register(g_nx1Sm3ConstantRemap[e.remapOffset + i], &staging[i * 4]);
+    }
+  }
+
+  // Report what ONE host register of ONE shader actually receives. The c252-c255 probe above is
+  // fixed to the literal window; this answers the general question, which is what a shader
+  // disassembly actually raises ("colour = r0 * c8.w + r4 -- so what is c8.w?").
+  //
+  // Host vs guest matters: the translated shader indexes HOST registers, and the remap decides
+  // which guest register fills each one, so reporting a guest value against a host index would be
+  // meaningless. Report both, plus whether the shader s the register itself -- a def is
+  // supplied by the shader and our upload deliberately skips it, so the staging value would not
+  // be what the shader sees.
+  if (const uint32_t obj = REXCVAR_GET(nx1_d3d9_dbg_const_obj);
+      obj && shader_object == obj) {
+    const uint32_t hostreg = REXCVAR_GET(nx1_d3d9_dbg_const_reg);
+    static std::mutex cm;
+    static uint32_t last_obj = 0, last_reg = 0xFFFFFFFFu;
+    std::lock_guard<std::mutex> clk(cm);
+    if (last_obj != obj || last_reg != hostreg) {
+      last_obj = obj;
+      last_reg = hostreg;
+      const bool uncompacted = (e.flags & NX1_SM3_UNCOMPACTED_CONSTANTS) != 0;
+      const uint32_t guestreg =
+          uncompacted ? hostreg
+          : (hostreg < e.remapCount ? g_nx1Sm3ConstantRemap[e.remapOffset + hostreg] : 0xFFFFFFFFu);
+      const bool is_def = hostreg < 256 && (shader.def_mask[hostreg >> 5] & (1u << (hostreg & 31)));
+      if (hostreg < count) {
+        const float* v = &staging[hostreg * 4];
+        REXGPU_INFO("nx1_d3d9: CONSTPROBE {} obj={:08X} host c{} = {} {} {} {} | guest c{} "
+                    "remapCount={} def={} ({})",
+                    pixel_stage ? "PS" : "VS", obj, hostreg, v[0], v[1], v[2], v[3], guestreg,
+                    e.remapCount, is_def ? 1 : 0,
+                    is_def ? "SHADER-SUPPLIED def, our upload skips it" : "uploaded by us");
+      } else {
+        REXGPU_INFO("nx1_d3d9: CONSTPROBE {} obj={:08X} host c{} is OUTSIDE the uploaded window "
+                    "(count={}, remapCount={}, def={}) -- the shader reads whatever is left there",
+                    pixel_stage ? "PS" : "VS", obj, hostreg, count, e.remapCount, is_def ? 1 : 0);
+      }
     }
   }
 
