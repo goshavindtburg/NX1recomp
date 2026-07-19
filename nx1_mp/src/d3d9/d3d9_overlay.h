@@ -54,6 +54,10 @@ class Overlay {
   Overlay& operator=(const Overlay&) = delete;
 
   void DrawPanels();
+  /// The shader picker: click any surface and it names the material and microcode hash that
+  /// drew it. Replaces bisecting material indices by hand, which is how the glass shader was
+  /// found and cost most of a day.
+  void DrawPicker();
   /// The cvar/TOML editor, rebuilt against our own ImGui context. The SDK's SettingsDialog
   /// cannot be reused directly: it is an ImGuiDialog, and ImGuiDialog::GetIO switches the
   /// current ImGui context to the drawer's, which would fight ours mid-frame. Only the
@@ -65,6 +69,12 @@ class Overlay {
   std::string selected_category_;
   bool show_settings_ = true;
   bool show_diagnostics_ = true;
+
+  bool picker_visible_ = false;
+  /// The game hides and re-centres the cursor every frame, so releasing it once is not enough --
+  /// it has to be re-asserted while the picker is open, and restored exactly once on close.
+  bool cursor_released_ = false;
+  bool pick_awaiting_ = false;
 
   static LRESULT CALLBACK WndProcThunk(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 

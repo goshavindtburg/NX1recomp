@@ -135,6 +135,33 @@ class Renderer {
   /// record. Returns false when resolution found no usable pair -- the draw must be skipped.
   bool BindShadersAndConstants(const RecordedDraw& d);
 
+  //--- Shader picker ---------------------------------------------------------
+  /// One draw that covered the picked pixel.
+  struct PickResult {
+    uint32_t ps_object;
+    uint32_t vs_object;
+    uint64_t ps_hash;
+    uint32_t pixels;
+    uint32_t draw_index;
+  };
+
+  /// Ask for a pick at a WINDOW-space pixel on the next frame. The frame it runs on renders
+  /// only a small box around that pixel (the scissor is clamped so the occlusion queries measure
+  /// coverage there) -- one odd-looking frame, then normal.
+  void RequestPick(int x, int y);
+
+ private:
+  /// Bracket one draw in an occlusion query while a pick is armed. EVERY draw path must use
+  /// these: a path without them is invisible to the picker, and a surface drawn through it can
+  /// never be identified -- which reads as "the picker returned the wrong thing".
+  IDirect3DQuery9* PickBegin(const RecordedDraw& d);
+  void PickEnd(IDirect3DQuery9* q);
+
+ public:
+  bool pick_pending() const { return pick_requested_ || pick_active_; }
+  /// Draws that covered the picked pixel, in submission order. The LAST entry is frontmost.
+  const std::vector<PickResult>& pick_results() const { return pick_results_; }
+
   /// Record-time half: hash the guest's microcode, look up the SM3 translations, and RESOLVE
   /// the constant values into the frame's pool. Must run on the guest thread -- the PM4 ring and
   /// the shader literals it reads are both transient (see ShaderCache::ResolveConstants).
@@ -300,6 +327,31 @@ class Renderer {
   uint32_t last_sig_mask_ = 0;
   uint64_t last_sig_surface_ = 0;
   bool last_sig_valid_ = false;
+  /// Set by ApplyRenderStates when the debug selection matches and dbg_hide_matched is on; the
+  /// draw sites return early on it. Reset per draw, so it never leaks to the next one.
+  /// Frame counter for the blinking picker highlight.
+  uint32_t highlight_frame_ = 0;
+  bool hide_draw_ = false;
+  bool hide_reported_ = false;
+
+  //--- Shader picker ---------------------------------------------------------
+  /// "What am I looking at?" For one armed frame the scissor is clamped to a small box at the
+  /// crosshair and every draw is wrapped in an occlusion query, so any draw reporting non-zero
+  /// pixels covered that box. Beats bisecting material indices by hand, which is how the glass
+  /// shader was found and cost most of a day.
+  struct PickEntry {
+    uint32_t ps_object;
+    uint32_t vs_object;
+    uint64_t ps_hash;
+  };
+  bool pick_active_ = false;
+  bool pick_requested_ = false;
+  int pick_x_ = 0, pick_y_ = 0;
+  RECT pick_box_{};
+  std::vector<IDirect3DQuery9*> pick_queries_;
+  std::vector<PickEntry> pick_entries_;
+  std::vector<PickResult> pick_results_;
+  size_t pick_count_ = 0;
   uint64_t prof_bind_skips_ = 0;
   uint64_t prof_bind_calls_ = 0;
 

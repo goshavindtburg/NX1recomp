@@ -1,5 +1,9 @@
 #include "d3d9_overlay.h"
 
+#include <windowsx.h>  // GET_X_LPARAM / GET_Y_LPARAM
+
+#include "d3d9_renderer.h"
+
 #ifdef _WIN32
 
 #include <rex/cvar.h>
@@ -33,6 +37,13 @@ REXCVAR_DECLARE(bool, nx1_d3d9_fast_detile);
 REXCVAR_DECLARE(bool, nx1_d3d9_commit_textures);
 REXCVAR_DECLARE(bool, nx1_d3d9_texture_mirror);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_texdump);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_hide_matched);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_highlight_ps);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_solo_ps);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_blend_ps);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_pick_size);
+REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_ox);
+REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_oy);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam,
@@ -46,6 +57,8 @@ namespace {
 /// ImmediateDrawer into a swapchain our PresentEx covers, so its F4 toggles something that
 /// can never be seen anyway.
 constexpr int kToggleKey = VK_F4;
+// F3 matches the ReXGlue D3D12 side, where F3 is already the debug key.
+constexpr int kPickerKey = VK_F3;
 }  // namespace
 
 Overlay& Overlay::Get() {
@@ -138,8 +151,40 @@ LRESULT CALLBACK Overlay::WndProcThunk(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     self.visible_ = !self.visible_;
     return 0;  // never let the toggle itself reach the game
   }
+  if (msg == WM_KEYDOWN && int(wparam) == kPickerKey) {
+    self.picker_visible_ = !self.picker_visible_;
+    return 0;
+  }
 
-  if (self.initialized_ && self.visible_) {
+  // While the picker is open the game must not see the mouse AT ALL. It re-hides the cursor and
+  // re-centres it for mouselook in response to these messages, so merely calling ShowCursor
+  // alongside it just fights a battle that restarts every frame. Swallowing them stops the
+  // recentring at its source, which is what actually frees the pointer.
+  if (self.initialized_ && self.picker_visible_) {
+    // WM_INPUT (raw mouse deltas) is NOT in the WM_MOUSEFIRST..WM_MOUSELAST range, so intercepting
+    // that range alone left mouselook fully working -- the game reads its deltas from raw input
+    // and never needed WM_MOUSEMOVE at all. Swallowing WM_INPUT is what actually stops the camera.
+    // The OS cursor still moves normally from here, since raw input does not drive it.
+    const bool mouse_msg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || msg == WM_MOUSEHOVER ||
+                           msg == WM_MOUSELEAVE || msg == WM_SETCURSOR || msg == WM_INPUT;
+    if (mouse_msg) {
+      if (msg == WM_INPUT) {
+        return 0;  // deltas dropped: no mouselook while picking
+      }
+      if (msg == WM_SETCURSOR) {
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        return TRUE;  // claim it, or the game resets the cursor to its own (hidden) one
+      }
+      ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
+      if (msg == WM_LBUTTONDOWN && !ImGui::GetIO().WantCaptureMouse) {
+        Renderer::Get().RequestPick(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+        self.pick_awaiting_ = true;
+      }
+      return 0;  // never reaches the game: no mouselook, no recentre, no re-hide
+    }
+  }
+
+  if (self.initialized_ && (self.visible_ || self.picker_visible_)) {
     ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
     // Swallow only what ImGui actually wants. Anything else still reaches the game, so the
     // overlay being open does not freeze the rest of the input.
@@ -312,6 +357,149 @@ void Overlay::DrawSettings() {
   ImGui::TextDisabled("(%s)", cfg.filename().string().c_str());
 }
 
+void Overlay::DrawPicker() {
+  // The game re-hides and re-centres the cursor every frame, so this has to be re-asserted
+  // while the picker is open rather than done once on the toggle.
+  // Safe to manage the cursor now: with mouse messages swallowed the game no longer re-hides it.
+  if (picker_visible_) {
+    ClipCursor(nullptr);  // re-asserted per frame: the game re-clips from its own update loop
+    if (!cursor_released_) {
+      while (ShowCursor(TRUE) < 0) {
+      }
+      cursor_released_ = true;
+    }
+  }
+  if (!picker_visible_ && cursor_released_) {
+    while (ShowCursor(FALSE) >= 0) {
+    }
+    cursor_released_ = false;
+  }
+  if (!picker_visible_) {
+    return;
+  }
+
+  ImGui::SetNextWindowSize(ImVec2(620, 300), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowPos(ImVec2(20, 700), ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("Shader picker (F3)", &picker_visible_)) {
+    ImGui::End();
+    return;
+  }
+
+  ImGui::TextWrapped(
+      "CLICK any surface to identify the shader that drew it. The nearest hit is highlighted in "
+      "WIREFRAME automatically -- if that is not the surface you wanted, 'highlight' the other "
+      "rows until the right one lights up. Nearest means nearest IN DEPTH, so a decal or overlay "
+      "in front of your target will win.");
+  ImGui::SetNextItemWidth(120.0f);
+  int box = int(REXCVAR_GET(nx1_d3d9_dbg_pick_size));
+  if (ImGui::InputInt("box size (px)", &box)) {
+    REXCVAR_SET(nx1_d3d9_dbg_pick_size, uint32_t(box < 1 ? 1 : box));
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("(1-2 to separate touching surfaces)");
+
+  ImGui::Separator();
+
+  Renderer& r = Renderer::Get();
+  if (pick_awaiting_ && !r.pick_pending()) {
+    pick_awaiting_ = false;
+    if (!r.pick_results().empty()) {
+      REXCVAR_SET(nx1_d3d9_dbg_highlight_ps, r.pick_results().back().ps_object);
+    }
+  }
+  if (pick_awaiting_) {
+    ImGui::TextUnformatted("picking...");
+  }
+
+  const auto& hits = r.pick_results();
+  if (hits.empty()) {
+    ImGui::TextDisabled("No pick yet.");
+  } else {
+    // Only the frontmost matters almost always -- it is the surface you aimed at. The rest is
+    // everything the pixel was drawn through (sky, terrain, decals, post) and is noise unless
+    // you are specifically chasing overdraw, so it is collapsed by default.
+    static bool show_all = true;
+    ImGui::Text("%zu draw(s) covered the pixel", hits.size());
+    ImGui::SameLine();
+    ImGui::Checkbox("show all", &show_all);
+    ImGui::TextDisabled("Nearest first. Deeper entries are what the surface was drawn over.");
+    ImGui::Spacing();
+    // FRONTMOST FIRST. It was last, which put the one entry that matters below the fold as soon
+    // as the list scrolled -- so the visible rows were the skybox and whatever was drawn behind,
+    // and 'hide this' on those looked like the picker returning the wrong material.
+    const size_t shown = show_all ? hits.size() : 1;
+    for (size_t n = 0; n < shown; ++n) {
+      const size_t i = hits.size() - 1 - n;
+      const auto& h = hits[i];
+      const bool front = (n == 0);
+      ImGui::PushStyleColor(ImGuiCol_Text, front ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
+                                                 : ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+      ImGui::Text("%s draw #%u  px=%u  ps=%08X  vs=%08X", front ? "->" : "  ", h.draw_index,
+                  h.pixels, h.ps_object, h.vs_object);
+      ImGui::PopStyleColor();
+      ImGui::SameLine();
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "ucode 0x%016llX",
+                    static_cast<unsigned long long>(h.ps_hash));
+      ImGui::TextDisabled("%s", buf);
+      // Everything needed to act on the result, without hand-converting hex -- which cost a
+      // round earlier: dbg_oc0_lo32 is DECIMAL and the dump file is named in hex.
+      ImGui::PushID(int(i));
+      std::snprintf(buf, sizeof(buf), "%u", uint32_t(h.ps_hash & 0xFFFFFFFFull));
+      if (ImGui::Button("copy dbg_oc0_lo32")) {
+        ImGui::SetClipboardText(buf);
+      }
+      ImGui::SameLine();
+      ImGui::TextUnformatted(buf);
+      ImGui::SameLine();
+      std::snprintf(buf, sizeof(buf), "shader_%016llX.ucode.frag",
+                    static_cast<unsigned long long>(h.ps_hash));
+      if (ImGui::Button("copy dump name")) {
+        ImGui::SetClipboardText(buf);
+      }
+      // VERIFY the pick before acting on it. "Frontmost" is a heuristic -- a decal, a
+      // transparent overlay or a neighbouring surface inside the box can all end up last -- and
+      // probing the wrong material reads as "the probe changed nothing", which is
+      // indistinguishable from a real negative result.
+      // Highlight is the primary confirmation: wireframe shows WHICH surface this row is
+      // without removing it, so the scene stays readable while you step through the hits.
+      ImGui::SameLine();
+      const bool lit = REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) == h.ps_object;
+      if (ImGui::Button(lit ? "unhighlight" : "highlight")) {
+        REXCVAR_SET(nx1_d3d9_dbg_highlight_ps, lit ? 0u : h.ps_object);
+      }
+      ImGui::SameLine();
+      const bool solo = REXCVAR_GET(nx1_d3d9_dbg_solo_ps) == h.ps_object;
+      if (ImGui::Button(solo ? "unsolo" : "SOLO")) {
+        REXCVAR_SET(nx1_d3d9_dbg_solo_ps, solo ? 0u : h.ps_object);
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Draw ONLY this material. The clearest way to see which surface a hit "
+                          "is -- everything else vanishes.");
+      }
+      ImGui::SameLine();
+      const bool hidden = REXCVAR_GET(nx1_d3d9_dbg_hide_matched) != 0 &&
+                          REXCVAR_GET(nx1_d3d9_dbg_blend_ps) == h.ps_object;
+      if (ImGui::Button(hidden ? "show again" : "hide this")) {
+        if (hidden) {
+          REXCVAR_SET(nx1_d3d9_dbg_hide_matched, 0u);
+          REXCVAR_SET(nx1_d3d9_dbg_blend_ps, 0u);
+        } else {
+          REXCVAR_SET(nx1_d3d9_dbg_blend_ps, h.ps_object);
+          REXCVAR_SET(nx1_d3d9_dbg_hide_matched, 1u);
+        }
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Hides every draw using this material. If the surface you aimed at "
+                          "does not disappear, this is not its shader.");
+      }
+      ImGui::PopID();
+      ImGui::Separator();
+    }
+  }
+  ImGui::End();
+}
+
 void Overlay::DrawPanels() {
   ImGui::SetNextWindowSize(ImVec2(780, 660), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
@@ -461,13 +649,20 @@ void Overlay::DrawPanels() {
 }
 
 void Overlay::Render() {
-  if (!initialized_ || !visible_ || !device_objects_valid_) {
+  // The picker is independent of the F4 settings panel: either one being open is reason to run
+  // a frame. DrawPicker also owns releasing/restoring the cursor, so it must still be called on
+  // the frame the picker is turned OFF -- hence it runs whenever the cursor is still released.
+  const bool want_frame = visible_ || picker_visible_ || cursor_released_;
+  if (!initialized_ || !want_frame || !device_objects_valid_) {
     return;
   }
   ImGui_ImplDX9_NewFrame();
   ImGui_ImplWin32_NewFrame();
   ImGui::NewFrame();
-  DrawPanels();
+  if (visible_) {
+    DrawPanels();
+  }
+  DrawPicker();
   ImGui::EndFrame();
   ImGui::Render();
   // imgui_impl_dx9 brackets this in a D3D9 state block, so nothing it sets leaks into the

@@ -520,9 +520,13 @@ void ShaderCache::PollDebugRebuild() {
                   oc0_at_watch, REXCVAR_GET(nx1_d3d9_dbg_oc0_swz), map->size());
       last_at = oc0_at_watch;
       uint32_t matched = 0, rewritten = 0;
+      const uint32_t dump_lo = REXCVAR_GET(nx1_d3d9_dbg_dump_sm3_lo32);
       for (auto& [hash, sh] : *map) {
         const uint32_t lo32 = uint32_t(hash & 0xFFFFFFFFu);
-        if ((lo32 != last_lo && lo32 != oc0_lo) || !sh.entry ||
+        // The DUMP target is its own selection: gating it behind the oC0 probe's filter meant a
+        // shader could only be dumped once that probe had already been pointed at it, which is
+        // backwards -- the dump is how you find the offsets the probe needs.
+        if ((lo32 != last_lo && lo32 != oc0_lo && lo32 != dump_lo) || !sh.entry ||
             !(sh.entry->flags & NX1_SM3_PIXEL_SHADER)) {
           continue;
         }

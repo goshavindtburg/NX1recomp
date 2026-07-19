@@ -24,6 +24,7 @@
 #include "d3d9_constants.h"
 #include "d3d9_resources.h"
 #include "d3d9_shaders.h"
+#include "nx1_sm3_shader_cache.h"
 #include "guest_d3d.h"
 
 REXCVAR_DEFINE_BOOL(nx1_d3d9, false, "GPU",
@@ -78,6 +79,40 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_ps, 0, "GPU",
 /// loaded fastfile, so their ADDRESSES are stable across launches -- which is what makes a range
 /// search valid here when an index search would not be (discovery order shifts every run, and that
 /// has already produced one retracted conclusion in this investigation).
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pick, 0, "GPU",
+                      "Debug: set to 1 while pointing at a surface. For ONE frame the scissor is "
+                      "clamped to a box at the screen centre and every draw is wrapped in an "
+                      "occlusion query; the draws that covered that box are logged with their "
+                      "material and microcode hash, last line = frontmost. Auto-disarms. That "
+                      "frame renders only the centre box -- expected, not a fault");
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_pick_ox, 0, "GPU",
+                     "Debug: horizontal offset of the pick point from the screen centre, in "
+                     "pixels. In a first-person game the VIEWMODEL occupies the centre, so an "
+                     "unoffset pick returns the weapon rather than what you are aiming at");
+REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_pick_oy, 0, "GPU",
+                     "Debug: vertical offset of the pick point from the screen centre");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pick_size, 8, "GPU",
+                      "Debug: side length in pixels of the picker box at the screen centre");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_solo_ps, 0, "GPU",
+                      "Debug: draw ONLY this pixel-shader object -- everything else is skipped. "
+                      "Wireframe highlighting a large flat surface shows just an outline and one "
+                      "diagonal, which is easy to miss; solo is unambiguous");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_highlight_ps, 0, "GPU",
+                      "Debug: draw this pixel-shader object in WIREFRAME so it is unmistakable on "
+                      "screen. Lets a pick be confirmed by eye before anything is probed -- the "
+                      "nearest draw at a pixel is often a decal or overlay rather than the "
+                      "surface, and probing the wrong material reads as a false negative");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_hide_matched, 0, "GPU",
+                      "Debug: SKIP every draw the blend-isolate selection matches (ps / ps_lo-hi "
+                      "/ idx_lo-hi) instead of overriding its blend. Blend overrides can only mark "
+                      "a material that blends, so they cannot identify an opaque world surface; "
+                      "hiding works for anything. Binary-search idx_lo/idx_hi and watch for the "
+                      "surface to vanish -- ~9 steps over 500 materials");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_blend_idx_lo, 0, "GPU",
                       "Debug: with idx_hi, restrict the blend isolate to BLENDPS discovery "
                       "indices [lo, hi). Indices are stable within a session, so a whole "
@@ -105,6 +140,12 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_opaque_ps, 0, "GPU",
                       "what the shader writes is shown verbatim. Required alongside the oC0 "
                       "register probe: under the premultiplied blend a register whose .w is 0 "
                       "turns the draw additive and reads as white whatever its colour is");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_nomips, 0, "GPU",
+                      "Debug: force MIPFILTER=NONE on every sampler, so only level 0 is ever "
+                      "sampled. The confetti speckle is distance-dependent and level 0 is "
+                      "measured clean, so if the speckle vanishes here it is coming from the mip "
+                      "chain (which we GENERATE on the host) rather than from the guest texels");
 
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipclamp_ps, 0, "GPU",
                       "Debug: pixel-shader object whose sampler mips to clamp");
@@ -439,6 +480,46 @@ void Renderer::Shutdown() {
   hwnd_ = nullptr;
 }
 
+IDirect3DQuery9* Renderer::PickBegin(const RecordedDraw& d) {
+  if (!pick_active_) {
+    return nullptr;
+  }
+  // Re-assert per draw. ApplyRenderStates / the guest's own state can clear SCISSORTESTENABLE,
+  // and with the scissor gone each query counts the draw's whole coverage -- which is why a
+  // single click once reported over a thousand "hits".
+  device_->SetScissorRect(&pick_box_);
+  device_->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+  if (pick_count_ >= pick_queries_.size()) {
+    IDirect3DQuery9* q = nullptr;
+    if (SUCCEEDED(device_->CreateQuery(D3DQUERYTYPE_OCCLUSION, &q))) {
+      pick_queries_.push_back(q);
+      pick_entries_.emplace_back();
+    }
+  }
+  if (pick_count_ >= pick_queries_.size()) {
+    return nullptr;
+  }
+  IDirect3DQuery9* q = pick_queries_[pick_count_];
+  pick_entries_[pick_count_] = {d.ps_object, d.vs_object,
+                                d.ps && d.ps->entry ? d.ps->entry->hash : 0ull};
+  q->Issue(D3DISSUE_BEGIN);
+  return q;
+}
+
+void Renderer::PickEnd(IDirect3DQuery9* q) {
+  if (q) {
+    q->Issue(D3DISSUE_END);
+    ++pick_count_;
+  }
+}
+
+void Renderer::RequestPick(int x, int y) {
+  std::lock_guard<std::mutex> lock(render_mutex_);
+  pick_x_ = x;
+  pick_y_ = y;
+  pick_requested_ = true;
+}
+
 void Renderer::BeginFrame() {
   std::lock_guard<std::mutex> lock(render_mutex_);
   if (shutting_down_.load(std::memory_order_acquire) || !device_) {
@@ -449,7 +530,32 @@ void Renderer::BeginFrame() {
   // Debug shader probes rebuild here rather than in ShaderCache::Lookup, which shader_memo_
   // short-circuits: once a shader is memoised Lookup stops being called, so changing a probe
   // cvar did nothing while the screen kept showing the previous mode.
+  ++highlight_frame_;
   ShaderCache::Get().PollDebugRebuild();
+
+  // Arm the shader picker for exactly this frame.
+  if ((pick_requested_ || REXCVAR_GET(nx1_d3d9_dbg_pick)) && !pick_active_) {
+    D3DVIEWPORT9 vp{};
+    if (SUCCEEDED(device_->GetViewport(&vp))) {
+      const LONG half = LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_size) ? REXCVAR_GET(nx1_d3d9_dbg_pick_size) : 8) / 2;
+      // A requested pick centres on the clicked pixel; the cvar path falls back to screen centre.
+      const LONG cx = pick_requested_ ? LONG(pick_x_)
+                                      : LONG(vp.X + vp.Width / 2) +
+                                            LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_ox));
+      const LONG cy = pick_requested_ ? LONG(pick_y_)
+                                      : LONG(vp.Y + vp.Height / 2) +
+                                            LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_oy));
+      pick_box_ = RECT{cx - half, cy - half, cx + half + 1, cy + half + 1};
+      device_->SetScissorRect(&pick_box_);
+      device_->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+      pick_active_ = true;
+      pick_requested_ = false;
+      pick_count_ = 0;
+      pick_results_.clear();
+      REXGPU_INFO("nx1_d3d9: PICK armed -- box {}x{} at ({}, {})", half * 2 + 1, half * 2 + 1, cx,
+                  cy);
+    }
+  }
   device_->BeginScene();
 
   // Nothing is cleared here. NX1 clears its colour and depth buffers through
@@ -467,6 +573,39 @@ void Renderer::Present() {
   // THE synchronisation point. Everything below -- the display blit, the overlay, PresentEx --
   // runs on the guest thread with the worker idle, which is why none of them needed queueing.
   DrainWorker();
+
+  // Shader picker readback, before EndScene so the queries are certainly issued. Occlusion
+  // queries count pixels that passed depth AND stencil, so with the scissor clamped to the
+  // crosshair box a non-zero result means "this draw is visible there" -- overdraw means several
+  // can report, and the LAST one is the frontmost.
+  if (pick_active_) {
+    uint32_t hits = 0;
+    for (size_t i = 0; i < pick_count_ && i < pick_queries_.size(); ++i) {
+      DWORD pixels = 0;
+      HRESULT hr;
+      for (int spin = 0; (hr = pick_queries_[i]->GetData(&pixels, sizeof(pixels),
+                                                         D3DGETDATA_FLUSH)) == S_FALSE &&
+                         spin < 10000;
+           ++spin) {
+      }
+      if (hr != S_OK || pixels == 0) continue;
+      ++hits;
+      const PickEntry& e = pick_entries_[i];
+      pick_results_.push_back({e.ps_object, e.vs_object, e.ps_hash, uint32_t(pixels), uint32_t(i)});
+      REXGPU_INFO("nx1_d3d9: PICK hit draw #{} pixels={} ps={:08X} vs={:08X} ucode=0x{:016X} "
+                  "-- dbg_oc0_lo32={} , shader_{:016X}.ucode.frag",
+                  i, pixels, e.ps_object, e.vs_object, e.ps_hash,
+                  uint32_t(e.ps_hash & 0xFFFFFFFFu), e.ps_hash);
+    }
+    REXGPU_INFO("nx1_d3d9: PICK done -- {} of {} draws covered the box; the LAST hit above is "
+                "the frontmost surface",
+                hits, pick_count_);
+    device_->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    pick_active_ = false;
+    pick_count_ = 0;
+    REXCVAR_SET(nx1_d3d9_dbg_pick, 0u);
+  }
+
   device_->EndScene();
 
   // Copy the frame the guest resolved to its display buffer onto the backbuffer. The
@@ -1685,6 +1824,39 @@ void Renderer::SetRenderStateCached(D3DRENDERSTATETYPE state, uint32_t value) {
 }
 
 void Renderer::ApplyRenderStates(const RecordedDraw& d) {
+  // Hide by MATERIAL IDENTITY, independent of the blend-isolate filter below. That filter only
+  // arms when a blend factor is specified, so hanging this off it meant an opaque material could
+  // never be hidden -- and "nothing disappeared" reads as "wrong material" rather than "the
+  // control does not apply here", which is the worse of the two failures.
+  hide_draw_ = false;
+  // Wireframe highlight. Set per draw rather than only on a match, or the state would leak to
+  // every following draw once one material matched.
+  // Highlight = wireframe, BLINKING. Two lessons are baked in here. Holding wireframe on is
+  // destructive when the picked material happens to be a full-screen composite pass: the final
+  // image never gets painted, the previous frame persists, and the overlay smears over it.
+  // Blinking keeps the frame correct half the time while still being impossible to miss. And
+  // FILLMODE is set on EVERY draw, both branches -- setting a state only for the matching draw
+  // leaves it applied to every draw after it.
+  const bool lit = REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) != 0 &&
+                   d.ps_object == REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) &&
+                   ((highlight_frame_ / 12u) & 1u) != 0;
+  SetRenderStateCached(D3DRS_FILLMODE, lit ? D3DFILL_WIREFRAME : D3DFILL_SOLID);
+  if (const uint32_t solo_ps = REXCVAR_GET(nx1_d3d9_dbg_solo_ps);
+      solo_ps && d.ps_object != solo_ps) {
+    hide_draw_ = true;
+    return;
+  }
+  if (const uint32_t hide_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps);
+      hide_ps && REXCVAR_GET(nx1_d3d9_dbg_hide_matched) && d.ps_object == hide_ps) {
+    if (!hide_reported_) {
+      hide_reported_ = true;
+      REXGPU_INFO("nx1_d3d9: HIDEMATCH hiding ps={:08X} -- if the surface you aimed at just "
+                  "disappeared, this is its material",
+                  hide_ps);
+    }
+    hide_draw_ = true;
+    return;
+  }
   // Depth. NX1 renders reverse-Z, so the guest's stored zfunc is GREATER_EQUAL --
   // we read it rather than hardcoding, so a draw that flips the test still works.
   const DepthState& depth = d.depth;
@@ -2154,8 +2326,11 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // point mip filter under linear/aniso minification leaves hard mip-level steps, visible as bands
     // sweeping across smooth gradients (the sky dome above all). Keep point mip only when the
     // minification itself is point (a deliberately crisp surface).
-    const D3DTEXTUREFILTERTYPE mip_filter =
+    D3DTEXTUREFILTERTYPE mip_filter =
         min_filter == D3DTEXF_POINT ? HostMipFilter(t.mip_filter) : D3DTEXF_LINEAR;
+    if (REXCVAR_GET(nx1_d3d9_dbg_nomips)) {
+      mip_filter = D3DTEXF_NONE;
+    }
     // Debug: refuse the top N mips of chosen slots on one material. The artifact under
     // investigation is distance-dependent -- saturated up close, merely speckled far away -- which
     // says the level sampled up close carries different data than the levels below it. Clamping
@@ -2576,6 +2751,7 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
 
   auto t_rs = ptick();
   ApplyRenderStates(d);
+  if (hide_draw_) return;
   padd(prof_states_ns_, t_rs);
 
   if (skip_draw_) {
@@ -2583,8 +2759,10 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
     return;
   }
   auto t_dr = ptick();
+  IDirect3DQuery9* pick_q = PickBegin(d);
   const HRESULT dhr = device_->DrawIndexedPrimitive(host_prim, int(base_vertex_index), 0,
                                                     vertex_count, start_index, prim_count);
+  PickEnd(pick_q);
   padd(prof_draw_ns_, t_dr);
   if (prof) {
     prof_last_draw_end_ = PClock::now();
@@ -2652,11 +2830,14 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
   }
   BindTextures(base, d);
   ApplyRenderStates(d);
+  if (hide_draw_) return;
   if (skip_draw_) {  // inline path: consume it too, or it leaks into the next indexed draw
     skip_draw_ = false;
     return;
   }
+  IDirect3DQuery9* pick_q = PickBegin(d);
   device_->DrawPrimitive(host_prim, start_vertex, prim_count);
+  PickEnd(pick_q);
   ++draws_submitted_;
 }
 
@@ -2720,13 +2901,16 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
 
   BindTextures(base, d);
   ApplyRenderStates(d);
+  if (hide_draw_) return;
   if (skip_draw_) {  // inline path: consume it too, or it leaks into the next indexed draw
     skip_draw_ = false;
     return;
   }
+  IDirect3DQuery9* pick_q = PickBegin(d);
   const HRESULT hr = device_->DrawIndexedPrimitiveUP(
       host_prim, 0, num_vertices, prim_count, indices.data(),
       index_size == 4 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, verts.data(), host_stride);
+  PickEnd(pick_q);
   if (SUCCEEDED(hr)) {
     ++draws_submitted_;
   }
@@ -2791,11 +2975,16 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
 
   BindTextures(base, d);
   ApplyRenderStates(d);
+  if (hide_draw_) return;
   if (skip_draw_) {  // inline path: consume it too, or it leaks into the next indexed draw
     skip_draw_ = false;
     return;
   }
-  if (SUCCEEDED(device_->DrawPrimitiveUP(host_prim, prim_count, verts.data(), host_stride))) {
+  IDirect3DQuery9* pick_q = PickBegin(d);
+  const bool up_ok =
+      SUCCEEDED(device_->DrawPrimitiveUP(host_prim, prim_count, verts.data(), host_stride));
+  PickEnd(pick_q);
+  if (up_ok) {
     ++draws_submitted_;
   }
   InvalidateVertexShadow();
