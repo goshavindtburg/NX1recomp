@@ -89,6 +89,30 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_force_zero_src_ps, 0, "GPU",
                       "Debug: force SRCBLEND=ZERO for draws using this pixel-shader object, so "
                       "only dst*(1-alpha) remains and the shader's real alpha becomes visible");
 
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_kill_sampler_ps, 0, "GPU",
+                      "Debug: pixel-shader object whose sampler slots to unbind (see "
+                      "dbg_kill_sampler_mask); a killed slot samples as zero");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_kill_sampler_mask, 0, "GPU",
+                      "Debug: bitmask of sampler slots to replace for dbg_kill_sampler_ps");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_kill_sampler_white, 0, "GPU",
+                      "Debug: 0 = unbind the killed slots (they sample as ZERO), 1 = bind 1x1 "
+                      "opaque WHITE instead. A shader that predicates on a sampled channel "
+                      "cannot be diagnosed by zeroing it -- zero is the suspected failure "
+                      "value -- so forcing the opposite is what separates the cases");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_opaque_ps, 0, "GPU",
+                      "Debug: force SRCBLEND=ONE/DESTBLEND=ZERO for this pixel-shader object, so "
+                      "what the shader writes is shown verbatim. Required alongside the oC0 "
+                      "register probe: under the premultiplied blend a register whose .w is 0 "
+                      "turns the draw additive and reads as white whatever its colour is");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipclamp_ps, 0, "GPU",
+                      "Debug: pixel-shader object whose sampler mips to clamp");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipclamp_mask, 0, "GPU",
+                      "Debug: bitmask of sampler slots to clamp for dbg_mipclamp_ps");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipclamp_level, 0, "GPU",
+                      "Debug: D3DSAMP_MAXMIPLEVEL for the clamped slots -- refuse mips above this");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_shaderid_n, 0, "GPU",
                       "Debug: log the microcode hash of the first N distinct pixel-shader "
                       "objects drawn. The hash names tools/new_shader_dump/shader_<HASH>.ucode.frag");
@@ -422,6 +446,10 @@ void Renderer::BeginFrame() {
   }
   // New frame: let the resource caches hash each texture/buffer at most once now.
   ResourceTracker::Get().AdvanceFrame();
+  // Debug shader probes rebuild here rather than in ShaderCache::Lookup, which shader_memo_
+  // short-circuits: once a shader is memoised Lookup stops being called, so changing a probe
+  // cvar did nothing while the screen kept showing the previous mode.
+  ShaderCache::Get().PollDebugRebuild();
   device_->BeginScene();
 
   // Nothing is cleared here. NX1 clears its colour and depth buffers through
@@ -1679,8 +1707,19 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
       force_ps && d.ps_object == force_ps) {
     host_src = D3DBLEND_ZERO;
   }
+  D3DBLEND host_dst = HostBlendFactor(blend.color_dst);
+  // Show what the shader writes, verbatim. Without this the oC0 register probe is unreadable:
+  // the material blends premultiplied (src.rgb + dst*(1-alpha)), so displaying a register whose
+  // .w happens to be ~0 makes the draw ADDITIVE and every such register reads as white no matter
+  // what its colour is -- which is exactly how four different registers all "came back white".
+  const bool dbg_opaque = REXCVAR_GET(nx1_d3d9_dbg_opaque_ps) != 0 &&
+                          d.ps_object == REXCVAR_GET(nx1_d3d9_dbg_opaque_ps);
+  if (dbg_opaque) {
+    host_src = D3DBLEND_ONE;
+    host_dst = D3DBLEND_ZERO;
+  }
   SetRenderStateCached(D3DRS_SRCBLEND, host_src);
-  SetRenderStateCached(D3DRS_DESTBLEND, HostBlendFactor(blend.color_dst));
+  SetRenderStateCached(D3DRS_DESTBLEND, host_dst);
   SetRenderStateCached(D3DRS_BLENDOP, HostBlendOp(blend.color_op));
   SetRenderStateCached(D3DRS_SRCBLENDALPHA, HostBlendFactor(blend.alpha_src));
   SetRenderStateCached(D3DRS_DESTBLENDALPHA, HostBlendFactor(blend.alpha_dst));
@@ -2040,6 +2079,19 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
   const uint32_t dump_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps);
   tracker.SetDumpDraw(dump_ps != 0, dump_ps != 0 && d.ps_object == dump_ps);
 
+  // Re-arm the KILLSAMPLER reporting when the selection changes, so the log always describes the
+  // mask that is actually live rather than the first one set this session.
+  if (const uint32_t kill_ps = REXCVAR_GET(nx1_d3d9_dbg_kill_sampler_ps),
+      kill_mask = REXCVAR_GET(nx1_d3d9_dbg_kill_sampler_mask);
+      kill_ps != kill_reported_ps_ || kill_mask != kill_reported_mask_) {
+    kill_reported_ps_ = kill_ps;
+    kill_reported_mask_ = kill_mask;
+    std::memset(kill_reported_, 0, sizeof(kill_reported_));
+    if (kill_ps && kill_mask) {
+      REXGPU_INFO("nx1_d3d9: KILLSAMPLER selection now ps={:08X} mask={:#x}", kill_ps, kill_mask);
+    }
+  }
+
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
     if (!(sampler_mask & (1u << sampler))) {
       continue;
@@ -2051,6 +2103,27 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
     const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(sampler));
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, t, sampler);
+    // Debug: unbind chosen sampler slots for ONE material, so a sample that is suspected of
+    // saturating the output can be removed and the result observed. A NULL texture reads as zero,
+    // which is a value the shader's own maths cannot produce from a real texture -- so if the
+    // artifact survives every slot being killed in turn, no sampled value causes it.
+    if (const uint32_t kill_ps = REXCVAR_GET(nx1_d3d9_dbg_kill_sampler_ps);
+        kill_ps && d.ps_object == kill_ps &&
+        (REXCVAR_GET(nx1_d3d9_dbg_kill_sampler_mask) & (1u << sampler))) {
+      // Mode 1 substitutes 1x1 opaque WHITE rather than unbinding. Unbinding samples as zero,
+      // which for a shader that predicates on a sampled channel is indistinguishable from the
+      // failure being investigated; white forces the opposite answer, so the two outcomes
+      // separate cleanly.
+      const bool use_white = REXCVAR_GET(nx1_d3d9_dbg_kill_sampler_white) != 0;
+      IDirect3DBaseTexture9* replacement = use_white ? tracker.WhiteTexture() : nullptr;
+      if (!kill_reported_[sampler]) {
+        kill_reported_[sampler] = true;
+        REXGPU_INFO("nx1_d3d9: KILLSAMPLER ps={:08X} slot={} -> {} (was {}, {}x{} fmt={})", kill_ps,
+                    sampler, use_white ? "1x1 WHITE" : "unbound/zero",
+                    static_cast<const void*>(tex), t.width, t.height, t.format);
+      }
+      tex = replacement;
+    }
     if (tex) {
       // For a static-geometry world draw, hold the highest-res texture this surface has shown and
       // substitute it when the engine swaps sampler to a receding (garbage) LOD -- see
@@ -2083,17 +2156,28 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // minification itself is point (a deliberately crisp surface).
     const D3DTEXTUREFILTERTYPE mip_filter =
         min_filter == D3DTEXF_POINT ? HostMipFilter(t.mip_filter) : D3DTEXF_LINEAR;
+    // Debug: refuse the top N mips of chosen slots on one material. The artifact under
+    // investigation is distance-dependent -- saturated up close, merely speckled far away -- which
+    // says the level sampled up close carries different data than the levels below it. Clamping
+    // says which level that is, and whether the chain below it is sound.
+    uint32_t mip_clamp = 0;
+    if (const uint32_t clamp_ps = REXCVAR_GET(nx1_d3d9_dbg_mipclamp_ps);
+        clamp_ps && d.ps_object == clamp_ps &&
+        (REXCVAR_GET(nx1_d3d9_dbg_mipclamp_mask) & (1u << sampler))) {
+      mip_clamp = REXCVAR_GET(nx1_d3d9_dbg_mipclamp_level);
+    }
     const uint32_t states[kSamplerStates] = {
         uint32_t(HostAddressMode(clamp.u)), uint32_t(HostAddressMode(clamp.v)),
         uint32_t(HostAddressMode(clamp.w)), uint32_t(HostFilter(t.mag_filter)),
         uint32_t(min_filter),               uint32_t(mip_filter),
         aniso,
         uint32_t(t.gamma ? TRUE : FALSE),
+        mip_clamp,
     };
     static constexpr D3DSAMPLERSTATETYPE kTypes[kSamplerStates] = {
         D3DSAMP_ADDRESSU,  D3DSAMP_ADDRESSV,  D3DSAMP_ADDRESSW,
         D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-        D3DSAMP_MAXANISOTROPY, D3DSAMP_SRGBTEXTURE,
+        D3DSAMP_MAXANISOTROPY, D3DSAMP_SRGBTEXTURE, D3DSAMP_MAXMIPLEVEL,
     };
     for (uint32_t i = 0; i < kSamplerStates; ++i) {
       if (states[i] != sampler_state_[sampler][i]) {

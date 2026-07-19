@@ -492,7 +492,7 @@ class Renderer {
   // D3DRS_COLORWRITEENABLE, none of which it restores), and silently desyncing the shadow
   // against it corrupted every later draw that happened to want the texture the shadow
   // still believed was bound.
-  static constexpr uint32_t kSamplerStates = 8;  ///< U, V, W address + mag, min, mip filter, aniso, sRGB
+  static constexpr uint32_t kSamplerStates = 9;  ///< U, V, W address + mag, min, mip filter, aniso, sRGB, mip clamp
   static constexpr uint32_t kSamplerStateUnset = ~0u;
   /// Clamped to the adapter's D3DCAPS9::MaxAnisotropy at device creation; 1 = no aniso.
   uint32_t max_anisotropy_ = 1;
@@ -500,6 +500,15 @@ class Renderer {
       reinterpret_cast<IDirect3DBaseTexture9*>(~uintptr_t(0));
   IDirect3DBaseTexture9* sampler_texture_[16];
   uint32_t sampler_state_[16][kSamplerStates];
+
+  /// One KILLSAMPLER line per slot, so the log proves the debug unbind actually fired on the
+  /// material rather than silently matching nothing (a filter that selects no draw reads exactly
+  /// like "killing this sampler changed nothing"). Re-armed whenever the mask or material changes,
+  /// so that toggling the cvar mid-session logs the NEW selection instead of staying silent and
+  /// leaving the previous run's lines looking current.
+  bool kill_reported_[16] = {};
+  uint32_t kill_reported_ps_ = 0;
+  uint32_t kill_reported_mask_ = 0;
 
   /// The bound shader pair and colour-write mask, shadowed on the same principle as the
   /// sampler state above: BindShadersAndConstants re-issued all three on EVERY draw, and at

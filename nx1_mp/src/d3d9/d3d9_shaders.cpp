@@ -38,6 +38,51 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_const_obj, 0, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_const_reg, 0, "GPU",
                       "Debug: HOST constant register index to report for dbg_const_obj");
 
+REXCVAR_DEFINE_UINT32(nx1_d3d9_orphan_texcoords, 0, "GPU",
+                      "Bitmask of pixel-shader TEXCOORD indices that no vertex shader produces. "
+                      "Reads of those inputs are rewritten to a constant instead of being left "
+                      "unbound and undefined by D3D9's semantic linkage");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_lo32, 0, "GPU",
+                      "Debug: for the shader whose microcode hash has these low 32 bits, force the "
+                      "final colour write to output dbg_oc0_reg instead of the shaded result");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_reg, 0, "GPU",
+                      "Debug: temp register index to display via dbg_oc0_lo32");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_force_branch, 0, "GPU",
+                      "Debug: for the dbg_oc0_lo32 shader, force the final colour select to one "
+                      "side -- 1 = always the first operand (the lit path), 2 = always the second "
+                      "(the fallback). Only the SELECTOR changes, so every colour and the alpha "
+                      "channel are still computed normally: this answers 'is the branch choice "
+                      "the bug' without disturbing the values the branch chooses between");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_type, 0, "GPU",
+                      "Debug: what dbg_oc0_reg names -- 0 = temp register rN, 1 = INPUT register "
+                      "vN (an interpolator). Lets a varying be displayed directly instead of "
+                      "inferred from the arithmetic that consumes it");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_neg, 0, "GPU",
+                      "Debug: negate the displayed value. A greyscale display clamps everything "
+                      "<= 0 to black, so zero and negative look identical -- and `cmp` treats "
+                      "0 >= 0 as TRUE while a negative fails, which is exactly the distinction "
+                      "that matters for a sign gate. Black normally + WHITE negated means the "
+                      "value is genuinely negative; black in both means it is zero");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_swz, 0, "GPU",
+                      "Debug: component to broadcast when displaying -- 0 = xyzw as colour, "
+                      "1/2/3/4 = x/y/z/w as greyscale. Needed to read a scalar such as a lerp "
+                      "factor, which is invisible in an xyzw display");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_oc0_at, 0, "GPU",
+                      "Debug: truncate the shader at the first instruction at or after this dword "
+                      "and output dbg_oc0_reg there. Registers are reused, so displaying one at "
+                      "the END of the shader shows a later value than the instruction under "
+                      "investigation consumed -- this reads it at the point that matters");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_orphan_paramgen, false, "GPU",
+                    "Treat an orphan pixel-shader input as the PARAM GEN register rather than an "
+                    "interpolator: substitute (0,0,0,0) as the reference does, not the "
+                    "interpolator default (0,0,0,1). The reference's signature shows this shader "
+                    "family uses SV_Position where ours invents a phantom TEXCOORD");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_literals, 0, "GPU",
                       "Debug: report what c252-c255 resolve to for the first N distinct shaders, "
                       "and whether each value came from the shader literal table or fell back to "
@@ -229,6 +274,411 @@ void CollectDefs(const DWORD* code, uint32_t dword_count, Sm3Shader& out) {
 }
 #endif
 
+/// Xenos routes interpolators POSITIONALLY: pixel-shader slot i reads whatever the vertex shader
+/// exported to o_i, and a slot the vertex shader never wrote reads the hardware default (0,0,0,1).
+/// D3D9 links by SEMANTIC instead, so a pixel-shader input whose TEXCOORDn has no producer is left
+/// unbound -- undefined contents, not the default.
+///
+/// Those orphans are systematic rather than incidental. The recompiler zero-initialises all 18 of
+/// Xenos's interpolators in every vertex shader precisely so unwritten ones read as the default,
+/// and the SM3 lowering then strips the ones that are only ever zero (SM3 offers 12 vertex outputs,
+/// not 18). So a semantic no vertex shader actually computes is orphaned for EVERY pairing, which
+/// is what makes this fixable here, on the pixel shader alone, without knowing the pair.
+///
+/// Rewrites reads of an orphan input to a `def` register that already holds both 0.0 and 1.0,
+/// remapping the swizzle per component so the shader still sees (0,0,0,1). Returns false (leaving
+/// `patched` untouched) when there is nothing to do or no usable def, so the caller uses the
+/// original bytecode.
+bool RewriteOrphanInputs(const DWORD* code, uint32_t dword_count, uint32_t texcoord_mask,
+                         std::vector<DWORD>& patched, uint32_t& reads_out) {
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51, kDcl = 0x1F;
+  constexpr uint32_t kInputRegType = 1, kConstRegType = 2;
+  constexpr uint32_t kUsageTexCoord = 5;
+
+  // Pass 1: the orphan input registers, and a def register carrying both 0.0 and 1.0.
+  uint32_t orphan_regs = 0;  // bit n = input register vn is an orphan
+  uint32_t def_reg = 0, comp_zero = 0, comp_one = 0;
+  bool have_def = false;
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (op == kDcl && len == 2 && i + 2 < dword_count) {
+      const DWORD usage_tok = code[i + 1], dst = code[i + 2];
+      const uint32_t type = ((dst >> 28) & 7) | ((dst >> 8) & 0x18);
+      const uint32_t reg = dst & 0x7FF;
+      if (type == kInputRegType && reg < 32 && (usage_tok & 0xF) == kUsageTexCoord) {
+        const uint32_t index = (usage_tok >> 16) & 0xF;
+        if (texcoord_mask & (1u << index)) orphan_regs |= 1u << reg;
+      }
+    } else if (!have_def && op == kDef && len == 5 && i + 5 < dword_count) {
+      float v[4];
+      std::memcpy(v, &code[i + 2], sizeof(v));
+      bool zero_found = false, one_found = false;
+      for (uint32_t c = 0; c < 4; ++c) {
+        // -0.0 reads as zero and is just as good a source for it.
+        if (!zero_found && v[c] == 0.0f) { comp_zero = c; zero_found = true; }
+        if (!one_found && v[c] == 1.0f) { comp_one = c; one_found = true; }
+      }
+      if (zero_found && one_found) {
+        def_reg = code[i + 1] & 0x7FF;
+        have_def = true;
+      }
+    }
+    i += 1 + len;
+  }
+  if (!orphan_regs || !have_def) return false;
+
+  // Pass 2: repoint every source read of an orphan at the def, mapping .xyz to the def's zero
+  // component and .w to its one -- the (0,0,0,1) the hardware would have supplied.
+  patched.assign(code, code + dword_count);
+  reads_out = 0;
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    // `def` holds raw floats and `dcl` holds a usage token, so neither has source parameters to
+    // walk; every other instruction's sources start one dword past its destination.
+    if (op != kDef && op != kDcl) {
+      for (uint32_t k = 2; k <= len && i + k < dword_count; ++k) {
+        const DWORD src = code[i + k];
+        const uint32_t type = ((src >> 28) & 7) | ((src >> 8) & 0x18);
+        const uint32_t reg = src & 0x7FF;
+        if (type != kInputRegType || reg >= 32 || !(orphan_regs & (1u << reg))) continue;
+        DWORD out = src;
+        out = (out & ~0x7FFu) | (def_reg & 0x7FF);
+        out = (out & ~(7u << 28)) | ((kConstRegType & 7u) << 28);
+        out = (out & ~(0x18u << 8)) | (((kConstRegType >> 3) & 3u) << 11);
+        // An interpolator the vertex shader never wrote reads (0,0,0,1) on Xenos, so .w maps to
+        // the def's 1.0. But the PARAM GEN register -- screen position, which the reference
+        // supplies from SV_Position -- is (pos.xy, 0, 0), so there .w is 0 like everything else.
+        // Which one an orphan actually is decides the value, and only one of them can be right.
+        const bool paramgen = REXCVAR_GET(nx1_d3d9_orphan_paramgen);
+        uint32_t swizzle = 0;
+        for (uint32_t c = 0; c < 4; ++c) {
+          const uint32_t sel = (src >> (16 + 2 * c)) & 3;
+          const uint32_t pick = (sel == 3 && !paramgen) ? comp_one : comp_zero;
+          swizzle |= (pick & 3u) << (2 * c);
+        }
+        out = (out & ~(0xFFu << 16)) | (swizzle << 16);
+        patched[i + k] = out;
+        ++reads_out;
+      }
+    }
+    i += 1 + len;
+  }
+  return reads_out != 0;
+}
+
+/// Repoint every source of the instruction that writes oC0 at one temp register, so the shader
+/// displays that register instead of its shaded result. Six hypotheses about this glass have now
+/// been wrong; rather than guess a seventh, make the shader show which intermediate is already
+/// saturated and bisect the ALU chain by eye.
+///
+/// The final write is a `cmp` (three sources) and every source is one dword, so rewriting them
+/// in place keeps the bytecode length identical -- no insertion, no relocation. Register type is
+/// forced to TEMP and the swizzle to .xyzw so the display is the raw register.
+bool RewriteColorOutput(const DWORD* code, uint32_t dword_count, uint32_t reg,
+                        std::vector<DWORD>& patched) {
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51, kDcl = 0x1F;
+  constexpr uint32_t kColorOutRegType = 8, kTempRegType = 0;
+  bool hit = false;
+  patched.assign(code, code + dword_count);
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (op != kDef && op != kDcl && len >= 2 && i + 1 < dword_count) {
+      const DWORD dst = code[i + 1];
+      const uint32_t dtype = ((dst >> 28) & 7) | ((dst >> 8) & 0x18);
+      if (dtype == kColorOutRegType && (dst & 0x7FF) == 0) {
+        for (uint32_t k = 2; k <= len && i + k < dword_count; ++k) {
+          DWORD s = code[i + k];
+          s = (s & ~0x7FFu) | (reg & 0x7FF);
+          s = (s & ~(7u << 28)) | ((kTempRegType & 7u) << 28);
+          s = (s & ~(0x18u << 8)) | (((kTempRegType >> 3) & 3u) << 11);
+          s = (s & ~(0xFFu << 16)) | (0xE4u << 16);  // .xyzw
+          s &= ~(0xFu << 24);                        // drop any source modifier
+          patched[i + k] = s;
+        }
+        hit = true;
+      }
+    }
+    i += 1 + len;
+  }
+  return hit;
+}
+
+/// Truncate the shader at the first instruction at or after `at_dword`, replacing it with
+/// `mov oC0, rN` followed by END. Gives the value of a register AT A POINT rather than at the end
+/// of the shader -- essential once registers are reused, because the final contents of a register
+/// are usually not what the instruction under investigation read from it.
+///
+/// ps_3_0 requires all four components of COLOR0 to be written, so the emitted mov is unmasked.
+bool RewriteEarlyOut(const DWORD* code, uint32_t dword_count, uint32_t reg, uint32_t at_dword,
+                     uint32_t reg_type, uint32_t swz, uint32_t negate,
+                     std::vector<DWORD>& patched, uint32_t& at_out) {
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE;
+  constexpr uint32_t kColorOutRegType = 8;
+  // swz 0 keeps .xyzw; 1..4 broadcast x/y/z/w so a scalar is readable as greyscale.
+  const uint32_t sel = swz ? (swz - 1u) & 3u : 0u;
+  const uint32_t swizzle = swz ? (sel | (sel << 2) | (sel << 4) | (sel << 6)) : 0xE4u;
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (i >= at_dword) {
+      if (i + 3 >= dword_count) return false;  // no room for mov + END
+      patched.assign(code, code + dword_count);
+      patched[i] = (2u << 24) | 1u;  // mov, length 2
+      // dst: oC0.xyzw -- type 8 splits as low3=0 (bits 28..30), high2=1 (bits 11..12)
+      patched[i + 1] = 0x80000000u | (0xFu << 16) | ((kColorOutRegType >> 3) << 11) | 0u;
+      // src: rN / vN, with the requested swizzle. Register type splits across bits 28..30 and
+      // 11..12 exactly as everywhere else in this file.
+      patched[i + 2] = 0x80000000u | (swizzle << 16) | ((reg_type & 7u) << 28) |
+                       (((reg_type >> 3) & 3u) << 11) | (reg & 0x7FF) |
+                       (negate ? (1u << 24) : 0u);  // source modifier 1 = negate
+      patched[i + 3] = kEnd;
+      at_out = i;
+      return true;
+    }
+    i += 1 + len;
+  }
+  return false;
+}
+
+// Defined below, next to the other bytecode rewrites; declared here because
+// PollDebugRebuild precedes them in this file.
+bool RewriteForceBranch(const DWORD* code, uint32_t dword_count, uint32_t side,
+                        std::vector<DWORD>& patched);
+
+void ShaderCache::PollDebugRebuild() {
+#ifdef NX1_HAVE_SM3_SHADER_CACHE
+  if (!shaders_ || !device_) {
+    return;
+  }
+  auto* map = static_cast<ShaderMap*>(shaders_);
+  // The oC0 probe rewrites bytecode at CREATE time, but a shader is created once and cached for
+  // the session -- so changing which register to display would otherwise do nothing until a
+  // restart, and the screen would keep showing the first register picked. Drop the probed
+  // shader whenever the selection changes so the next lookup rebuilds it, making the sweep
+  // usable from the overlay.
+  //
+  // The shader object is REPLACED IN PLACE rather than erased: Renderer::shader_memo_ caches the
+  // Sm3Shader* it got back, so removing the map node would leave that memo dangling.
+  {
+    static std::mutex om;
+    static uint32_t last_lo = 0, last_reg = 0xFFFFFFFFu, last_at = 0xFFFFFFFFu,
+                   last_mix = 0xFFFFFFFFu, last_dump = 0xFFFFFFFFu;
+    const uint32_t oc0_lo = REXCVAR_GET(nx1_d3d9_dbg_oc0_lo32);
+    const uint32_t oc0_reg = REXCVAR_GET(nx1_d3d9_dbg_oc0_reg);
+    // EVERY input the rewrite depends on has to be watched here, not just the register: leaving
+    // dbg_oc0_at out meant changing it rebuilt nothing and the screen kept showing the previous
+    // mode, while the log line said so and was not read.
+    const uint32_t oc0_at_watch = REXCVAR_GET(nx1_d3d9_dbg_oc0_at);
+    const uint32_t oc0_mix = (REXCVAR_GET(nx1_d3d9_dbg_oc0_neg) << 24) |
+                             (REXCVAR_GET(nx1_d3d9_dbg_force_branch) << 16) |
+                             (REXCVAR_GET(nx1_d3d9_dbg_oc0_type) << 8) |
+                             REXCVAR_GET(nx1_d3d9_dbg_oc0_swz);
+    // The dump cvar has to participate in change detection too, or toggling it does nothing.
+    const uint32_t dump_watch = REXCVAR_GET(nx1_d3d9_dbg_dump_sm3_lo32);
+    std::lock_guard<std::mutex> olk(om);
+    if (oc0_lo != last_lo || oc0_reg != last_reg || oc0_at_watch != last_at ||
+        oc0_mix != last_mix || dump_watch != last_dump) {
+      last_dump = dump_watch;
+      last_mix = oc0_mix;
+      // Announce the selection BEFORE acting on it, and count what matched. Silence here is
+      // ambiguous in the one way that has cost the most time today: "the cvar never changed",
+      // "the shader is not in the cache yet" and "the rewrite failed" all previously looked
+      // identical from the log, and each was misread as a result about the shader.
+      REXGPU_INFO("nx1_d3d9: OC0PROBE selection lo32={:#010x} {}{} at={} swz={} (cache holds {})",
+                  oc0_lo, REXCVAR_GET(nx1_d3d9_dbg_oc0_type) ? "v" : "r", oc0_reg,
+                  oc0_at_watch, REXCVAR_GET(nx1_d3d9_dbg_oc0_swz), map->size());
+      last_at = oc0_at_watch;
+      uint32_t matched = 0, rewritten = 0;
+      for (auto& [hash, sh] : *map) {
+        const uint32_t lo32 = uint32_t(hash & 0xFFFFFFFFu);
+        if ((lo32 != last_lo && lo32 != oc0_lo) || !sh.entry ||
+            !(sh.entry->flags & NX1_SM3_PIXEL_SHADER)) {
+          continue;
+        }
+        const auto* code = reinterpret_cast<const DWORD*>(bytecode_ + sh.entry->bytecodeOffset);
+        // Dump from HERE, not from Lookup: a shader is created once and then served from the
+        // cache (and the renderer's memo), so a dump that only runs on a cache miss can never be
+        // triggered again without a restart -- and a stale dump is worse than none, because every
+        // instruction offset read off it silently addresses the wrong instruction.
+        if (REXCVAR_GET(nx1_d3d9_dbg_dump_sm3_lo32) == lo32) {
+          char path[128];
+          std::snprintf(path, sizeof(path), "sm3_%016llX.bin",
+                        static_cast<unsigned long long>(hash));
+          if (FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(code, 1, sh.entry->bytecodeSize, f);
+            std::fclose(f);
+            REXGPU_INFO("nx1_d3d9: SM3DUMP wrote {} ({} bytes, {} dwords) from the LIVE cache",
+                        path, sh.entry->bytecodeSize, sh.entry->bytecodeSize / 4);
+          }
+        }
+        const DWORD* use = code;
+        std::vector<DWORD> shown;
+        uint32_t at = 0;
+        const uint32_t oc0_at = REXCVAR_GET(nx1_d3d9_dbg_oc0_at);
+        const uint32_t oc0_ty = REXCVAR_GET(nx1_d3d9_dbg_oc0_type);
+        const uint32_t oc0_sw = REXCVAR_GET(nx1_d3d9_dbg_oc0_swz);
+        const uint32_t force_side = REXCVAR_GET(nx1_d3d9_dbg_force_branch);
+        ++matched;
+        if (oc0_lo && lo32 == oc0_lo) {
+          const bool ok =
+              force_side ? RewriteForceBranch(code, sh.entry->bytecodeSize / 4, force_side, shown)
+              : oc0_at   ? RewriteEarlyOut(code, sh.entry->bytecodeSize / 4, oc0_reg, oc0_at,
+                                           oc0_ty, oc0_sw,
+                                           REXCVAR_GET(nx1_d3d9_dbg_oc0_neg), shown, at)
+                         : RewriteColorOutput(code, sh.entry->bytecodeSize / 4, oc0_reg, shown);
+          if (ok) {
+            use = shown.data();
+            ++rewritten;
+          } else {
+            REXGPU_WARN("nx1_d3d9: OC0PROBE rewrite FAILED for 0x{:016X} (at={} size={} dwords) "
+                        "-- shader left as-is",
+                        hash, oc0_at, sh.entry->bytecodeSize / 4);
+          }
+        }
+        IDirect3DPixelShader9* replacement = nullptr;
+        if (SUCCEEDED(device_->CreatePixelShader(use, &replacement))) {
+          if (sh.ps) sh.ps->Release();
+          sh.ps = replacement;
+          if (use == code) {
+            REXGPU_INFO("nx1_d3d9: OC0PROBE ps 0x{:016X} restored to its shaded result", hash);
+          } else if (REXCVAR_GET(nx1_d3d9_dbg_force_branch)) {
+            REXGPU_INFO("nx1_d3d9: OC0PROBE ps 0x{:016X} colour select FORCED to operand {} "
+                        "(values untouched)",
+                        hash, REXCVAR_GET(nx1_d3d9_dbg_force_branch));
+          } else if (oc0_at) {
+            REXGPU_INFO("nx1_d3d9: OC0PROBE ps 0x{:016X} truncated at dw{} -- displaying r{} "
+                        "AS OF THAT INSTRUCTION",
+                        hash, at, oc0_reg);
+          } else {
+            REXGPU_INFO("nx1_d3d9: OC0PROBE ps 0x{:016X} displaying r{} at end of shader", hash,
+                        oc0_reg);
+          }
+        }
+      }
+      if (oc0_lo && !matched) {
+        REXGPU_WARN("nx1_d3d9: OC0PROBE lo32={:#010x} matched NO shader in the cache -- the "
+                    "selection is wrong or that shader has not been used yet, so nothing on "
+                    "screen reflects this setting",
+                    oc0_lo);
+      } else if (oc0_lo && !rewritten) {
+        REXGPU_WARN("nx1_d3d9: OC0PROBE matched {} shader(s) but rewrote none", matched);
+      }
+      last_lo = oc0_lo;
+      last_reg = oc0_reg;
+    }
+  }
+#endif
+}
+
+/// Force the shader's final colour select to one side by rewriting ONLY the selector operand of
+/// the `cmp` that writes oC0's colour channels. `cmp dst, a, b, c` is `(a >= 0) ? b : c`, so
+/// pointing `a` at a def component holding 0.0 takes the first operand and one holding -1.0 takes
+/// the second.
+///
+/// Everything else -- both candidate colours, the alpha channel, the blend -- is left exactly as
+/// the shader computed it. That is the point: substituting a *value* (a white texture, a zeroed
+/// sampler) changes what the branches produce and cannot separate "the branch chose wrong" from
+/// "the chosen branch is wrong". Changing only the choice can.
+bool RewriteForceBranch(const DWORD* code, uint32_t dword_count, uint32_t side,
+                        std::vector<DWORD>& patched) {
+  constexpr uint32_t kEnd = 0xFFFF, kComment = 0xFFFE, kDef = 0x51, kDcl = 0x1F;
+  constexpr uint32_t kColorOutRegType = 8, kConstRegType = 2, kCmp = 0x58;
+
+  uint32_t def_reg = 0, comp_zero = 0, comp_neg = 0;
+  bool have_def = false;
+  for (uint32_t i = 1; i < dword_count && !have_def;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (op == kDef && len == 5 && i + 5 < dword_count) {
+      float v[4];
+      std::memcpy(v, &code[i + 2], sizeof(v));
+      bool z = false, n = false;
+      for (uint32_t c = 0; c < 4; ++c) {
+        // A negative zero still compares >= 0, so it cannot serve as the "take the second
+        // operand" source; require a strictly negative value.
+        if (!z && v[c] == 0.0f && !std::signbit(v[c])) { comp_zero = c; z = true; }
+        if (!n && v[c] < 0.0f) { comp_neg = c; n = true; }
+      }
+      if (z && n) {
+        def_reg = code[i + 1] & 0x7FF;
+        have_def = true;
+      }
+    }
+    i += 1 + len;
+  }
+  if (!have_def) return false;
+
+  const uint32_t pick = (side == 2) ? comp_neg : comp_zero;
+  patched.assign(code, code + dword_count);
+  bool hit = false;
+  for (uint32_t i = 1; i < dword_count;) {
+    const DWORD tok = code[i];
+    const uint32_t op = tok & 0xFFFF;
+    if (op == kEnd) break;
+    if (op == kComment) {
+      i += 1 + ((tok >> 16) & 0x7FFF);
+      continue;
+    }
+    const uint32_t len = (tok >> 24) & 0xF;
+    if (len == 0) break;
+    if (op == kCmp && len == 4 && i + 1 < dword_count) {
+      const DWORD dst = code[i + 1];
+      const uint32_t dtype = ((dst >> 28) & 7) | ((dst >> 8) & 0x18);
+      // Colour channels only: a .w-only write is the alpha path and must keep its own selector.
+      if (dtype == kColorOutRegType && (dst & 0x7FF) == 0 && ((dst >> 16) & 0x7u) != 0) {
+        DWORD s = code[i + 2];
+        s = (s & ~0x7FFu) | (def_reg & 0x7FF);
+        s = (s & ~(7u << 28)) | ((kConstRegType & 7u) << 28);
+        s = (s & ~(0x18u << 8)) | (((kConstRegType >> 3) & 3u) << 11);
+        s = (s & ~(0xFFu << 16)) | ((pick | (pick << 2) | (pick << 4) | (pick << 6)) << 16);
+        s &= ~(0xFu << 24);  // no source modifier: the negation is what we are replacing
+        patched[i + 2] = s;
+        hit = true;
+      }
+    }
+    i += 1 + len;
+  }
+  return hit;
+}
+
 const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
 #ifndef NX1_HAVE_SM3_SHADER_CACHE
   (void)ucode_hash;
@@ -303,11 +753,50 @@ const Sm3Shader* ShaderCache::Lookup(uint64_t ucode_hash) {
         ReadsUndefinedConstRange(code, found->bytecodeSize / 4, base + 2, base + 17);
   }
 
+  // Give pixel-shader inputs that no vertex shader produces the value the hardware would have,
+  // rather than whatever D3D9 leaves in an unbound register. CreateShader copies the bytecode,
+  // so the patched buffer only has to outlive the call.
+  std::vector<DWORD> patched;
+  const DWORD* create_code = code;
+  if (const uint32_t orphan_mask = REXCVAR_GET(nx1_d3d9_orphan_texcoords);
+      orphan_mask && (found->flags & NX1_SM3_PIXEL_SHADER)) {
+    uint32_t reads = 0;
+    if (RewriteOrphanInputs(code, found->bytecodeSize / 4, orphan_mask, patched, reads)) {
+      create_code = patched.data();
+      REXGPU_INFO("nx1_d3d9: ORPHAN ps 0x{:016X} rewrote {} read(s) of unproduced TEXCOORDs "
+                  "(mask {:#x}) to (0,0,0,1)",
+                  ucode_hash, reads, orphan_mask);
+    }
+  }
+
+  if (const uint32_t oc0_lo = REXCVAR_GET(nx1_d3d9_dbg_oc0_lo32);
+      oc0_lo && uint32_t(ucode_hash & 0xFFFFFFFFu) == oc0_lo &&
+      (found->flags & NX1_SM3_PIXEL_SHADER)) {
+    const uint32_t reg = REXCVAR_GET(nx1_d3d9_dbg_oc0_reg);
+    const uint32_t at_req = REXCVAR_GET(nx1_d3d9_dbg_oc0_at);
+    std::vector<DWORD> shown;
+    uint32_t at = 0;
+    const bool ok = at_req ? RewriteEarlyOut(create_code, found->bytecodeSize / 4, reg, at_req,
+                                             REXCVAR_GET(nx1_d3d9_dbg_oc0_type),
+                                             REXCVAR_GET(nx1_d3d9_dbg_oc0_swz),
+                                             REXCVAR_GET(nx1_d3d9_dbg_oc0_neg), shown, at)
+                           : RewriteColorOutput(create_code, found->bytecodeSize / 4, reg, shown);
+    if (ok) {
+      patched = std::move(shown);
+      create_code = patched.data();
+      REXGPU_INFO("nx1_d3d9: OC0PROBE ps 0x{:016X} now displays r{} instead of its shaded result",
+                  ucode_hash, reg);
+    } else {
+      REXGPU_WARN("nx1_d3d9: OC0PROBE ps 0x{:016X} -- no oC0 write found, shader left alone",
+                  ucode_hash);
+    }
+  }
+
   HRESULT hr;
   if (found->flags & NX1_SM3_PIXEL_SHADER) {
-    hr = device_->CreatePixelShader(code, &shader.ps);
+    hr = device_->CreatePixelShader(create_code, &shader.ps);
   } else {
-    hr = device_->CreateVertexShader(code, &shader.vs);
+    hr = device_->CreateVertexShader(create_code, &shader.vs);
   }
   if (FAILED(hr)) {
     REXGPU_ERROR("nx1_d3d9: Create{}Shader failed for 0x{:016X} ({:#x})",

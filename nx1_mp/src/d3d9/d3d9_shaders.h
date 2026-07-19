@@ -85,6 +85,12 @@ class ShaderCache {
   /// Returns nullptr on a cache miss -- the caller must skip or fall back.
   const Sm3Shader* Lookup(uint64_t ucode_hash);
 
+  /// Rebuild the oC0-probe shader when its cvars change. Call once per frame: the renderer
+  /// memoises the Sm3Shader* it got back and stops calling Lookup, so an invalidation that
+  /// lives only in Lookup never runs and the probe silently keeps showing its previous mode.
+  /// Safe against the memo because the shader object is replaced IN PLACE -- same node, new ps.
+  void PollDebugRebuild();
+
   /// Copy the guest's ALU constants into the host constant registers this shader actually
   /// reads. Registers come from the stage's shadow (device+0x780 / +0x1780, big-endian; see
   /// guest_d3d.h) unless the device's ConstantRing says the ring owns them.
