@@ -363,6 +363,10 @@ class Renderer {
   /// Bottleneck attribution: guest time blocked in DrainWorker vs worker time starved waiting
   /// for work. Whichever is large names the limiting side; both near zero means the two are
   /// balanced and the remainder is GPU or present.
+  /// Set by ApplyRenderStates when a draw matches the blend-isolate filter; ExecuteDraw skips it
+  /// and clears the flag. Skipping beats zeroing the colour mask, which leaked into the overlay.
+  bool skip_draw_ = false;
+  uint64_t prof_blend_match_draws_ = 0;
   uint64_t prof_drain_wait_ns_ = 0;
   /// Worst frame in the reporting window, and how much of it was spent blocked on the worker.
   /// A hitch does not show up in a mean -- that pair says whether a spike is our queue stalling

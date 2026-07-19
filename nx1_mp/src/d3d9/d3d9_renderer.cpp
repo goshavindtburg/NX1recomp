@@ -591,6 +591,11 @@ void Renderer::Present() {
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
+      if (prof_blend_match_draws_) {
+        REXGPU_INFO("nx1_d3d9: PROF/blendmatch {:.1f} draws/frame match the isolate filter",
+                    double(prof_blend_match_draws_) / prof_frames);
+        prof_blend_match_draws_ = 0;
+      }
       // Report the hit rate, not just the timing. Several shadows in this renderer measured
       // exactly zero benefit and were only caught by a counter -- a memo that never hits is pure
       // added cost, and the phase timing alone cannot tell the difference.
@@ -1636,11 +1641,17 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
     // conclusion: a verify captured when #2 meant ONE->INVSRCALPHA was read against an
     // identification made when #2 meant ZERO->SRCCOLOR. The Xenos factor pair is stable, so
     // target that instead and the mistake cannot recur.
+    // -1 means "any" for either factor, so a single one can be targeted. Requiring both to be set
+    // meant `dst 7` alone silently matched nothing, which reads as "that config is not the glass"
+    // rather than "the filter was never armed".
     const int32_t want_src = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_src));
     const int32_t want_dst = int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_dst));
-    const bool value_match = want_src >= 0 && want_dst >= 0 &&
-                             uint32_t(want_src) == blend.color_src &&
-                             uint32_t(want_dst) == blend.color_dst;
+    const bool value_match = (want_src >= 0 || want_dst >= 0) &&
+                             (want_src < 0 || uint32_t(want_src) == blend.color_src) &&
+                             (want_dst < 0 || uint32_t(want_dst) == blend.color_dst);
+    if (value_match) {
+      ++prof_blend_match_draws_;
+    }
     if (value_match) {
       if (REXCVAR_GET(nx1_d3d9_dbg_blend_verify)) {
         // Ask D3D what it ACTUALLY has, rather than trusting our shadow.
@@ -1697,8 +1708,10 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
           }
         }
       } else {
-        SetRenderStateCached(D3DRS_COLORWRITEENABLE, 0);
-        bound_color_write_ = 0;
+        // SKIP the draw rather than zeroing the colour-write mask. Zeroing left that state on the
+        // device, and ImGui's D3D9 backend does not restore D3DRS_COLORWRITEENABLE -- so the F4
+        // overlay itself rendered invisibly. A debug tool that hides the debug UI is not usable.
+        skip_draw_ = true;
       }
     }
   }
@@ -2256,6 +2269,10 @@ void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const Rec
   ApplyRenderStates(d);
   padd(prof_states_ns_, t_rs);
 
+  if (skip_draw_) {
+    skip_draw_ = false;
+    return;
+  }
   auto t_dr = ptick();
   const HRESULT dhr = device_->DrawIndexedPrimitive(host_prim, int(base_vertex_index), 0,
                                                     vertex_count, start_index, prim_count);
