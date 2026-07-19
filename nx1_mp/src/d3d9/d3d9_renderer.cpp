@@ -1612,7 +1612,13 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   // setting isolate alone did nothing -- the index bookkeeping it depends on never ran. A debug
   // tool that silently no-ops is worse than no tool: it reads as "the theory is wrong" rather
   // than "the switch was off".
-  if (REXCVAR_GET(nx1_d3d9_dbg_blend_log) || int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_src)) >= 0) {
+  // Arm on EITHER factor, matching the wildcard rule inside. This gate previously tested only
+  // dbg_blend_src, so `dst 7` with src left at -1 never entered the block at all -- the same
+  // unarmed-filter failure as before, fixed one level too shallow. The inner condition was
+  // corrected while the gate that decides whether it runs was not.
+  if (REXCVAR_GET(nx1_d3d9_dbg_blend_log) ||
+      int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_src)) >= 0 ||
+      int32_t(REXCVAR_GET(nx1_d3d9_dbg_blend_dst)) >= 0) {
     const uint64_t sig = uint64_t(blend.enabled) | (uint64_t(blend.color_src) << 1) |
                          (uint64_t(blend.color_dst) << 7) | (uint64_t(blend.color_op) << 13) |
                          (uint64_t(blend.alpha_src) << 17) | (uint64_t(blend.alpha_dst) << 23) |
@@ -2343,6 +2349,10 @@ void Renderer::Draw(const uint8_t* base, uint32_t guest_device, uint32_t prim_ty
   }
   BindTextures(base, d);
   ApplyRenderStates(d);
+  if (skip_draw_) {  // inline path: consume it too, or it leaks into the next indexed draw
+    skip_draw_ = false;
+    return;
+  }
   device_->DrawPrimitive(host_prim, start_vertex, prim_count);
   ++draws_submitted_;
 }
@@ -2407,6 +2417,10 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
 
   BindTextures(base, d);
   ApplyRenderStates(d);
+  if (skip_draw_) {  // inline path: consume it too, or it leaks into the next indexed draw
+    skip_draw_ = false;
+    return;
+  }
   const HRESULT hr = device_->DrawIndexedPrimitiveUP(
       host_prim, 0, num_vertices, prim_count, indices.data(),
       index_size == 4 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, verts.data(), host_stride);
@@ -2474,6 +2488,10 @@ void Renderer::DrawUP(const uint8_t* base, uint32_t guest_device, uint32_t prim_
 
   BindTextures(base, d);
   ApplyRenderStates(d);
+  if (skip_draw_) {  // inline path: consume it too, or it leaks into the next indexed draw
+    skip_draw_ = false;
+    return;
+  }
   if (SUCCEEDED(device_->DrawPrimitiveUP(host_prim, prim_count, verts.data(), host_stride))) {
     ++draws_submitted_;
   }
