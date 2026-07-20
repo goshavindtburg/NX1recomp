@@ -25,9 +25,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -683,16 +686,25 @@ REX_HOOK_RAW(rex_ImageCache_WaitFence_YAHXZ) {
 // Mode 2 performs the mirror copy, page-wise through GuestPointer: image cache pointers are
 // physical-mirror EAs, and a single bulk memcpy through `base +` arithmetic has already
 // blacked the screen three times in this project's history.
-REXCVAR_DEFINE_UINT32(nx1_d3d9_dmacopy_mirror, 0, "GPU",
-                      "ImageCache_DmaCopy handling: 0=off (default), 1=log arguments, "
-                      "2=log and mirror the GPU copy in CPU-visible guest RAM. MODE 2 IS "
-                      "HARMFUL as written: DmaCopy is a GPU blit through a vertex shader with "
-                      "memexport, and the reason to move data that way rather than by memcpy "
-                      "is that it TRANSFORMS the layout in flight. Our verbatim byte copy puts "
-                      "untiled data in a slot the decoder reads as tiled, which renders as a "
-                      "regular block CHECKERBOARD -- measured directly: a dumpster whose body "
-                      "was checkered with mirroring on came back as correct rusty metal with it "
-                      "off. Re-enable only with the tiling transform replicated");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dmacopy_mirror, 2, "GPU",
+                      "ImageCache_DmaCopy handling: 0=off, 1=log arguments, 2=log and mirror the "
+                      "GPU copy in CPU-visible guest RAM (default). The blit is a VERBATIM byte "
+                      "move, so this mirror is correct as written -- measured by snapshotting the "
+                      "source at call time and comparing against the destination once the fence "
+                      "retires: four full pairs 100% identical with matching byte histograms, and "
+                      "11,918 of 14,500 sampled copies byte-exact. It also restores textures that "
+                      "otherwise never reach CPU RAM at all (smoke grenade sprites).\n"
+                      "\n"
+                      "This cvar previously defaulted to 0 with a comment asserting the blit "
+                      "TRANSFORMS layout in flight and that mirroring caused a block checkerboard. "
+                      "Both claims were wrong. The 'transform' was inferred, never measured, then "
+                      "quoted back as established; the checkerboard rested on a SINGLE screenshot "
+                      "pair taken at different moments in a scene whose corruption varies "
+                      "constantly. An earlier verification did appear to support a transform (24% "
+                      "byte-exact) but compared LIVE guest memory 250 ms after the call, so it was "
+                      "measuring the streaming pool recycling the source -- the same run reports "
+                      "the source moving 24-49% while we waited. Snapshot the input to measure a "
+                      "copy; do not compare against memory that anything else can write.");
 
 REX_EXTERN(__imp__rex_ImageCache_DmaCopy);
 REX_EXTERN(__imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z);
@@ -758,20 +770,51 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_dmaverify, false, "GPU",
                     "settle whether ImageCache_DmaCopy transforms the layout or moves bytes "
                     "verbatim. Needs the reference rasterising so guest RAM holds real results");
 
+/// DERIVE the blit instead of guessing at it. Four theories about what DmaCopy does have now
+/// been advanced from inference and three have collapsed; this dumps the actual input and the
+/// actual output so the mapping can be computed rather than argued.
+///
+/// MUST run with nx1_skip_reference_raster=false and readback_memexport=true: only then does the
+/// reference execute the memexport draw and land the real result in guest RAM. (That config was
+/// unusable before the readback map leak was fixed -- it ate ~100 MB/s.)
+///
+/// Writes texdump/dma_<dst>_<bytes>_src.bin and _dst.bin. Byte-identical files mean the move is
+/// VERBATIM and our mirror's bug was timing; differing files are the ground truth to derive the
+/// permutation from.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dmadump, 0, "GPU",
+                      "Dump the next N DMA source/destination pairs to texdump/ as raw .bin, for "
+                      "deriving the image-cache blit's layout transform offline");
+
 struct PendingDma {
   uint32_t dst, src, bytes;
   std::chrono::steady_clock::time_point at;
+  /// The source AS IT WAS AT CALL TIME. Comparing live guest memory 250 ms later cannot
+  /// distinguish "the blit transformed the data" from "the streaming pool recycled the source
+  /// while we waited" -- that ambiguity has now muddied two measurements. Snapshotting here
+  /// removes it: this is exactly the input the blit was handed.
+  std::vector<uint8_t> src_snapshot;
 };
 std::mutex g_dma_verify_m;
 std::deque<PendingDma> g_dma_verify;
 
-void RecordPendingDma(uint32_t dst, uint32_t src, uint32_t bytes) {
+void RecordPendingDma(const uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   if (!REXCVAR_GET(nx1_d3d9_dbg_dmaverify) || bytes < 256 || bytes > (16u << 20) || !dst || !src) {
     return;
   }
+  const uint32_t snap_bytes = std::min(bytes, 256u << 10);
+  std::vector<uint8_t> snap(snap_bytes);
+  for (uint32_t off = 0; off < snap_bytes; off += 4096) {
+    const uint32_t chunk = std::min(4096u, snap_bytes - off);
+    const uint8_t* s = nx1::d3d9::GuestPointer(base, src + off);
+    if (!s) {
+      return;  // unreadable source -- a pair we cannot interpret is worse than no pair
+    }
+    std::memcpy(snap.data() + off, s, chunk);
+  }
   std::lock_guard<std::mutex> lk(g_dma_verify_m);
-  if (g_dma_verify.size() < 512) {
-    g_dma_verify.push_back({dst, src, bytes, std::chrono::steady_clock::now()});
+  if (g_dma_verify.size() < 64) {  // each entry now carries up to 256 KB
+    g_dma_verify.push_back(
+        {dst, src, bytes, std::chrono::steady_clock::now(), std::move(snap)});
   }
 }
 
@@ -794,16 +837,17 @@ void VerifyPendingDma(const uint8_t* base) {
       e = g_dma_verify.front();
       g_dma_verify.pop_front();
     }
-    const uint32_t span = std::min(e.bytes, 64u << 10);
-    uint32_t same = 0, compared = 0;
+    const uint32_t span = std::min<uint32_t>(e.bytes, uint32_t(e.src_snapshot.size()));
+    uint32_t same = 0, compared = 0, src_moved = 0;
     int64_t first_bad = -1;
     for (uint32_t off = 0; off < span; off += 4096) {
       const uint32_t chunk = std::min(4096u, span - off);
       const uint8_t* d = nx1::d3d9::GuestPointer(base, e.dst + off);
-      const uint8_t* s = nx1::d3d9::GuestPointer(base, e.src + off);
-      if (!d || !s) {
+      const uint8_t* s_live = nx1::d3d9::GuestPointer(base, e.src + off);
+      if (!d) {
         break;
       }
+      const uint8_t* s = e.src_snapshot.data() + off;  // the blit's ACTUAL input
       for (uint32_t i = 0; i < chunk; ++i) {
         ++compared;
         if (d[i] == s[i]) {
@@ -811,10 +855,50 @@ void VerifyPendingDma(const uint8_t* base) {
         } else if (first_bad < 0) {
           first_bad = off + i;
         }
+        // Did the source itself change while we waited? If this is high, every earlier
+        // live-memory comparison was measuring recycling, not the blit.
+        if (s_live && s_live[i] != s[i]) {
+          ++src_moved;
+        }
       }
     }
     if (!compared) {
       continue;
+    }
+    // Dump the pair itself when asked. Prefer entries big enough to show a 2D pattern -- a
+    // single 4 KB page can look like anything, while a full mip level makes a tiling obvious.
+    if (const uint32_t dump_budget = REXCVAR_GET(nx1_d3d9_dbg_dmadump);
+        dump_budget && e.bytes >= (16u << 10)) {
+      REXCVAR_SET(nx1_d3d9_dbg_dmadump, dump_budget - 1);
+      const uint32_t dump_bytes = std::min<uint32_t>(e.bytes, uint32_t(e.src_snapshot.size()));
+      const std::vector<uint8_t>& sbuf = e.src_snapshot;  // input as the blit received it
+      std::vector<uint8_t> dbuf(dump_bytes);
+      bool ok = true;
+      for (uint32_t off = 0; off < dump_bytes && ok; off += 4096) {
+        const uint32_t chunk = std::min(4096u, dump_bytes - off);
+        const uint8_t* d = nx1::d3d9::GuestPointer(base, e.dst + off);
+        if (!d) {
+          ok = false;
+          break;
+        }
+        std::memcpy(dbuf.data() + off, d, chunk);
+      }
+      if (ok) {
+        char path[256];
+        std::snprintf(path, sizeof(path), "texdump/dma_%08X_%u_src.bin", e.dst, dump_bytes);
+        if (FILE* f = std::fopen(path, "wb")) {
+          std::fwrite(sbuf.data(), 1, sbuf.size(), f);
+          std::fclose(f);
+        }
+        std::snprintf(path, sizeof(path), "texdump/dma_%08X_%u_dst.bin", e.dst, dump_bytes);
+        if (FILE* f = std::fopen(path, "wb")) {
+          std::fwrite(dbuf.data(), 1, dbuf.size(), f);
+          std::fclose(f);
+        }
+        REXGPU_WARN("nx1_d3d9: DMADUMP dst={:08X} src={:08X} {} bytes -> texdump/dma_*_src.bin "
+                    "and _dst.bin ({}% identical)",
+                    e.dst, e.src, dump_bytes, same * 100 / compared);
+      }
     }
     static std::atomic<uint64_t> n{0}, exact{0}, pct_sum{0};
     const uint32_t pct = same * 100 / compared;
@@ -825,9 +909,10 @@ void VerifyPendingDma(const uint8_t* base) {
     }
     if (k <= 12 || (k % 500) == 0) {
       REXGPU_WARN("nx1_d3d9: DMAVERIFY dst={:08X} src={:08X} {} bytes | {}% identical, first "
-                  "difference at {} | running: {} copies, {} byte-exact, {}% mean",
-                  e.dst, e.src, e.bytes, pct, first_bad, k, exact.load(),
-                  pct_sum.load() / k);
+                  "difference at {} | source itself moved {}% while we waited | running: {} "
+                  "copies, {} byte-exact, {}% mean",
+                  e.dst, e.src, e.bytes, pct, first_bad, src_moved * 100 / compared, k,
+                  exact.load(), pct_sum.load() / k);
     }
   }
 }
@@ -883,7 +968,7 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, a5 = ctx.r5.u32, a6 = ctx.r6.u32;
   __imp__rex_ImageCache_DmaCopy(ctx, base);
 #ifdef _WIN32
-  RecordPendingDma(dst, src, a5);  // independent of the mirror mode
+  RecordPendingDma(base, dst, src, a5);  // independent of the mirror mode
   const uint32_t mode = REXCVAR_GET(nx1_d3d9_dmacopy_mirror);
   if (!mode) {
     return;
@@ -924,7 +1009,7 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z) {
   const uint32_t hi = uint32_t(ctx.r5.u64 >> 32), lo = ctx.r5.u32;
   __imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z(ctx, base);
 #ifdef _WIN32
-  RecordPendingDma(dst, src, lo);  // lo = copy size (hi is the slot allocation)
+  RecordPendingDma(base, dst, src, lo);  // lo = copy size (hi is the slot allocation)
   const uint32_t mode = REXCVAR_GET(nx1_d3d9_dmacopy_mirror);
   if (!mode) {
     return;
