@@ -2150,6 +2150,9 @@ void ResourceTracker::LogCacheStats() {
       frame_, textures, vbs, ibs, resolves, tex_uploads_, tex_rebuilds_, tex_evicted_,
       tex_failures_, unsupported_texture_formats_,
       device_->GetAvailableTextureMem() / (1024 * 1024));
+  REXGPU_INFO("nx1_d3d9: PLACEHOLDER binds={} (textures bound at the engine's not-resident "
+              "buffer {:08X}); a config that streams properly drives this toward zero",
+              placeholder_binds_, DefaultPixelsAddress());
   REXGPU_INFO("nx1_d3d9: mipgen guest={} built={} auto={} basemap(level0 only)={} "
               "skipped(no chain declared)={} skipped(fmt)={} mip_relocs={}",
               mips_guest_, mips_built_, mips_auto_, mips_basemap_, mips_skip_nochain_,
@@ -2878,6 +2881,15 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                                  frame_, false, 1, 1});
       }
     }
+  }
+
+  // OBJECTIVE SPECKLE METRIC. A bind whose pixels are the engine's placeholder buffer is a
+  // texture the game itself considers not resident -- no judgement call, no screenshot
+  // comparison. Counted per frame and reported with the cache stats so two configs (or two
+  // backends) can be compared by number instead of by eye.
+  if (const uint32_t dp = DefaultPixelsAddress();
+      dp && t.base_address && PhysicalAddress(t.base_address) == PhysicalAddress(dp)) {
+    ++placeholder_binds_;
   }
 
   const uint32_t dbg_track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
@@ -4950,6 +4962,20 @@ void ResourceTracker::ResolveWriteback(IDirect3DTexture9* tex, uint32_t width, u
               "(#{} total)",
               dest.base_address, width, height, dest.tiled ? 1 : 0, dest.endian,
               guest_bytes / 1024, us, writebacks_done_);
+}
+
+namespace {
+/// The engine's not-resident placeholder buffer, learned from ImageCache_GetDefaultPixels.
+std::atomic<uint32_t> g_default_pixels{0};
+}  // namespace
+
+bool ResourceTracker::SetDefaultPixelsAddress(uint32_t addr) {
+  uint32_t expected = 0;
+  return g_default_pixels.compare_exchange_strong(expected, addr, std::memory_order_relaxed);
+}
+
+uint32_t ResourceTracker::DefaultPixelsAddress() {
+  return g_default_pixels.load(std::memory_order_relaxed);
 }
 
 void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height,

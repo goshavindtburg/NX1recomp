@@ -526,6 +526,74 @@ REX_HOOK_RAW(rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIter_PBU
 }
 
 //=============================================================================
+// Placeholder detection (objective speckle metric)
+//=============================================================================
+//
+// Every "this config looks better" judgement tonight was later walked back -- by both of us.
+// So stop judging by eye. The engine states non-residency explicitly: GetDefaultPixels hands
+// out the placeholder buffer an unloaded image is shown with. Capture its address once, and
+// the renderer can then count, per frame, how many bound textures are actually placeholders.
+// That converts "is the speckle better" into a number that is comparable across configs and
+// across backends.
+REX_EXTERN(__imp__rex_ImageCache_GetDefaultPixels_YAPBEXZ);
+
+REX_HOOK_RAW(rex_ImageCache_GetDefaultPixels_YAPBEXZ) {
+  __imp__rex_ImageCache_GetDefaultPixels_YAPBEXZ(ctx, base);
+#ifdef _WIN32
+  const uint32_t pixels = ctx.r3.u32;
+  if (pixels && nx1::d3d9::ResourceTracker::SetDefaultPixelsAddress(pixels)) {
+    REXGPU_WARN("nx1_d3d9: DEFAULTPIXELS buffer at {:08X} -- textures bound at this address are "
+                "the engine's own not-resident placeholder",
+                pixels);
+  }
+#endif
+}
+
+//=============================================================================
+// ImageCache streamer pacing
+//=============================================================================
+//
+// Measured: pure Xenia moves ~51,500 DMA copies / 711 MiB in ~72s of play; our mode fewer
+// than 500 in a longer walk. The streamer is throttling itself on some signal our backend
+// presents differently, and its obvious pacing input is this fence wait. Count and time it in
+// both modes: a streamer spinning on a never-clearing fence shows up as huge call counts or
+// huge cumulative time; a streamer that never even ASKS shows up as near-zero calls -- which
+// would move the suspect upstream to the priority/visibility inputs instead.
+REX_EXTERN(__imp__rex_ImageCache_WaitFence_YAHXZ);
+
+// The two globals the streamer's DMA pipeline turns on, read straight off WaitFence's
+// disassembly: r31 = 0x840F8020 (the fence value it polls) and r31-28 = 0x840F8004 (the
+// "work outstanding" flag). Sampling BOTH modes says whether the streamer is even arming
+// work under our backend, or arming it and having the fence retire so fast it never blocks.
+// Verified arithmetic: base -2079064064 = 0x84140000 unsigned, r31 = base - 0x7FE0
+// = 0x84138020. An earlier hand-computed 0x840F8020 read zeros in BOTH modes while
+// ret=1 proved work WAS pending -- a wrong address reads exactly like a clean null
+// result, which is the failure mode this project has hit repeatedly.
+inline constexpr uint32_t kImgCachePendingFlag = 0x84138004;
+inline constexpr uint32_t kImgCacheFence = 0x84138020;
+
+REX_HOOK_RAW(rex_ImageCache_WaitFence_YAHXZ) {
+  static std::atomic<uint64_t> calls{0}, ns{0}, armed{0};
+  const uint32_t pending_before = nx1::d3d9::GuestRead32(base, kImgCachePendingFlag);
+  const uint32_t fence_before = nx1::d3d9::GuestRead32(base, kImgCacheFence);
+  if (pending_before) {
+    armed.fetch_add(1, std::memory_order_relaxed);
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  __imp__rex_ImageCache_WaitFence_YAHXZ(ctx, base);
+  const uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t total =
+      ns.fetch_add(uint64_t((std::chrono::steady_clock::now() - t0).count()),
+                   std::memory_order_relaxed);
+  if ((n % 200) == 0) {
+    REXGPU_WARN("nx1_d3d9: IMGFENCE {} calls, {} armed, {} ms total | last ret={} "
+                "pending={} fence={:08X} -> {:08X}",
+                n, armed.load(), total / 1000000, ctx.r3.u32, pending_before, fence_before,
+                nx1::d3d9::GuestRead32(base, kImgCacheFence));
+  }
+}
+
+//=============================================================================
 // ImageCache DMA copies
 //=============================================================================
 //
@@ -604,7 +672,7 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   if (n < 32) {
     REXGPU_WARN("nx1_d3d9: DMACOPY dst={:08X} src={:08X} a5={:08X} a6={:08X}", dst, src, a5, a6);
   }
-  if ((n % 500) == 499) {
+  if ((n % 100) == 99) {  // fine-grained: the D3D9-mode run never even reached the old 500
     REXGPU_WARN("nx1_d3d9: DMACOPY volume {} calls, {} MiB total", n + 1, tb >> 20);
   }
   if (mode >= 2) {

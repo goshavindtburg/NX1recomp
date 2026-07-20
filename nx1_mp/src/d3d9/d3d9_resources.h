@@ -222,6 +222,11 @@ class ResourceTracker {
   /// RecordedCommand::resolve_writeback), the resolved pixels are ALSO read back and written
   /// into guest RAM at the destination in its declared format/endian/tiling, so the game's
   /// CPU-side bakes read real data instead of the pool's leftovers.
+  /// The engine's not-resident placeholder buffer (ImageCache_GetDefaultPixels). Returns true
+  /// the first time it is learned, so the hook can announce it once. See PlaceholderBinds.
+  static bool SetDefaultPixelsAddress(uint32_t addr);
+  static uint32_t DefaultPixelsAddress();
+
   void ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height, const RECT& src_rect,
                     const POINT& dest_point, const TextureFetchConstant& dest, bool writeback);
 
@@ -584,6 +589,7 @@ class ResourceTracker {
   uint64_t mips_auto_ = 0;             ///< chain left to the driver (uncompressed)
   uint64_t mips_skip_nochain_ = 0;     ///< guest declares mip_max_level == 0
   uint64_t mips_skip_unsupported_ = 0; ///< no autogen and not block-compressed
+  uint64_t placeholder_binds_ = 0;  ///< binds of the engine's not-resident buffer
   uint64_t mips_guest_ = 0;            ///< chain decoded from the guest's mip_address
   uint64_t mips_basemap_ = 0;          ///< kBaseMap: level 0 only, no chain wanted at all
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
