@@ -36,6 +36,10 @@
 #include "d3d9_resources.h"
 #include "guest_d3d.h"
 
+// Process memory accounting for the periodic MEM stats line (see LogCacheStats). MUST come
+// after the headers above: psapi.h uses BOOL/DWORD and does not include windows.h itself.
+#include <psapi.h>
+
 /// Paint one PreferLargestForSurface branch white, to identify which one serves the confetti.
 ///   1 = the `substitute` path (smaller than retained -> retained served)
 ///   2 = the `equal` path (same area -> current served, retained bypassed)
@@ -2118,6 +2122,30 @@ void ResourceTracker::LogCacheStats() {
               "skipped(no chain declared)={} skipped(fmt)={} mip_relocs={}",
               mips_guest_, mips_built_, mips_auto_, mips_basemap_, mips_skip_nochain_,
               mips_skip_unsupported_, mip_relocs_);
+  // MEMORY ACCOUNTING. A 33 GB runaway was observed twice; guessing at which container or
+  // resource pool grows has already cost one wrong fix (the dump force-rebuild was a real
+  // pathology but not the cause -- the leak reproduced at the same size without it). Report the
+  // process totals beside every pool this tracker owns, so one run says which number moves.
+  // Committed memory rather than working set: a leak of never-touched pages shows in commit
+  // long before it shows in RSS, and D3D9Ex staging lives in the process heap.
+  {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                         sizeof(pmc));
+    size_t pending = 0;
+    {
+      std::lock_guard<std::mutex> lk(dirty_mu_);
+      pending = writes_pending_.size();
+    }
+    size_t mirror_pages_valid = 0;
+    for (uint64_t w : mirror_valid_) mirror_pages_valid += size_t(__popcnt64(w));
+    REXGPU_INFO("nx1_d3d9: MEM private={} MiB working={} MiB | writes_pending={} "
+                "detile_scratch={} KiB mirror_valid={} MiB baseline_new={} pick_queries~n/a",
+                pmc.PrivateUsage / (1024 * 1024), pmc.WorkingSetSize / (1024 * 1024), pending,
+                detile_scratch_.size() / 1024, (mirror_pages_valid * 4096) / (1024 * 1024),
+                baseline_new_.size());
+  }
   REXGPU_INFO("nx1_d3d9: packedmip enabled={} small_decodes={} packed_decodes={} offsets_applied={}"
               " ({})",
               REXCVAR_GET(nx1_d3d9_packed_mip_offset) ? 1 : 0, small_decodes_, packed_decodes_,
