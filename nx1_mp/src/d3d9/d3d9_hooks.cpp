@@ -706,6 +706,10 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dmacopy_mirror, 2, "GPU",
                       "the source moving 24-49% while we waited. Snapshot the input to measure a "
                       "copy; do not compare against memory that anything else can write.");
 
+// Owned by d3d9_resources.cpp. Needed here so the DMA path can report against the tracked
+// texture -- without it, "no DMA touched this address" was true only because nothing looked.
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
+
 REX_EXTERN(__imp__rex_ImageCache_DmaCopy);
 REX_EXTERN(__imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z);
 
@@ -721,11 +725,11 @@ namespace {
 /// too and the mirror faithfully propagates garbage. That would explain why mirroring both DMA
 /// paths, at verified sizes, changed nothing. Sampled, not exhaustive: zero-fraction and
 /// distinct-byte count are enough to tell "never written" and "plausible texture data" apart.
-void ClassifyDmaSource(const uint8_t* base, uint32_t src, uint32_t bytes) {
+bool ClassifyDmaSource(const uint8_t* base, uint32_t src, uint32_t bytes) {
   static std::atomic<uint64_t> total{0}, empty{0}, lowvar{0};
   const uint8_t* s = nx1::d3d9::GuestPointer(base, src);
   if (!s) {
-    return;
+    return false;
   }
   const uint32_t span = std::min(bytes, 4096u);
   uint32_t zeros = 0, distinct = 0;
@@ -751,6 +755,15 @@ void ClassifyDmaSource(const uint8_t* base, uint32_t src, uint32_t bytes) {
                 "never reaches CPU RAM at all",
                 n, empty.load(), lowvar.load());
   }
+  // MEASURED at ~9.4% of copies (5,076 of 54,000): the source is empty in CPU-visible RAM.
+  //
+  // The image cache CHAINS these moves (A->B->C). On console every hop is the GPU writing
+  // unified memory; here the GPU does not execute the blit, so an intermediate slot is empty
+  // for us -- and mirroring it copies that emptiness onward, OVERWRITING whatever the
+  // destination legitimately held. A copy with no data to move is not a copy worth making, and
+  // performing it can only destroy. Skipping is strictly safer than propagating: at worst the
+  // destination keeps what it had, which is what would have happened without the mirror at all.
+  return sampled && zeros * 100 / sampled >= 95;
 }
 
 /// IS DmaCopy ACTUALLY A TRANSFORM? Everything written about this hook so far assumes it is --
@@ -918,6 +931,22 @@ void VerifyPendingDma(const uint8_t* base) {
 }
 
 void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
+  // DOES ANY DMA ACTUALLY FILL THE TRACKED TEXTURE? A run tracking one permanently-77%-empty
+  // texture logged only BIND and CACHED -- no writes, no copies -- which reads like "nothing ever
+  // writes it". That conclusion was unsupported: this path had no tracking at all, so the absence
+  // was guaranteed. It matters because the addresses differ by WINDOW, not by location: DMA
+  // destinations are logged as 0xA/0xB-window EAs (B4789000) while textures are keyed physically
+  // (12526000), and 0xB2526000 & 0x1FFFFFFF is exactly 12526000 -- the same memory. Compare
+  // physically or the match can never happen.
+  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track && bytes) {
+    const uint32_t tphys = track & 0x1FFFFFFF;
+    const uint32_t dphys = dst & 0x1FFFFFFF;
+    if (tphys >= dphys && tphys < dphys + bytes) {
+      REXGPU_WARN("nx1_d3d9: TRACK {:08X} DMACOPY dst={:08X} (phys {:08X}) src={:08X} {} bytes -- "
+                  "a copy lands ON the tracked texture",
+                  track, dst, dphys, src, bytes);
+    }
+  }
   // OUR-RENDERER ONLY. In pure Xenia mode the GPU-side buffer is authoritative for DMA
   // results; a CPU write here fires Xenia's watches and replaces the GPU's (possibly
   // TRANSFORMED) result with our raw byte copy -- observed as the reference going black.
@@ -929,7 +958,16 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   if (bytes < 32 || bytes > (16u << 20) || !dst || !src) {
     return;
   }
-  ClassifyDmaSource(base, src, bytes);
+  if (ClassifyDmaSource(base, src, bytes)) {
+    static std::atomic<uint64_t> skipped{0};
+    const uint64_t k = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((k % 2000) == 0) {
+      REXGPU_WARN("nx1_d3d9: DMASKIP {} mirrors skipped -- empty source, so the copy would only "
+                  "have blanked a destination that may hold good texels",
+                  k);
+    }
+    return;
+  }
   {
     // Destination region histogram, keyed by physical high byte.
     static std::atomic<uint32_t> hist[256];
@@ -947,6 +985,18 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
       REXGPU_WARN("nx1_d3d9: DMADST regions {}", out);
     }
   }
+  // PER-PAGE, not all-or-nothing. The whole-copy emptiness test above samples only the FIRST
+  // 4 KB, so a copy whose opening page holds data while later pages are empty passes it and then
+  // blanks the rest of the destination. Measured directly: a tracked texture went from
+  // nonzero=8134/8192 to 2033/8192 -- data that had already arrived was destroyed by our own
+  // mirror, which is the opposite of what this code exists to do.
+  //
+  // An empty source page carries nothing, so copying it can only erase. Skip those and leave the
+  // destination holding whatever it legitimately had: the worst case is that we fail to propagate
+  // a genuine zero-fill, which costs nothing, while the alternative demonstrably wipes live
+  // texels. Counted so "the mirror is landing bytes" can be distinguished from "the mirror is
+  // landing NOTHING because every page it was handed was blank".
+  static std::atomic<uint64_t> pages_copied{0}, pages_skipped{0};
   for (uint32_t off = 0; off < bytes; off += 4096) {
     const uint32_t chunk = std::min(4096u, bytes - off);
     uint8_t* d = const_cast<uint8_t*>(nx1::d3d9::GuestPointer(base, dst + off));
@@ -954,6 +1004,20 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
     if (!d || !s) {
       return;
     }
+    bool any = false;
+    for (uint32_t i = 0; i < chunk && !any; ++i) {
+      any = s[i] != 0;
+    }
+    if (!any) {
+      const uint64_t k = pages_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((k % 20000) == 0) {
+        REXGPU_WARN("nx1_d3d9: DMAPAGESKIP {} empty source pages not copied ({} copied) -- each "
+                    "would have blanked a destination page that may hold live texels",
+                    k, pages_copied.load());
+      }
+      continue;
+    }
+    pages_copied.fetch_add(1, std::memory_order_relaxed);
     std::memcpy(d, s, chunk);
   }
   // The write above bypassed guest page protection, so nothing was invalidated by it. Tell the

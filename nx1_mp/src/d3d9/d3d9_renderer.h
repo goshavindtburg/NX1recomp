@@ -137,6 +137,14 @@ class Renderer {
 
   //--- Shader picker ---------------------------------------------------------
   /// One draw that covered the picked pixel.
+  /// One bound texture captured by a pick.
+  struct PickTex {
+    uint32_t sampler;
+    uint32_t addr;
+    uint32_t w, h, fmt;
+  };
+  static constexpr uint32_t kPickTexMax = 8;
+
   struct PickResult {
     uint32_t ps_object;
     uint32_t vs_object;
@@ -158,12 +166,17 @@ class Renderer {
     /// geometry from a composite: the composite covers every pixel and does not depth-test at
     /// all, so it wins any "frontmost" ranking wherever you point.
     bool depth_test;
-    /// Sampler 0 (the colormap) of THIS draw, captured at pick time. ps_object names the
-    /// shader, which most of the world shares -- following it re-latched a different texture
-    /// per draw, ~40k times a session. The address of the clicked draw is the only way to
-    /// track ONE surface's texture.
-    uint32_t s0_addr;
-    uint32_t s0_w, s0_h, s0_fmt;
+    /// EVERY sampler this draw binds, captured at pick time -- not just sampler 0.
+    ///
+    /// ps_object names the shader, which most of the world shares, so following the MATERIAL
+    /// re-latched a different texture per draw (~40k times a session) and proved nothing. The
+    /// clicked draw's own addresses are the only way to track one surface. Capturing sampler 0
+    /// alone was the remaining gap: a surface whose diffuse is healthy can still be ruined by a
+    /// corrupt map further down the chain -- measured, a material whose fmt=18 diffuse and DXN
+    /// normal were both clean while its fmt=20 DXT5 at sampler 7 was half black blocks and half
+    /// another image. Tracking s0 there watches the one texture that is fine.
+    PickTex tex[kPickTexMax];
+    uint32_t tex_count;
   };
 
   /// Ask for a pick at a window pixel on the next frame. The frame it runs on renders only a
@@ -385,8 +398,8 @@ class Renderer {
     uint32_t rt_surface;
     bool depth_write;
     bool depth_test;
-    uint32_t s0_addr;
-    uint32_t s0_w, s0_h, s0_fmt;
+    PickTex tex[kPickTexMax];
+    uint32_t tex_count;
   };
   bool pick_active_ = false;
   std::atomic<bool> pick_requested_{false};

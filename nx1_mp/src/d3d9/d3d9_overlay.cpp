@@ -627,17 +627,28 @@ void Overlay::DrawPicker() {
       // that names the shader, which most of the world shares, so a "follow the material"
       // tracker re-latched a different texture per draw (~40k TRACKFOLLOWs in one session)
       // and its WRITE detection watched a rotating window -- silence proved nothing.
-      const bool tracking =
-          h.s0_addr != 0 && REXCVAR_GET(nx1_d3d9_dbg_track_addr) == h.s0_addr;
-      std::snprintf(buf, sizeof(buf), "%s s0 %08X (%ux%u f%u)",
-                    tracking ? "untrack" : "TRACK", h.s0_addr, h.s0_w, h.s0_h, h.s0_fmt);
-      if (h.s0_addr && ImGui::Button(buf)) {
-        REXCVAR_SET(nx1_d3d9_dbg_track_addr, tracking ? 0u : h.s0_addr);
-      }
-      if (h.s0_addr && ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Watch this texture's memory: TRACK BIND lines report its live bytes "
-                          "every frame (base_nonzero), TRACK WRITE lines report guest writes. "
-                          "The tracked texture paints white on screen -- judge it from the log.");
+      // One TRACK button per BOUND SAMPLER, not just sampler 0. A material's diffuse can be
+      // perfectly healthy while the map that ruins it sits further down the chain -- measured,
+      // an fmt=18 diffuse and DXN normal both clean while the fmt=20 DXT5 at sampler 7 was half
+      // black blocks and half a different image entirely. Tracking s0 there watches the one
+      // texture that is fine and reports reassuringly full byte counts.
+      for (uint32_t k = 0; k < h.tex_count; ++k) {
+        const auto& pt = h.tex[k];
+        const bool tracking = REXCVAR_GET(nx1_d3d9_dbg_track_addr) == pt.addr;
+        std::snprintf(buf, sizeof(buf), "%s s%u %08X (%ux%u f%u)", tracking ? "untrack" : "TRACK",
+                      pt.sampler, pt.addr, pt.w, pt.h, pt.fmt);
+        ImGui::PushID(int(100 + k));
+        if (ImGui::Button(buf)) {
+          REXCVAR_SET(nx1_d3d9_dbg_track_addr, tracking ? 0u : pt.addr);
+        }
+        if (ImGui::IsItemHovered()) {
+          ImGui::SetTooltip("Watch THIS texture's memory: TRACK BIND lines report its live bytes "
+                            "every frame (base_nonzero), TRACK WRITE lines report guest writes, "
+                            "and TRACK DMACOPY lines report image-cache copies landing on it. "
+                            "Pick the sampler whose dump looked WRONG, not sampler 0.");
+        }
+        ImGui::PopID();
+        if (k + 1 < h.tex_count) ImGui::SameLine();
       }
       ImGui::PopID();
       ImGui::Separator();

@@ -616,6 +616,13 @@ class ResourceTracker {
   uint64_t mips_guest_ = 0;            ///< chain decoded from the guest's mip_address
   uint64_t mips_basemap_ = 0;          ///< kBaseMap: level 0 only, no chain wanted at all
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
+  uint64_t forced_rechecks_ = 0;       ///< re-decodes forced by nx1_d3d9_redecode_delay
+  uint64_t decodes_total_ = 0;         ///< texture decodes performed (speckle baseline)
+  uint64_t partial_decodes_ = 0;       ///< of those, decoded with one or more empty source pages
+  uint64_t decode_pages_sum_ = 0;      ///< source pages examined across all decodes
+  uint64_t partial_pages_sum_ = 0;     ///< of those, pages that were entirely zero
+  uint64_t torn_checked_ = 0;          ///< mirror pages double-copied for the torn-page test
+  uint64_t torn_pages_ = 0;            ///< of those, how many changed mid-copy
 };
 
 /// D3DPT_* on the Xbox 360 is the raw Xenos PrimitiveType, which agrees with the

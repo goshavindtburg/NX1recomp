@@ -538,19 +538,25 @@ IDirect3DQuery9* Renderer::PickBegin(const RecordedDraw& d) {
     return nullptr;
   }
   IDirect3DQuery9* q = pick_queries_[pick_count_];
-  // Sampler 0 of this exact draw, so the overlay can track the surface's own texture rather
-  // than every texture its (shared) shader ever binds.
-  const TextureFetchConstant s0 = DecodeTextureFetchConstant(d.texture_fetch(0));
-  pick_entries_[pick_count_] = {d.ps_object,
-                                d.vs_object,
-                                d.ps && d.ps->entry ? d.ps->entry->hash : 0ull,
-                                current_rt_surface_,
-                                d.depth.write_enabled,
-                                d.depth.test_enabled && d.depth.compare_function != 7,
-                                s0.valid ? s0.base_address : 0u,
-                                s0.width,
-                                s0.height,
-                                s0.format};
+  // EVERY sampler this exact draw binds, so the overlay can track any of them. Capturing only
+  // sampler 0 meant a material whose diffuse was healthy looked healthy, while the texture
+  // actually responsible sat at sampler 7 and was never watched.
+  PickEntry& pe = pick_entries_[pick_count_];
+  pe = {d.ps_object,
+        d.vs_object,
+        d.ps && d.ps->entry ? d.ps->entry->hash : 0ull,
+        current_rt_surface_,
+        d.depth.write_enabled,
+        d.depth.test_enabled && d.depth.compare_function != 7,
+        {},
+        0};
+  for (uint32_t si = 0; si < 16 && pe.tex_count < kPickTexMax; ++si) {
+    const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(si));
+    if (!t.valid || !t.base_address) {
+      continue;
+    }
+    pe.tex[pe.tex_count++] = {si, t.base_address, t.width, t.height, t.format};
+  }
   q->Issue(D3DISSUE_BEGIN);
   return q;
 }
@@ -668,14 +674,18 @@ void Renderer::Present() {
       const PickEntry& e = pick_entries_[i];
       pick_results_.push_back(
           {e.ps_object, e.vs_object, e.ps_hash, uint32_t(pixels), uint32_t(i), e.rt_surface, false,
-           e.depth_write, e.depth_test, e.s0_addr, e.s0_w, e.s0_h, e.s0_fmt});
+           e.depth_write, e.depth_test, {}, 0});
+      auto& ph = pick_results_.back();
+      ph.tex_count = e.tex_count;
+      for (uint32_t k = 0; k < e.tex_count; ++k) ph.tex[k] = e.tex[k];
       // Every field the selection heuristic uses, so a wrong pick can be diagnosed from the log
       // instead of by guessing which filter rejected the surface.
       REXGPU_INFO("nx1_d3d9: PICK hit #{} px={} ps={:08X} vs={:08X} rt={:08X} ztest={} zwrite={} "
                   "ucode=0x{:016X} lo32={} s0={:08X} ({}x{} fmt={})",
                   i, pixels, e.ps_object, e.vs_object, e.rt_surface, e.depth_test ? 1 : 0,
-                  e.depth_write ? 1 : 0, e.ps_hash, uint32_t(e.ps_hash & 0xFFFFFFFFu), e.s0_addr,
-                  e.s0_w, e.s0_h, e.s0_fmt);
+                  e.depth_write ? 1 : 0, e.ps_hash, uint32_t(e.ps_hash & 0xFFFFFFFFu),
+                  e.tex_count ? e.tex[0].addr : 0u, e.tex_count ? e.tex[0].w : 0u,
+                  e.tex_count ? e.tex[0].h : 0u, e.tex_count ? e.tex[0].fmt : 0u);
     }
     // The MAIN pass is whichever target the last covering draw wrote: the scene is composed
     // last, after the shadow and reflection passes. Everything on another target was never on

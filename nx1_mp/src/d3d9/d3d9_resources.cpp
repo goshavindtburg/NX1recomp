@@ -199,6 +199,28 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_resolve_size_check, true, "GPU",
                     "the render target. Off = legacy address-only matching, which serves stale "
                     "targets forever for addresses the streaming pool has since recycled");
 
+/// The premature-decode test. Every other explanation for the speckle has now been eliminated by
+/// measurement, and the one symptom none of them accounted for is that it HEALS -- on approach,
+/// and eventually on its own -- while the only configuration that ever rendered a clean frame was
+/// the one that slowed the entire pipeline down. Both point at the decode happening before the
+/// guest has finished landing the texture.
+///
+/// The write-watch cannot detect this: DECODECHANGE reports thousands of textures whose content
+/// changed between decodes with "page writes 0 -> 0", so this memory moves through paths page
+/// protection never sees. The only way to find out is to re-read and compare.
+///
+/// Set to a frame count (30 is a reasonable start) to force each texture to re-decode on a
+/// geometric ladder after its first decode. If the speckle clears, the decode was early.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_tornpages, false, "GPU",
+                    "Copy every mirror page TWICE and compare, to detect guest writes landing "
+                    "while we snapshot. A non-zero torn count means our decodes read half-written "
+                    "memory, which is what a decode that flickers between correct and corrupt "
+                    "from a fixed address requires");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_redecode_delay, 0, "GPU",
+                      "Frames after a decode to force a re-decode (0 = off). Four rechecks on a "
+                      "widening ladder; DECODECHANGE reports which found different bytes");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_framediff, 0, "GPU",
                       "Debug: dump the next N resolves as a PAIR -- our rendered target and "
                       "the guest-RAM contents at the same address -- for backend comparison");
@@ -785,6 +807,13 @@ struct TextureEntry {
   /// does eventually arrive is still picked up within ~1 second.
   uint32_t zero_retries = 0;
   uint64_t retry_frame = 0;
+  /// PREMATURE-DECODE TEST. Frame at which to force one re-decode regardless of the write-watch,
+  /// or 0 for none. The watch cannot help here: guest texture memory demonstrably changes through
+  /// paths it never sees (thousands of DECODECHANGE entries, every one at "page writes 0 -> 0"),
+  /// so a decode taken before the data landed is served forever and nothing signals it.
+  uint64_t recheck_frame = 0;
+  uint32_t rechecks_left = 0;
+  bool ladder_done = false;  ///< the ladder runs ONCE per entry, not once per decode
   /// How this texture's mip chain was actually provided: 0 = none, 1 = CPU-built (block
   /// compressed), 2 = driver auto-generated, 3 = decoded from the guest's own chain at
   /// mip_address. Classified by OUTCOME, not by intent, so the nx1_d3d9_bc_mips diagnostic
@@ -2167,6 +2196,19 @@ void ResourceTracker::LogCacheStats() {
   REXGPU_INFO("nx1_d3d9: DMAINVALIDATE {} cached textures re-decoded after a mirrored GPU copy "
               "(zero here means the mirror was landing bytes nobody ever re-read)",
               dma_invalidations_);
+  REXGPU_INFO("nx1_d3d9: TORNPAGES {} of {} page copies changed while being read -- non-zero "
+              "means texture decodes are reading half-written guest memory",
+              torn_pages_, torn_checked_);
+  REXGPU_INFO("nx1_d3d9: REDECODE forced={} rechecks (nx1_d3d9_redecode_delay={}) -- pair this "
+              "with the DECODECHANGE count: rechecks that found DIFFERENT bytes are decodes that "
+              "had been taken before the data landed",
+              forced_rechecks_, REXCVAR_GET(nx1_d3d9_redecode_delay));
+  REXGPU_INFO("nx1_d3d9: PARTIALSRC {} of {} decodes had an incomplete source ({}%) | {} of {} "
+              "source pages were still empty ({}%) -- the objective speckle baseline",
+              partial_decodes_, decodes_total_,
+              decodes_total_ ? partial_decodes_ * 100 / decodes_total_ : 0, partial_pages_sum_,
+              decode_pages_sum_,
+              decode_pages_sum_ ? partial_pages_sum_ * 100 / decode_pages_sum_ : 0);
   REXGPU_INFO("nx1_d3d9: RESOLVEMAP served={} rejected_stale={} (entries={})", resolve_served_,
               resolve_rejected_, resolves_ ? static_cast<ResolveMap*>(resolves_)->size() : 0);
   REXGPU_INFO("nx1_d3d9: SRCCLASS repeating(placeholder-like)={} high-entropy(garbage-like)={} "
@@ -2384,6 +2426,30 @@ const uint8_t* ResourceTracker::MirrorSnapshot(uint32_t phys_addr, uint32_t len)
   for (uint32_t p = p0; p <= p1; ++p) {
     if (!(mirror_valid_[p >> 6] & (uint64_t(1) << (p & 63)))) {
       std::memcpy(mirror_ + (size_t(p) << 12), phys_base_ + (size_t(p) << 12), 4096);
+      // TORN-PAGE TEST. This copy runs on the render thread with NOTHING synchronising it
+      // against the guest thread, which may be part-way through writing this very page --
+      // invalidations are queued and drained later, so nothing here waits for a write to finish.
+      // A page captured mid-write is half old bytes and half new, which is spatially patterned
+      // corruption that differs on every decode: exactly the observed flicker, where a surface
+      // alternates between correct and speckled in BOTH directions. A timing race would heal one
+      // way and stay healed, so tearing fits the symptom and a race no longer does.
+      //
+      // Copy twice and compare. Differing copies mean the page changed WHILE WE READ IT, which
+      // is proof rather than inference -- and it is the one explanation left that predicts a
+      // non-deterministic decode from a fixed address.
+      if (REXCVAR_GET(nx1_d3d9_dbg_tornpages)) {
+        alignas(16) static thread_local uint8_t second[4096];
+        std::memcpy(second, phys_base_ + (size_t(p) << 12), 4096);
+        ++torn_checked_;
+        if (std::memcmp(mirror_ + (size_t(p) << 12), second, 4096) != 0) {
+          ++torn_pages_;
+          if (torn_pages_ <= 8) {
+            REXGPU_WARN("nx1_d3d9: TORNPAGE physical page {:05X} ({:08X}) changed between two "
+                        "back-to-back copies -- the guest is writing it as we snapshot it",
+                        p, p << 12);
+          }
+        }
+      }
       mirror_valid_[p >> 6] |= (uint64_t(1) << (p & 63));
       if (auto* mem = rex::system::kernel_state()->memory()) {
         mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
@@ -2989,23 +3055,50 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // the failure is upstream of the texture cache (the game's streaming decision), not in
       // decode or invalidation. If a WRITE does appear and the texture stays wrong, the
       // invalidation chain lost it and the bug is ours.
-      uint32_t base_nz = 0, mip_nz = 0;
-      if (const uint8_t* bp = TranslatePhysical(t.base_address)) {
-        for (uint32_t i = 0; i < 8192; ++i) {
-          base_nz += bp[i] != 0 ? 1 : 0;
+      // SCAN THE WHOLE TEXTURE, not a fixed 8 KB prefix. The old fixed window silently reported
+      // only the first 8192 bytes: fine for a 128x128 DXT1 (which IS 8192 bytes -- that is the
+      // one case where the number meant what it said, and it read 1896/8192), but for a 512x512
+      // DXN it covered 3% of the image. Every "this texture is ~99% full" reading taken while
+      // hunting the speckle described an opening sliver and nothing else, which is precisely how
+      // a texture that is half black blocks past the first pages reads as healthy.
+      //
+      // Reported as EMPTY PAGES rather than nonzero bytes: a hole is page-shaped (that is how the
+      // data fails to arrive), and legitimately dark texels make a byte count look alarming for
+      // no reason.
+      const auto scan = [&](uint32_t addr, uint32_t bytes, uint32_t* empty_pages,
+                            uint32_t* total_pages) {
+        *empty_pages = *total_pages = 0;
+        const uint8_t* p = addr ? TranslatePhysical(addr) : nullptr;
+        if (!p || !bytes) {
+          return;
         }
-      }
-      if (const uint8_t* mp = t.mip_address ? TranslatePhysical(t.mip_address) : nullptr) {
-        for (uint32_t i = 0; i < 8192; ++i) {
-          mip_nz += mp[i] != 0 ? 1 : 0;
+        for (uint32_t off = 0; off < bytes; off += 4096) {
+          const uint32_t end = std::min(off + 4096u, bytes);
+          uint32_t nz = 0;
+          for (uint32_t i = off; i < end && !nz; ++i) nz += p[i] != 0 ? 1 : 0;
+          ++*total_pages;
+          *empty_pages += nz == 0 ? 1 : 0;
         }
+      };
+      // Guest size of level 0 from the format's own block geometry -- the same arithmetic the
+      // decode uses, so the scan covers exactly what we would read.
+      uint32_t base_bytes = 0;
+      if (const auto* fi = rex::graphics::FormatInfo::Get(t.format)) {
+        const uint32_t bw = (t.width + fi->block_width - 1) / fi->block_width;
+        const uint32_t tex_h = t.dimension == 0 ? 1u : t.height;
+        const uint32_t bh = (tex_h + fi->block_height - 1) / fi->block_height;
+        base_bytes = bw * bh * fi->bytes_per_block();
       }
+      uint32_t base_empty = 0, base_pages = 0, mip_empty = 0, mip_pages = 0;
+      scan(t.base_address, base_bytes, &base_empty, &base_pages);
+      scan(t.mip_address, base_bytes, &mip_empty, &mip_pages);
       REXGPU_INFO("nx1_d3d9: TRACK {:08X} BIND frame={} sampler={} {}x{} fmt={} dim={} "
-                  "mip_min={} mip_max={} mip_filter={} lod_bias={} packed={} "
-                  "base_nonzero={}/8192 mip_address={:08X} mip_nonzero={}/8192",
+                  "mip_min={} mip_max={} mip_filter={} lod_bias={} packed={} | base {} bytes, "
+                  "{} of {} pages EMPTY | mip_address={:08X} {} of {} pages EMPTY",
                   t.base_address, frame_, sampler, t.width, t.height, t.format, t.dimension,
                   t.mip_min_level, t.mip_max_level, t.mip_filter, t.lod_bias,
-                  t.packed_mips ? 1 : 0, base_nz, t.mip_address, mip_nz);
+                  t.packed_mips ? 1 : 0, base_bytes, base_empty, base_pages, t.mip_address,
+                  mip_empty, mip_pages);
     }
   }
 
@@ -3178,6 +3271,31 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   if (entry.tex && REXCVAR_GET(nx1_d3d9_dbg_mipdump) && dump_filter_active_ && dump_draw_) {
     entry.dirty = true;
     entry.retry_frame = 0;  // the backoff must not defer the very rebuild we asked for
+  }
+  // FORCED RE-DECODE. If the corruption is a race -- the decode taken before the guest finished
+  // landing the data -- then re-reading the same address later must produce different bytes, and
+  // the texture must come good. That is testable directly, and no passive signal can test it:
+  // every other suspect (mirror, eviction, resolve writeback, memexport readback, DmaCopy layout)
+  // has been eliminated by measurement, and this one matches the symptom nothing else explained,
+  // that speckle heals when you approach and that only SLOWING the whole pipeline has ever
+  // produced a clean frame.
+  //
+  // Schedules on a geometric ladder rather than a single retry: whatever fills these slots is
+  // asynchronous, so a fixed delay would answer only for that one latency. DECODECHANGE reports
+  // which of these rechecks actually found different bytes -- that number is the measurement,
+  // and the picture is the confirmation.
+  if (entry.tex && entry.recheck_frame && frame_ >= entry.recheck_frame) {
+    entry.dirty = true;
+    entry.retry_frame = 0;
+    ++forced_rechecks_;
+    if (entry.rechecks_left) {
+      --entry.rechecks_left;
+      const uint32_t base_delay = REXCVAR_GET(nx1_d3d9_redecode_delay);
+      entry.recheck_frame = frame_ + uint64_t(base_delay) * (1u << (3 - std::min(3u, entry.rechecks_left)));
+    } else {
+      entry.recheck_frame = 0;
+      entry.ladder_done = true;  // four rechecks is the whole test; do not re-arm
+    }
   }
   if (entry.tex && entry.layout_key == layout_key && (!entry.dirty || frame_ < entry.retry_frame)) {
     entry.last_frame = frame_;
@@ -4271,12 +4389,42 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       uint32_t(size_t(dst_row_bytes) * extent.block_height * (levels > 1 ? 4 : 3) / 3);
   entry.layout_key = layout_key;
   entry.dirty = false;
+  // Arm the premature-decode ladder HERE, at the actual end of a decode. It was first placed at
+  // the `committed = true` further up, which sits above the cache lookup and never runs on this
+  // path -- the run reported "forced=0" with the cvar plainly set, i.e. the instrument measured
+  // nothing and the zero meant nothing.
+  //
+  // `ladder_done` is what bounds this. Arming unconditionally here re-armed the ladder inside the
+  // very decode it triggered, so rechecks_left reset every time and EVERY texture re-decoded on a
+  // 30-frame cycle forever -- a permanent rebuild storm across the whole cache rather than the
+  // four-shot ladder intended. Arm once per entry; a genuine guest write still re-decodes through
+  // the write-watch, independently of this.
+  if (const uint32_t redecode_delay = REXCVAR_GET(nx1_d3d9_redecode_delay);
+      redecode_delay && !entry.ladder_done) {
+    entry.recheck_frame = frame_ + redecode_delay;
+    entry.rechecks_left = 3;
+  }
   // A broadcast-swizzle sprite that came out fully transparent is not resident yet: keep it dirty
   // (re-decode next bind) and never let it commit, so it recovers the moment its pool streams in.
   // A decode made from a source with holes is provisional for the same reason a fully-empty one
   // is: the pages have not all arrived. Keeping it caches a permanently speckled texture.
   // Independent of the retry cvar: even without retrying, a partial decode must not be frozen.
   entry.decoded_from_partial = partial_pages != 0;
+  // BASELINE METRIC for the speckle. partial_pages counts source pages that were entirely zero
+  // at decode time -- texels the guest had not landed yet -- so a texture decoded with any of
+  // them is a speckle candidate by construction, and this is objective where looking at the
+  // screen is not. Tracked as a rate because absolute counts move with how much is streaming.
+  //
+  // Worth measuring precisely now: three separate paths were found copying UNWRITTEN memory over
+  // good texels (the mirror from an empty source, memexport readback with the reference not
+  // rasterising, and forced re-decode from recycled slots). Each looked like a fix for missing
+  // data and was in fact destroying data that had arrived. This number says what is left.
+  ++decodes_total_;
+  decode_pages_sum_ += src_pages_total;
+  if (partial_pages) {
+    ++partial_decodes_;
+    partial_pages_sum_ += partial_pages;
+  }
   const bool partial = partial_pages != 0 && REXCVAR_GET(nx1_d3d9_retry_partial);
   if (swizzle_all_zero || partial) {
     entry.dirty = true;
