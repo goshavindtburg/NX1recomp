@@ -87,6 +87,22 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 /// the mirror off and committing off (which make a sprite re-decode whenever the guest writes
 /// it) firing a weapon will capture the muzzle flash on the spot -- the targeting problem that
 /// otherwise makes these sprites impossible to catch.
+/// Do not SHOW a texture decoded from an incomplete source.
+///
+/// Retrying cannot help the common case: the engine streams by proximity, so a distant texture's
+/// bytes are genuinely absent until the player approaches, and re-decoding just re-reads the same
+/// empty slot. Measured -- speckle clears within a second on nearby surfaces (the retry working)
+/// but persists on anything further out until approached.
+///
+/// The console never shows this. While an image is still streaming the engine draws its own
+/// placeholder or a coarser mip; only our renderer decodes the half-filled slot and puts the
+/// noise on screen. So substitute rather than display: a flat neutral texel is what a
+/// not-yet-resident image is supposed to look like, and it is strictly closer to the reference
+/// than garbage is. The real decode replaces it the moment the source completes.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_hide_partial, false, "GPU",
+                    "Bind a flat placeholder instead of a texture decoded from a source with "
+                    "empty pages, until its data actually arrives");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_retry_partial, false, "GPU",
                     "Re-decode a texture whose guest source had EMPTY pages, instead of keeping "
                     "that decode forever. The mirror snapshots on first touch, so a texture first "
@@ -220,6 +236,18 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_tornpages, false, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_redecode_delay, 0, "GPU",
                       "Frames after a decode to force a re-decode (0 = off). Four rechecks on a "
                       "widening ladder; DECODECHANGE reports which found different bytes");
+
+/// Latch the tracker onto the FIRST small DXT1 diffuse that decodes from a holey source.
+///
+/// Picking by eye cannot catch this: by the time a surface looks wrong its first decode is long
+/// past, and the streaming pool has usually moved the address since. The corrupt class is
+/// specific -- 128x128 fmt=18 diffuse maps whose guest memory is largely zeros (dumped as black
+/// blocks; measured at nonzero=1896/8192) -- so the decode itself can recognise one and start
+/// tracking at the exact moment it goes bad, capturing the DMACOPY / WRITE / POLL history from
+/// first bind rather than from whenever a human noticed.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_autotrack_partial, false, "GPU",
+                    "Point dbg_track_addr at the first <=128x128 fmt=18 texture that decodes with "
+                    "empty source pages, and log why it qualified");
 
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_framediff, 0, "GPU",
                       "Debug: dump the next N resolves as a PAIR -- our rendered target and "
@@ -2365,11 +2393,16 @@ void ResourceTracker::InvalidateGuestRange(uint32_t phys, uint32_t bytes) {
   if (mirror_ && !mirror_valid_.empty()) {
     const uint32_t p0 = a0 >> 12;
     const uint32_t p1 = (a1 - 1) >> 12;
+    // These pages WERE written -- by us, mirroring an image-cache copy. Record it: page
+    // protection never fired for them, so without this they read as "never written", and the
+    // partial-source test below would call legitimately-delivered data missing.
+    if (page_writes_.size() != size_t(kMirrorPages)) page_writes_.assign(kMirrorPages, 0);
     for (uint32_t p = p0; p <= p1 && (p >> 6) < mirror_valid_.size(); ++p) {
       mirror_valid_[p >> 6] &= ~(uint64_t(1) << (p & 63));
       if ((p >> 6) < watch_armed_.size()) {
         watch_armed_[p >> 6] &= ~(uint64_t(1) << (p & 63));
       }
+      if (p < page_writes_.size() && page_writes_[p] < 255) ++page_writes_[p];
     }
   }
   if (auto* textures = static_cast<TextureMap*>(textures_)) {
@@ -2623,6 +2656,17 @@ void ResourceTracker::LearnTextureBaseline(uint32_t frames) {
 }
 
 void ResourceTracker::AdvanceFrame() {
+  // Apply any autotrack request posted by a decode. Main thread only -- see the member's note.
+  if (const uint32_t req = autotrack_request_.exchange(0, std::memory_order_relaxed); req) {
+    if (req == kAutotrackRelease) {
+      REXCVAR_SET(nx1_d3d9_dbg_track_addr, 0u);
+      REXGPU_WARN("nx1_d3d9: AUTOTRACK released -- that texture decoded COMPLETE, so it healed "
+                  "and is not the permanent case. Hunting the next candidate");
+    } else {
+      REXCVAR_SET(nx1_d3d9_dbg_track_addr, req);
+    }
+  }
+
 
   // Poll the tracked address every frame and report whenever its populated-byte count changes.
   // We only ever sampled it at bind time; if the guest fills this memory and clears it again
@@ -3325,6 +3369,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     if (dbg_mip && white_ && entry.mip_source == (dbg_mip == 3 ? 0 : dbg_mip)) {
       return white_;
     }
+    // A decode made from a holey source is NOT what this surface should look like. Show the
+    // placeholder until the bytes arrive rather than the noise that is in the slot now.
+    if (entry.decoded_from_partial && white_ && REXCVAR_GET(nx1_d3d9_hide_partial)) {
+      return white_;
+    }
     return entry.tex;
   }
 
@@ -3806,13 +3855,40 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // page stops at its first non-zero byte, so a populated texture costs one byte per page.
   const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_partial_src);
   if (src && dst) {
+    // SCAN ONLY THE BYTES THIS TEXTURE ACTUALLY USES. guest_bytes is the TILED, PADDED extent,
+    // which for small images is far larger than the level: a 128x16 DXT1 is 1024 bytes but its
+    // guest extent is 8192, so the padding and packed mip tail -- legitimately zero -- were
+    // counted as missing data. That false "partial" verdict inflated the PARTIALSRC baseline to
+    // 17% and, once partial decodes started being replaced by a placeholder, turned much of the
+    // world white. A texture is incomplete only if the region it reads from is.
+    size_t scan_bytes = guest_bytes;
+    if (const auto* fi_scan = rex::graphics::FormatInfo::Get(t.format)) {
+      const uint32_t bw_s = (t.width + fi_scan->block_width - 1) / fi_scan->block_width;
+      const uint32_t bh_s = (height + fi_scan->block_height - 1) / fi_scan->block_height;
+      const size_t level0 = size_t(bw_s) * bh_s * fi_scan->bytes_per_block();
+      if (level0 && level0 < scan_bytes) {
+        scan_bytes = level0;
+      }
+    }
     uint32_t pages_total = 0, pages_empty = 0;
-    for (size_t off = 0; off < guest_bytes; off += 4096) {
-      const size_t end = (off + 4096 < guest_bytes) ? off + 4096 : guest_bytes;
+    for (size_t off = 0; off < scan_bytes; off += 4096) {
+      const size_t end = (off + 4096 < scan_bytes) ? off + 4096 : scan_bytes;
       uint32_t nz = 0;
       for (size_t i = off; i < end && nz == 0; ++i) nz += src[i] != 0 ? 1 : 0;
       ++pages_total;
-      pages_empty += nz == 0 ? 1 : 0;
+      // NEVER WRITTEN, not merely zero. An all-zero page is not evidence of missing data: a UI
+      // logo on a transparent background is genuinely zero over most of its area, and treating
+      // that as absent flagged it partial and replaced the NX1 title logo with a white box. What
+      // distinguishes absent from blank is whether anything ever wrote the page -- guest writes
+      // via the write-watch, ours via InvalidateGuestRange above.
+      //
+      // Same class of error as the entropy classifiers this project has now been burned by three
+      // times: judging texture CONTENT to infer residency. Judge the write history instead.
+      if (nz == 0) {
+        const uint32_t page = uint32_t((t.base_address + off) >> 12);
+        const bool ever_written = page < page_writes_.size() && page_writes_[page] != 0;
+        pages_empty += ever_written ? 0 : 1;
+      }
     }
     partial_pages = pages_empty;
     src_pages_total = pages_total;
@@ -4410,6 +4486,27 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // is: the pages have not all arrived. Keeping it caches a permanently speckled texture.
   // Independent of the retry cvar: even without retrying, a partial decode must not be frozen.
   entry.decoded_from_partial = partial_pages != 0;
+  // RELEASE the latch when the tracked texture decodes CLEANLY, so the hunt moves on. The first
+  // catch healed: data arrived progressively (nonzero 0 -> 1359 -> 7239 -> 7380), the guest wrote
+  // it, DIRTIED fired correctly. Partial-at-first-decode is NORMAL -- a texture caught mid-stream
+  // is not the bug. What matters is the one that never fills, so hold the latch only while the
+  // decode is still holey and re-arm on the next candidate otherwise.
+  // NOTE: only ever REQUEST a change here. Decodes run on the async translation worker
+  // (nx1_d3d9_async), and writing a cvar from that thread crashed the game -- a read fault at
+  // 0x27, i.e. a near-null deref inside the cvar machinery. The main thread applies it in
+  // AdvanceFrame.
+  if (!partial_pages && REXCVAR_GET(nx1_d3d9_dbg_autotrack_partial) &&
+      REXCVAR_GET(nx1_d3d9_dbg_track_addr) == t.base_address) {
+    autotrack_request_.store(kAutotrackRelease, std::memory_order_relaxed);
+  }
+  if (partial_pages && REXCVAR_GET(nx1_d3d9_dbg_autotrack_partial) &&
+      !REXCVAR_GET(nx1_d3d9_dbg_track_addr) && t.format == 18 && t.width <= 128 && height <= 128) {
+    autotrack_request_.store(t.base_address, std::memory_order_relaxed);
+    REXGPU_WARN("nx1_d3d9: AUTOTRACK {:08X} {}x{} fmt={} decoded with {} of {} source pages EMPTY "
+                "-- tracking from here. Watch for a DMACOPY landing on it (and what its source "
+                "held), and for a WRITE arriving AFTER this decode",
+                t.base_address, t.width, height, t.format, partial_pages, src_pages_total);
+  }
   // BASELINE METRIC for the speckle. partial_pages counts source pages that were entirely zero
   // at decode time -- texels the guest had not landed yet -- so a texture decoded with any of
   // them is a speckle candidate by construction, and this is objective where looking at the

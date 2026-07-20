@@ -20,6 +20,7 @@
 #include <cstdint>
 
 #ifdef _WIN32
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -617,6 +618,11 @@ class ResourceTracker {
   uint64_t mips_basemap_ = 0;          ///< kBaseMap: level 0 only, no chain wanted at all
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
   uint64_t forced_rechecks_ = 0;       ///< re-decodes forced by nx1_d3d9_redecode_delay
+  /// Autotrack hand-off. Decodes run on the async worker and MUST NOT write cvars from there --
+  /// doing so crashed the game with a near-null read fault inside the cvar machinery. The decode
+  /// posts a request here; AdvanceFrame (main thread) applies it.
+  static constexpr uint32_t kAutotrackRelease = 0xFFFFFFFFu;
+  std::atomic<uint32_t> autotrack_request_{0};
   uint64_t decodes_total_ = 0;         ///< texture decodes performed (speckle baseline)
   uint64_t partial_decodes_ = 0;       ///< of those, decoded with one or more empty source pages
   uint64_t decode_pages_sum_ = 0;      ///< source pages examined across all decodes
