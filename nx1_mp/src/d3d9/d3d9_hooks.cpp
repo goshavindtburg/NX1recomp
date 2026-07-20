@@ -25,6 +25,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <string>
 
 #include <rex/cvar.h>
@@ -634,6 +636,10 @@ REX_EXTERN(__imp__rex_ImageCache_WaitFence_YAHXZ);
 inline constexpr uint32_t kImgCachePendingFlag = 0x84138004;
 inline constexpr uint32_t kImgCacheFence = 0x84138020;
 
+namespace {
+void VerifyPendingDma(const uint8_t* base);  // defined with the DMA hooks below
+}  // namespace
+
 REX_HOOK_RAW(rex_ImageCache_WaitFence_YAHXZ) {
   static std::atomic<uint64_t> calls{0}, ns{0}, armed{0};
   const uint32_t pending_before = nx1::d3d9::GuestRead32(base, kImgCachePendingFlag);
@@ -643,6 +649,7 @@ REX_HOOK_RAW(rex_ImageCache_WaitFence_YAHXZ) {
   }
   const auto t0 = std::chrono::steady_clock::now();
   __imp__rex_ImageCache_WaitFence_YAHXZ(ctx, base);
+  VerifyPendingDma(base);  // the guest's own "DMA retired" signal is the place to check
   const uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
   const uint64_t total =
       ns.fetch_add(uint64_t((std::chrono::steady_clock::now() - t0).count()),
@@ -734,6 +741,97 @@ void ClassifyDmaSource(const uint8_t* base, uint32_t src, uint32_t bytes) {
   }
 }
 
+/// IS DmaCopy ACTUALLY A TRANSFORM? Everything written about this hook so far assumes it is --
+/// that the blit re-tiles in flight, and that our verbatim memcpy therefore produced the
+/// measured checkerboard. That is an INFERENCE, never a measurement, and it has been quoted
+/// back as if it were established. It has a competing explanation with the same symptom: the
+/// mirror may copy a source that is not valid in CPU RAM yet (ClassifyDmaSource was written for
+/// exactly that worry), in which case the move is verbatim and our bug was TIMING, not layout.
+///
+/// Run with the reference rasterising and readback_memexport on: guest RAM then holds the real
+/// post-blit bytes, so src and dst can simply be compared.
+///   dst == src  -> verbatim move. The transform story is wrong; delete it. Fix the source's
+///                  validity/timing instead.
+///   dst != src  -> a real transform, and the pair is the ground truth to derive it from.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_dmaverify, false, "GPU",
+                    "Compare each DMA destination against its source AFTER the blit retires, to "
+                    "settle whether ImageCache_DmaCopy transforms the layout or moves bytes "
+                    "verbatim. Needs the reference rasterising so guest RAM holds real results");
+
+struct PendingDma {
+  uint32_t dst, src, bytes;
+  std::chrono::steady_clock::time_point at;
+};
+std::mutex g_dma_verify_m;
+std::deque<PendingDma> g_dma_verify;
+
+void RecordPendingDma(uint32_t dst, uint32_t src, uint32_t bytes) {
+  if (!REXCVAR_GET(nx1_d3d9_dbg_dmaverify) || bytes < 256 || bytes > (16u << 20) || !dst || !src) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(g_dma_verify_m);
+  if (g_dma_verify.size() < 512) {
+    g_dma_verify.push_back({dst, src, bytes, std::chrono::steady_clock::now()});
+  }
+}
+
+/// Drained from the fence wait -- the guest's own "DMA retired" signal -- and only for entries
+/// old enough that the reference's readback has had time to land, so a mismatch means a real
+/// difference rather than a race against our own instrumentation.
+void VerifyPendingDma(const uint8_t* base) {
+  if (!REXCVAR_GET(nx1_d3d9_dbg_dmaverify)) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  for (;;) {
+    PendingDma e{};
+    {
+      std::lock_guard<std::mutex> lk(g_dma_verify_m);
+      if (g_dma_verify.empty() ||
+          now - g_dma_verify.front().at < std::chrono::milliseconds(250)) {
+        return;
+      }
+      e = g_dma_verify.front();
+      g_dma_verify.pop_front();
+    }
+    const uint32_t span = std::min(e.bytes, 64u << 10);
+    uint32_t same = 0, compared = 0;
+    int64_t first_bad = -1;
+    for (uint32_t off = 0; off < span; off += 4096) {
+      const uint32_t chunk = std::min(4096u, span - off);
+      const uint8_t* d = nx1::d3d9::GuestPointer(base, e.dst + off);
+      const uint8_t* s = nx1::d3d9::GuestPointer(base, e.src + off);
+      if (!d || !s) {
+        break;
+      }
+      for (uint32_t i = 0; i < chunk; ++i) {
+        ++compared;
+        if (d[i] == s[i]) {
+          ++same;
+        } else if (first_bad < 0) {
+          first_bad = off + i;
+        }
+      }
+    }
+    if (!compared) {
+      continue;
+    }
+    static std::atomic<uint64_t> n{0}, exact{0}, pct_sum{0};
+    const uint32_t pct = same * 100 / compared;
+    const uint64_t k = n.fetch_add(1, std::memory_order_relaxed) + 1;
+    pct_sum.fetch_add(pct, std::memory_order_relaxed);
+    if (pct == 100) {
+      exact.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (k <= 12 || (k % 500) == 0) {
+      REXGPU_WARN("nx1_d3d9: DMAVERIFY dst={:08X} src={:08X} {} bytes | {}% identical, first "
+                  "difference at {} | running: {} copies, {} byte-exact, {}% mean",
+                  e.dst, e.src, e.bytes, pct, first_bad, k, exact.load(),
+                  pct_sum.load() / k);
+    }
+  }
+}
+
 void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // OUR-RENDERER ONLY. In pure Xenia mode the GPU-side buffer is authoritative for DMA
   // results; a CPU write here fires Xenia's watches and replaces the GPU's (possibly
@@ -785,6 +883,7 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, a5 = ctx.r5.u32, a6 = ctx.r6.u32;
   __imp__rex_ImageCache_DmaCopy(ctx, base);
 #ifdef _WIN32
+  RecordPendingDma(dst, src, a5);  // independent of the mirror mode
   const uint32_t mode = REXCVAR_GET(nx1_d3d9_dmacopy_mirror);
   if (!mode) {
     return;
@@ -825,6 +924,7 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z) {
   const uint32_t hi = uint32_t(ctx.r5.u64 >> 32), lo = ctx.r5.u32;
   __imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z(ctx, base);
 #ifdef _WIN32
+  RecordPendingDma(dst, src, lo);  // lo = copy size (hi is the slot allocation)
   const uint32_t mode = REXCVAR_GET(nx1_d3d9_dmacopy_mirror);
   if (!mode) {
     return;
