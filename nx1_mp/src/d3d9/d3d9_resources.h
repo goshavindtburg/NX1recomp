@@ -502,6 +502,12 @@ class ResourceTracker {
   /// decrement only happens on one decode path and a material that never takes it rebuilt
   /// forever (33 GB of staging textures). See AdvanceFrame.
   uint32_t dump_arm_frames_ = 0;
+  /// Saturating count of guest writes seen per physical page, for the whole session. The
+  /// speckle is a stale PREFIX -- the first N bytes of a texture wrong, the rest correct, held
+  /// byte-identical for tens of seconds -- and every diagnostic so far only established that we
+  /// READ that memory faithfully. This answers the other question directly: was the prefix ever
+  /// written at all? Pages with zero writes were never touched by the guest while we watched.
+  std::vector<uint8_t> page_writes_;
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;

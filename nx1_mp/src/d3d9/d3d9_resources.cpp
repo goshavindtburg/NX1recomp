@@ -720,6 +720,10 @@ struct TextureEntry {
   IDirect3DVolumeTexture9* vol = nullptr;
   /// Cube maps (environment/reflection), a third D3D9 type again.
   IDirect3DCubeTexture9* cube = nullptr;
+  /// Host bytes this entry's texture occupies (level 0 plus its chain), for the MEM stats line.
+  /// Counts alone cannot say whether a cache is oversized: 1726 textures is unremarkable, 1726
+  /// textures holding 4 GB is the whole bug. Recorded at creation.
+  uint32_t host_bytes = 0;
   uint64_t layout_key = 0;  ///< base address + format + dims + mips; a change rebuilds it
   uint64_t last_frame = 0;
   /// Content hash for the cube/volume paths, which still re-read on a content change. The 2D path
@@ -2140,11 +2144,26 @@ void ResourceTracker::LogCacheStats() {
     }
     size_t mirror_pages_valid = 0;
     for (uint64_t w : mirror_valid_) mirror_pages_valid += size_t(__popcnt64(w));
-    REXGPU_INFO("nx1_d3d9: MEM private={} MiB working={} MiB | writes_pending={} "
-                "detile_scratch={} KiB mirror_valid={} MiB baseline_new={} pick_queries~n/a",
-                pmc.PrivateUsage / (1024 * 1024), pmc.WorkingSetSize / (1024 * 1024), pending,
-                detile_scratch_.size() / 1024, (mirror_pages_valid * 4096) / (1024 * 1024),
-                baseline_new_.size());
+    // BYTES, not counts. Sum what each cache actually holds and report the largest single
+    // entry beside it: a cache of 3000 buffers is unremarkable until one learns they are
+    // pool-sized. GetVertexBuffer allocates the WHOLE guest pool when a draw cannot bound
+    // itself by index reach (needed_vertices == 0), and the size is grow-only per entry, so
+    // one unbounded draw pins an entry at pool size for the rest of the session.
+    uint64_t tex_bytes = 0, vb_bytes = 0, vb_max = 0;
+    if (auto* tm = static_cast<TextureMap*>(textures_)) {
+      for (auto [k, e] : *tm) tex_bytes += e.host_bytes;
+    }
+    if (auto* vm = static_cast<VertexBufferMap*>(vertex_buffers_)) {
+      for (auto [k, e] : *vm) {
+        vb_bytes += e.bytes;
+        vb_max = std::max<uint64_t>(vb_max, e.bytes);
+      }
+    }
+    REXGPU_INFO("nx1_d3d9: MEM private={} MiB working={} MiB | tex_cache={} MiB vb_cache={} MiB "
+                "(largest vb {} KiB) | writes_pending={} detile_scratch={} KiB mirror_valid={} MiB",
+                pmc.PrivateUsage / (1024 * 1024), pmc.WorkingSetSize / (1024 * 1024),
+                tex_bytes / (1024 * 1024), vb_bytes / (1024 * 1024), vb_max / 1024, pending,
+                detile_scratch_.size() / 1024, (mirror_pages_valid * 4096) / (1024 * 1024));
   }
   REXGPU_INFO("nx1_d3d9: packedmip enabled={} small_decodes={} packed_decodes={} offsets_applied={}"
               " ({})",
@@ -2272,7 +2291,9 @@ void ResourceTracker::DrainMemoryWrites() {
     if (uint64_t(addr) + len > (uint64_t(kMirrorPages) << 12)) continue;
     const uint32_t p0 = addr >> 12;
     const uint32_t p1 = (addr + len - 1) >> 12;
+    if (page_writes_.size() != size_t(kMirrorPages)) page_writes_.assign(kMirrorPages, 0);
     for (uint32_t p = p0; p <= p1; ++p) {
+      if (p < page_writes_.size() && page_writes_[p] < 255) ++page_writes_[p];
       const uint64_t bit = uint64_t(1) << (p & 63);
       mirror_valid_[p >> 6] &= ~bit;  // invalidate: re-copy on next request
       // Disarm too, so the next read RE-ARMS the callback. The guest access callback fires
@@ -3182,14 +3203,19 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   }
   const bool guest_mips = !guest_plan.empty();
 
-  // A kBaseMap texture is sampled at level 0 only (the sampler carries MIPFILTER=NONE for it,
-  // see nx1_d3d9_basemap) -- generating a chain for it is pure wasted decode time, and any
-  // path that accidentally samples it reads fabricated data the hardware never touches.
-  const bool base_map_only = t.mip_filter == 2 && REXCVAR_GET(nx1_d3d9_basemap);
+  // kBaseMap is honoured at the SAMPLER (MIPFILTER=NONE, see nx1_d3d9_basemap), never here.
+  //
+  // Skipping chain generation for kBaseMap textures looks like free decode time and is a trap:
+  // mip_filter lives in the FETCH CONSTANT, which carries sampler state alongside the texture,
+  // so the same texture bound by two materials -- one asking kBaseMap, one asking linear --
+  // would flip the chain's existence between binds. With the level count (and mip_source) part
+  // of what decides whether the host texture is recreated, that released and recreated the
+  // texture on EVERY bind. Under D3D9Ex a DEFAULT-pool Release is deferred until the GPU is
+  // done, so the destruction queue outran the driver: process memory climbed to 33 GB within
+  // seconds of entering a match. The texture object must depend only on the texture.
   const bool auto_mips = SupportsAutoMips(device_, host.d3d);
   const bool bc_mips = IsBlockCompressed(host.d3d);
-  const bool want_mips =
-      !base_map_only && REXCVAR_GET(nx1_d3d9_mips) && (guest_mips || auto_mips || bc_mips);
+  const bool want_mips = REXCVAR_GET(nx1_d3d9_mips) && (guest_mips || auto_mips || bc_mips);
   const bool build_mips =
       want_mips && !guest_mips && !auto_mips && REXCVAR_GET(nx1_d3d9_bc_mips);
   const uint32_t levels = guest_mips ? uint32_t(1 + guest_plan.size())
@@ -3198,9 +3224,6 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // Track how each texture's mip chain is provided (guest chain / built here / driver auto-gen /
   // skipped), so the periodic "mipgen" stats line can show the split across the whole run.
   const bool driver_mips = auto_mips && want_mips && !guest_mips;
-  // A change of mip-source class changes the host texture's level structure, and UpdateTexture
-  // requires staging and target to match -- force a recreate below (the cvars can flip live).
-  const uint8_t prev_mip_source = entry.mip_source;
   entry.mip_source = guest_mips ? 3 : build_mips ? 1 : (driver_mips ? 2 : 0);
   if (guest_mips) {
     ++mips_guest_;
@@ -3208,7 +3231,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ++mips_built_;
   } else if (want_mips) {
     ++mips_auto_;
-  } else if (base_map_only) {
+  } else if (t.mip_filter == 2) {
+    // Counted for visibility only. The chain is still BUILT for these -- the sampler is what
+    // refuses to read it -- so this must never feed back into the texture object.
     ++mips_basemap_;
   } else if (t.mip_max_level == 0) {
     ++mips_skip_nochain_;
@@ -3262,7 +3287,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ArmWriteWatch(t.base_address, uint32_t(guest_bytes));
     src = TranslatePhysical(t.base_address);
   }
-  if (entry.tex && (entry.layout_key != layout_key || prev_mip_source != entry.mip_source)) {
+  // ONLY the layout decides recreation. mip_source was added here too and had to come back out:
+  // it is derived from state that can differ between binds of the same texture, so it turned
+  // every such bind into a release + recreate (see the want_mips note above).
+  if (entry.tex && entry.layout_key != layout_key) {
     entry.tex->Release();
     entry.tex = nullptr;
     ++tex_rebuilds_;
@@ -3621,10 +3649,72 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // material binds, and a material can bind slots its shader never reads. A noise texture
       // on an unused high slot says nothing about what is on screen, while noise on slot 0 (the
       // colormap) is the artifact itself.
+      // EVERY layout-bearing field, printed rather than assumed. The corruption is systematic
+      // (a leading run of rows, stable, on data the guest demonstrably wrote), which is what a
+      // misread layout field looks like -- and tiled/pitch/endian/dimension have never once
+      // been logged for a corrupt texture. pitch especially: it is a 9-bit field scaled by 32,
+      // so a texture whose pitch exceeds its width has rows we are reading at the wrong stride.
       REXGPU_INFO("nx1_d3d9: mip dump s{} {}x{} fmt {} levels={} mip_filter={} aniso={} "
-                  "src_empty_pages={}/{} mip_address={:08X} -> texdump/mip_{:08X}_f{}_L*.bmp",
+                  "src_empty_pages={}/{} mip_address={:08X} | tiled={} pitch={} dim={} "
+                  "endian={} swizzle={:#05x} sign={},{},{},{} blocks={}x{} pitchblocks={}x{} "
+                  "-> texdump/mip_{:08X}_f{}_L*.bmp",
                   sampler, t.width, height, t.format, levels, t.mip_filter, t.aniso_filter,
-                  partial_pages, src_pages_total, t.mip_address, t.base_address, frame_);
+                  partial_pages, src_pages_total, t.mip_address, t.tiled ? 1 : 0, t.pitch_pixels,
+                  t.dimension, t.endian, t.swizzle, t.sign[0], t.sign[1], t.sign[2], t.sign[3],
+                  extent.block_width, extent.block_height, extent.block_pitch_h,
+                  extent.block_pitch_v, t.base_address, frame_);
+
+      // WAS THE BAD REGION EVER WRITTEN? The decisive question, and the one every previous
+      // diagnostic talked around: they all established that we read this memory faithfully,
+      // which is not in doubt. Print the per-page guest write count across the texture. If the
+      // stale prefix reads 0 while the correct tail reads >0, the guest never wrote those bytes
+      // while we were watching -- so it is not a race we lose, and the reference must be
+      // showing a copy it took earlier. If the prefix reads >0, the writes DID arrive and we
+      // failed to act on them, which is our bug and a very different fix.
+      {
+        std::string wb;
+        const uint32_t np = uint32_t((guest_bytes + 4095) / 4096);
+        uint32_t zero_pages = 0;
+        for (uint32_t i = 0; i < np; ++i) {
+          const uint32_t p = (t.base_address >> 12) + i;
+          const uint32_t n = p < page_writes_.size() ? page_writes_[p] : 0;
+          if (n == 0) ++zero_pages;
+          if (i < 48) {
+            if (i) wb += ',';
+            wb += std::to_string(n);
+          }
+        }
+        REXGPU_WARN("nx1_d3d9: PAGEWRITES {:08X} {} pages, {} never written | per-page: {}",
+                    t.base_address, np, zero_pages, wb);
+      }
+
+      // WHAT IS THE BAD REGION, ACTUALLY? The corruption is confined to the first macro-tile
+      // row, is byte-identical across 26 seconds, and decodes to STRUCTURE (green/black
+      // striping), not noise -- so those bytes are real data written by someone. Dump the raw
+      // guest bytes of the first tile row so the pattern can be identified offline: a short
+      // repeating period means a fill/clear, a 4 KB period means page-granular reuse, and
+      // recognisable block structure means another texture's pixels.
+      {
+        const size_t tile_row_bytes =
+            std::min<size_t>(guest_bytes, size_t(extent.block_pitch_h) * 32 * bpb);
+        char raw_path[256];
+        std::snprintf(raw_path, sizeof(raw_path), "texdump/raw_%08X_f%llu.bin", t.base_address,
+                      static_cast<unsigned long long>(frame_));
+        if (FILE* f = std::fopen(raw_path, "wb")) {
+          std::fwrite(src, 1, tile_row_bytes, f);
+          std::fclose(f);
+        }
+        // The same span from the KNOWN-GOOD second tile row, as a control: whatever analysis
+        // says about the bad bytes has to say something different about these.
+        if (guest_bytes > tile_row_bytes * 2) {
+          std::snprintf(raw_path, sizeof(raw_path), "texdump/rawok_%08X_f%llu.bin",
+                        t.base_address, static_cast<unsigned long long>(frame_));
+          if (FILE* f = std::fopen(raw_path, "wb")) {
+            std::fwrite(src + tile_row_bytes, 1, tile_row_bytes, f);
+            std::fclose(f);
+          }
+        }
+      }
 
       // OUR LAYOUT vs THE REFERENCE'S, on the same texture. Both backends run over the same
       // recompiled game and the same memory -- the reference renders these correctly, so the
@@ -3917,6 +4007,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   }
   stage_add(prof_tex_.commit_ns, t_commit);
 
+  // Approximate host footprint: the level-0 surface plus a full chain is ~4/3 of level 0.
+  entry.host_bytes =
+      uint32_t(size_t(dst_row_bytes) * extent.block_height * (levels > 1 ? 4 : 3) / 3);
   entry.layout_key = layout_key;
   entry.dirty = false;
   // A broadcast-swizzle sprite that came out fully transparent is not resident yet: keep it dirty
