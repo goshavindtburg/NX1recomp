@@ -218,8 +218,16 @@ class ResourceTracker {
   /// Record a resolve: StretchRect the current render target (source rect) into a
   /// host texture keyed by the destination's guest address, so a later draw that
   /// samples that address gets the rendered image instead of untiled memory.
+  /// With `writeback` set (decided at record time on the guest thread -- see
+  /// RecordedCommand::resolve_writeback), the resolved pixels are ALSO read back and written
+  /// into guest RAM at the destination in its declared format/endian/tiling, so the game's
+  /// CPU-side bakes read real data instead of the pool's leftovers.
   void ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height, const RECT& src_rect,
-                    const POINT& dest_point);
+                    const POINT& dest_point, const TextureFetchConstant& dest, bool writeback);
+
+  /// Should this resolve be written back to guest RAM? Consumes one unit of the destination's
+  /// writeback budget when it says yes. Guest thread only, under render_mutex_.
+  bool WantResolveWriteback(const TextureFetchConstant& dest);
 
   //--- Render targets --------------------------------------------------------
   //
@@ -528,6 +536,18 @@ class ResourceTracker {
     uint32_t changes = 0;
   };
   std::unordered_map<uint64_t, DecodeStamp> decode_hashes_;
+
+  /// Resolve writeback state. Budget per destination address: bake resolves happen once or
+  /// twice per destination and are exactly what the CPU reads; the per-frame scene and shadow
+  /// resolves would cost a GetRenderTargetData sync every frame for memory nobody reads, so
+  /// each destination gets a few writebacks and then stops. Counts on the guest thread under
+  /// render_mutex_; staging surface reused across writebacks of the same size.
+  std::unordered_map<uint32_t, uint32_t> writeback_counts_;
+  IDirect3DSurface9* writeback_staging_ = nullptr;
+  uint32_t writeback_staging_w_ = 0, writeback_staging_h_ = 0;
+  uint64_t writebacks_done_ = 0, writeback_bytes_ = 0;
+  void ResolveWriteback(IDirect3DTexture9* tex, uint32_t width, uint32_t height,
+                        const TextureFetchConstant& dest);
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;

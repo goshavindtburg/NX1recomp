@@ -1626,6 +1626,12 @@ void ResourceTracker::Shutdown() {
     std::lock_guard<std::mutex> lk(dirty_mu_);
     writes_pending_.clear();
   }
+  if (writeback_staging_) {
+    writeback_staging_->Release();
+    writeback_staging_ = nullptr;
+    writeback_staging_w_ = writeback_staging_h_ = 0;
+  }
+  writeback_counts_.clear();
   if (mirror_) {
     VirtualFree(mirror_, 0, MEM_RELEASE);
     mirror_ = nullptr;
@@ -4769,8 +4775,186 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   RebuildResolveFlat();
 }
 
+/// Write the resolved pixels back into guest RAM, so the game's CPU-side reads see them.
+///
+/// This is the native half of the root-cause fix for the texture speckle: NX1 bakes textures by
+/// rendering, resolving, then READING THE RESOLVE DESTINATION ON THE CPU (compressing imposters
+/// to DXT, retiling, and so on). On hardware the resolve lands in unified memory; here our
+/// renderer resolved into a host texture and guest RAM kept the previous occupant's bytes, so
+/// every bake compressed garbage. The reference proved the mechanism: readback_resolve="full"
+/// (plus real rasterization) made the scene nearly clean until its readback path hit memory
+/// pressure. This writeback makes the D3D9 renderer self-sufficient instead -- no reference
+/// raster, no readback cvars.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_resolve_writeback, true, "GPU",
+                    "Write resolve results back into guest memory so CPU-side texture bakes "
+                    "read real pixels. The fix for baked-texture speckle (imposters, decals)");
+/// Per-destination budget, because writeback is a GPU sync (GetRenderTargetData). Bake
+/// destinations are resolved once or twice and are exactly what the CPU reads; the scene and
+/// shadow targets are resolved every frame and never CPU-read, so each destination gets a few
+/// writebacks and then stops. Predicated tiling resolves a destination in BANDS, each its own
+/// call -- the budget must comfortably exceed the band count so the final band still writes.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_writeback_max, 8, "GPU",
+                      "Writebacks per resolve destination before it is assumed to be a "
+                      "per-frame render loop target and skipped");
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_writeback_all, false, "GPU",
+                    "Debug: ignore the per-destination budget and write back EVERY resolve. "
+                    "Costs a GPU sync per resolve; correctness reference, not a mode to play");
+
+bool ResourceTracker::WantResolveWriteback(const TextureFetchConstant& dest) {
+  if (!REXCVAR_GET(nx1_d3d9_resolve_writeback)) {
+    return false;
+  }
+  if (!dest.base_address || !dest.width || !dest.height || dest.dimension != 1) {
+    // Was a SILENT reject; a whole class of bake destinations could have been dropped here
+    // without a trace, indistinguishable from "no such resolves happen".
+    static std::mutex m;
+    static std::vector<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(m);
+    if (dest.base_address &&
+        std::find(seen.begin(), seen.end(), dest.base_address) == seen.end() &&
+        seen.size() < 16) {
+      seen.push_back(dest.base_address);
+      REXGPU_WARN("nx1_d3d9: resolve writeback skipping {:08X} -- {}x{} dim={} (not a 2D "
+                  "image destination)",
+                  dest.base_address, dest.width, dest.height, dest.dimension);
+    }
+    return false;
+  }
+  // Depth formats are published as sampleable host depth textures instead (ResolveDepth), and
+  // the CPU does not read shadow maps back. Colour: k_8_8_8_8 (6) covers the bakes; name any
+  // other format once so support can be added deliberately rather than guessed at.
+  if (dest.format != 6) {
+    static std::mutex m;
+    static std::vector<uint32_t> seen;
+    std::lock_guard<std::mutex> lk(m);
+    if (std::find(seen.begin(), seen.end(), dest.format) == seen.end() && seen.size() < 16) {
+      seen.push_back(dest.format);
+      REXGPU_WARN("nx1_d3d9: resolve writeback skipping unsupported dest format {} ({}x{} at "
+                  "{:08X}) -- add if its content is CPU-read",
+                  dest.format, dest.width, dest.height, dest.base_address);
+    }
+    return false;
+  }
+  uint32_t& count = writeback_counts_[PhysicalAddress(dest.base_address)];
+  if (!REXCVAR_GET(nx1_d3d9_dbg_writeback_all) &&
+      count >= REXCVAR_GET(nx1_d3d9_writeback_max)) {
+    return false;
+  }
+  ++count;
+  return true;
+}
+
+void ResourceTracker::ResolveWriteback(IDirect3DTexture9* tex, uint32_t width, uint32_t height,
+                                       const TextureFetchConstant& dest) {
+  namespace tu = rex::graphics::texture_util;
+  const auto t0 = std::chrono::steady_clock::now();
+
+  const auto* fmt = rex::graphics::FormatInfo::Get(dest.format);
+  if (!fmt) {
+    return;
+  }
+  const uint32_t bpb = fmt->bytes_per_block();  // 4 for k_8_8_8_8
+  const uint32_t pitch_px = dest.pitch_pixels ? dest.pitch_pixels : width;
+  const rex::graphics::TextureExtent extent = rex::graphics::TextureExtent::Calculate(
+      fmt, pitch_px, height, /*depth=*/1, dest.tiled, /*is_guest=*/true);
+  const uint32_t pitch_blocks = extent.block_pitch_h;
+  const uint64_t guest_bytes = uint64_t(extent.block_pitch_h) * extent.block_pitch_v * bpb;
+  const uint32_t phys = PhysicalAddress(dest.base_address);
+  if (uint64_t(phys) + guest_bytes > (uint64_t(kMirrorPages) << 12)) {
+    return;
+  }
+  uint8_t* gdst = const_cast<uint8_t*>(TranslatePhysical(phys));
+  if (!gdst) {
+    return;
+  }
+
+  // Staging surface, reused while the size repeats (bakes come in bursts of one size).
+  if (writeback_staging_ &&
+      (writeback_staging_w_ != width || writeback_staging_h_ != height)) {
+    writeback_staging_->Release();
+    writeback_staging_ = nullptr;
+  }
+  if (!writeback_staging_) {
+    if (FAILED(device_->CreateOffscreenPlainSurface(width, height, D3DFMT_A8R8G8B8,
+                                                    D3DPOOL_SYSTEMMEM, &writeback_staging_,
+                                                    nullptr))) {
+      REXGPU_ERROR("nx1_d3d9: writeback staging ({}x{}) failed", width, height);
+      writeback_staging_ = nullptr;
+      return;
+    }
+    writeback_staging_w_ = width;
+    writeback_staging_h_ = height;
+  }
+  IDirect3DSurface9* rt = nullptr;
+  if (FAILED(tex->GetSurfaceLevel(0, &rt)) || !rt) {
+    return;
+  }
+  // Synchronous by design: the caller (the guest thread, via the drain in Renderer::Resolve)
+  // is waiting on this before letting the game's CPU read the destination.
+  const HRESULT hr = device_->GetRenderTargetData(rt, writeback_staging_);
+  rt->Release();
+  if (FAILED(hr)) {
+    REXGPU_ERROR("nx1_d3d9: writeback GetRenderTargetData({}x{}) failed {:#010x}", width, height,
+                 uint32_t(hr));
+    return;
+  }
+  D3DLOCKED_RECT lr{};
+  if (FAILED(writeback_staging_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+    return;
+  }
+
+  // Byte order. Post-endian-swap, a k_8_8_8_8 texel's guest bytes are its components in order
+  // [R][G][B][A] (see the Swizzle32 note); the host surface is [B][G][R][A]. So guest MEMORY
+  // must hold the pre-swap form: reversed for 8-in-32 (the usual case), identity for none.
+  // 8-in-16 on a 32bpp texel is nonsensical; treat as 8-in-32 and say so once.
+  if (dest.endian == 1) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXGPU_WARN("nx1_d3d9: writeback dest {:08X} declares endian 1 (8in16) on 32bpp -- "
+                  "treating as 8in32",
+                  dest.base_address);
+    }
+  }
+  const bool swap32 = dest.endian != 0;
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* srow = static_cast<const uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch;
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint8_t* h = srow + size_t(x) * 4;  // B,G,R,A
+      uint8_t out[4];
+      if (swap32) {
+        out[0] = h[3];  // A
+        out[1] = h[0];  // B
+        out[2] = h[1];  // G
+        out[3] = h[2];  // R
+      } else {
+        out[0] = h[2];  // R
+        out[1] = h[1];  // G
+        out[2] = h[0];  // B
+        out[3] = h[3];  // A
+      }
+      const size_t off =
+          dest.tiled
+              ? size_t(tu::GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks, 2))
+              : (size_t(y) * pitch_blocks + x) * 4;
+      std::memcpy(gdst + off, out, 4);
+    }
+  }
+  writeback_staging_->UnlockRect();
+
+  ++writebacks_done_;
+  writeback_bytes_ += guest_bytes;
+  const double us =
+      double((std::chrono::steady_clock::now() - t0).count()) / 1000.0;
+  REXGPU_INFO("nx1_d3d9: WRITEBACK {:08X} {}x{} tiled={} endian={} {} KiB in {:.0f} us "
+              "(#{} total)",
+              dest.base_address, width, height, dest.tiled ? 1 : 0, dest.endian,
+              guest_bytes / 1024, us, writebacks_done_);
+}
+
 void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height,
-                                   const RECT& src_rect, const POINT& dest_point) {
+                                   const RECT& src_rect, const POINT& dest_point,
+                                   const TextureFetchConstant& dest, bool writeback) {
   if (!device_ || !resolves_ || !dest_address || !width || !height) {
     return;
   }
@@ -4830,6 +5014,13 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
   if (src) src->Release();
   // The bind path scans a flat mirror of this map; keep it in step.
   RebuildResolveFlat();
+
+  // After the band has landed in the host copy. Bands before the last write a partially
+  // updated image; the final band's writeback leaves the destination complete, and the guest
+  // thread is drained behind ALL of them before the game can read.
+  if (writeback && entry.tex) {
+    ResolveWriteback(entry.tex, width, height, dest);
+  }
 }
 
 }  // namespace nx1::d3d9

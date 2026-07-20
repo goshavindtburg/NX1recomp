@@ -1221,7 +1221,25 @@ void Renderer::Resolve(const uint8_t* base, uint32_t dest_texture, uint32_t src_
       c.clear_color[i] = GuestReadF32(base, clear_color + i * 4);
     }
   }
+  // Resolve writeback is decided HERE, on the guest thread, for two reasons. The budget map is
+  // plain state guarded by render_mutex_, which this thread holds. And the decision gates a
+  // worker drain below: the game's bake pattern is resolve -> fence -> CPU read, and the fence
+  // is satisfied by the reference command processor almost immediately -- so if the guest is
+  // allowed to run ahead of our deferred executor, it reads the destination before we have even
+  // performed the resolve, let alone written the pixels back. Draining after submit means the
+  // resolve, the draws that produced its content, and the writeback have ALL completed before
+  // the guest resumes. Present already drains while holding render_mutex_, so the worker is
+  // known not to take it -- no deadlock class here.
+  bool want_writeback = false;
+  if (dest_texture) {
+    const TextureFetchConstant dest = ReadBaseTextureFormat(base, dest_texture);
+    want_writeback = ResourceTracker::Get().WantResolveWriteback(dest);
+    c.resolve_writeback = want_writeback;
+  }
   SubmitCommand(base, 0, uint32_t(cmdbuf_.commands().size() - 1));
+  if (want_writeback) {
+    DrainWorker();
+  }
 }
 
 void Renderer::ExecuteResolve(const uint8_t* base, const RecordedCommand& c) {
@@ -1250,7 +1268,7 @@ void Renderer::ResolveCopy(const uint8_t* base, const RecordedCommand& c) {
     static std::vector<uint32_t> seen;
     std::lock_guard<std::mutex> lk(m);
     if (std::find(seen.begin(), seen.end(), dest.base_address) == seen.end() &&
-        seen.size() < 64) {
+        seen.size() < 512) {  // 64 was too small a window: late bake destinations fell off it
       seen.push_back(dest.base_address);
       REXGPU_INFO("nx1_d3d9: RESOLVEDST {:08X} {}x{} fmt={} tiled={} (dest_texture {:08X})",
                   dest.base_address, dest.width, dest.height, dest.format, dest.tiled ? 1 : 0,
@@ -1287,7 +1305,8 @@ void Renderer::ResolveCopy(const uint8_t* base, const RecordedCommand& c) {
     return;
   }
 
-  ResourceTracker::Get().ResolveColor(dest.base_address, dest.width, dest.height, rect, at);
+  ResourceTracker::Get().ResolveColor(dest.base_address, dest.width, dest.height, rect, at, dest,
+                                      c.resolve_writeback);
 
   // A display-sized colour resolve is the finished frame; remember it for Present.
   if (dest.width == backbuffer_width_ && dest.height == backbuffer_height_) {

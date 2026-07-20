@@ -355,6 +355,12 @@ struct RecordedCommand {
   /// the time a worker read them -- a texture object is a persistent allocation, the same
   /// read-it-late class as the shader objects and surface descriptors.
   uint32_t dest_texture = 0;
+  /// kResolve: write the resolved pixels back into guest RAM at the destination, so the
+  /// game's CPU-side reads (texture bakes) see real data. Decided on the GUEST thread at
+  /// record time -- the budget map is not thread-safe, and the guest thread must also know
+  /// the answer to drain the worker before returning (the bake pattern is resolve -> fence ->
+  /// CPU read, so the writeback has to land before the guest resumes).
+  bool resolve_writeback = false;
 
   // --- kSetRenderTarget / kSetDepthStencil ---------------------------------------------
   uint32_t rt_index = 0;

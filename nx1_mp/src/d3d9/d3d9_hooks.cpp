@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 
+#include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging/macros.h>
 #include <rex/ppc/context.h>
@@ -474,5 +475,156 @@ REX_HOOK_RAW(rex_XGSetIndexBufferHeader) {
 
 REX_HOOK_RAW(rex_XGSetTextureHeader) {
   __imp__rex_XGSetTextureHeader(ctx, base);
+}
+
+//=============================================================================
+// Command buffer playback (the unrecorded draw path)
+//=============================================================================
+//
+// The CPFETCH/D9FETCH alignment found ~2400 ring draws per window that our draw hooks never
+// record, and paired substitutions at matching positions (ring s0=10000000 where ours says a
+// pool slot). Xenon command buffers carry FIXUPS -- resources patched into the recorded PM4 at
+// playback -- and that is IW4's late image binding: record with the intended image, play back
+// with whatever representation is currently resident. We capture the device shadow at RECORD
+// time, so for command-buffered draws we bind the pre-fixup constant: the unstreamed slot,
+// while the console binds the low-res proxy. That is the distance speckle at the binding
+// layer. These counters establish the traffic before any capture surgery.
+REX_EXTERN(__imp__rex_D3DDevice_RunCommandBuffer);
+REX_EXTERN(__imp__rex_D3DDevice_InsertAsyncCommandBufferCall);
+REX_EXTERN(__imp__rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIter_PBUGfxViewport_PBD_Z);
+
+namespace {
+std::atomic<uint64_t> g_cb_run{0}, g_cb_async{0}, g_cb_r_run{0};
+void LogCmdBufTraffic() {
+  static std::atomic<uint64_t> last{0};
+  const uint64_t total = g_cb_run.load() + g_cb_async.load() + g_cb_r_run.load();
+  if (total - last.load() >= 100) {
+    last.store(total);
+    REXGPU_WARN("nx1_d3d9: CMDBUF traffic run={} async={} r_run={}", g_cb_run.load(),
+                g_cb_async.load(), g_cb_r_run.load());
+  }
+}
+}  // namespace
+
+REX_HOOK_RAW(rex_D3DDevice_RunCommandBuffer) {
+  g_cb_run.fetch_add(1, std::memory_order_relaxed);
+  LogCmdBufTraffic();
+  __imp__rex_D3DDevice_RunCommandBuffer(ctx, base);
+}
+
+REX_HOOK_RAW(rex_D3DDevice_InsertAsyncCommandBufferCall) {
+  g_cb_async.fetch_add(1, std::memory_order_relaxed);
+  LogCmdBufTraffic();
+  __imp__rex_D3DDevice_InsertAsyncCommandBufferCall(ctx, base);
+}
+
+REX_HOOK_RAW(rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIter_PBUGfxViewport_PBD_Z) {
+  g_cb_r_run.fetch_add(1, std::memory_order_relaxed);
+  LogCmdBufTraffic();
+  __imp__rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIter_PBUGfxViewport_PBD_Z(ctx,
+                                                                                              base);
+}
+
+//=============================================================================
+// ImageCache DMA copies
+//=============================================================================
+//
+// The image cache moves texture data between pool slots WITH THE GPU: DmaCopy saves shader
+// state, binds the source bytes as a vertex buffer, BeginExport()s the destination, and
+// DrawVertices()es a shader that ferries the data across -- a memexport blit (read straight
+// from the recompiled body). On console that lands in unified memory. Here it lands in the
+// reference backend's GPU-side buffer, and CPU-visible guest RAM keeps whatever the slot held
+// before -- which is the image cache's own DEFAULT-PIXEL placeholder for fresh slots
+// (ImageCache_GetDefaultPixels): the identical structured "speckle" pattern measured across
+// many textures at once. Memexport readback (readback_memexport) recovers most of these, which
+// is exactly the improvement observed when it was enabled; this hook is the native,
+// reference-free completion: mirror the move in CPU RAM ourselves.
+//
+// Mode 1 logs the arguments only. The byte count is believed to be one of the two
+// ImageAllocInfo words (r5/r6) and NOTHING is written to guest memory until a logged run has
+// confirmed which -- a wrong length here would corrupt the pool far worse than the bug.
+// Mode 2 performs the mirror copy, page-wise through GuestPointer: image cache pointers are
+// physical-mirror EAs, and a single bulk memcpy through `base +` arithmetic has already
+// blacked the screen three times in this project's history.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dmacopy_mirror, 1, "GPU",
+                      "ImageCache_DmaCopy handling: 0=off, 1=log arguments (first 32), "
+                      "2=log and mirror the GPU copy in CPU-visible guest RAM");
+
+REX_EXTERN(__imp__rex_ImageCache_DmaCopy);
+REX_EXTERN(__imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z);
+
+namespace {
+
+/// Mirror one image-cache move into CPU-visible guest RAM. Page-wise through GuestPointer --
+/// these are physical-mirror EAs, and bulk `base +` arithmetic across them has burned this
+/// project three times. Idempotent, so a delayed copy that is later flushed through the
+/// immediate path simply copies the same bytes twice.
+void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
+  if (bytes < 32 || bytes > (16u << 20) || !dst || !src) {
+    return;
+  }
+  for (uint32_t off = 0; off < bytes; off += 4096) {
+    const uint32_t chunk = std::min(4096u, bytes - off);
+    uint8_t* d = const_cast<uint8_t*>(nx1::d3d9::GuestPointer(base, dst + off));
+    const uint8_t* s = nx1::d3d9::GuestPointer(base, src + off);
+    if (!d || !s) {
+      return;
+    }
+    std::memcpy(d, s, chunk);
+  }
+}
+
+}  // namespace
+
+REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
+  const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, a5 = ctx.r5.u32, a6 = ctx.r6.u32;
+  __imp__rex_ImageCache_DmaCopy(ctx, base);
+#ifdef _WIN32
+  const uint32_t mode = REXCVAR_GET(nx1_d3d9_dmacopy_mirror);
+  if (!mode) {
+    return;
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+    REXGPU_WARN("nx1_d3d9: DMACOPY dst={:08X} src={:08X} a5={:08X} a6={:08X}", dst, src, a5, a6);
+  }
+  if (mode >= 2) {
+    // a5 confirmed as the byte count by the logged run: clean page multiples, and dst/size
+    // pairs that match the GPU-written census entry for entry.
+    MirrorDmaCopy(base, dst, src, a5);
+  }
+#endif
+}
+
+// The DELAYED variant queues the move for a later batched flush. It is a separate entry point,
+// and it is the leading explanation for the remaining distance-dependent speckle: the cache
+// uses immediate copies for urgent (nearby) images and the delayed path for the rest, so
+// mirroring only the immediate one healed exactly the surfaces you walk up to. Mirroring at
+// QUEUE time is sound: the source staging is complete before the game queues it, and the flush
+// re-copies the same bytes. The 8-byte ImageAllocInfo arrives packed in r5 (big-endian struct
+// in a 64-bit register: size in the HIGH half) -- both halves are logged so a wrong guess is
+// visible, and the copy takes whichever half passes the sanity gate.
+REX_HOOK_RAW(rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z) {
+  const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32;
+  const uint32_t hi = uint32_t(ctx.r5.u64 >> 32), lo = ctx.r5.u32;
+  __imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z(ctx, base);
+#ifdef _WIN32
+  const uint32_t mode = REXCVAR_GET(nx1_d3d9_dmacopy_mirror);
+  if (!mode) {
+    return;
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+    REXGPU_WARN("nx1_d3d9: DMACOPY-DELAYED dst={:08X} src={:08X} hi={:08X} lo={:08X}", dst, src,
+                hi, lo);
+  }
+  if (mode >= 2) {
+    // LO is the copy size -- verified against the GPU-written census (dst ACAF8000 moves
+    // exactly +3000, and lo=3000 where hi=5000). hi is the slot's ALLOCATION size; using it
+    // overcopied past the image and trampled the neighbouring slot, which presented as some
+    // textures healing while others newly broke.
+    MirrorDmaCopy(base, dst, src, lo);
+  }
+#endif
 }
 

@@ -11,14 +11,24 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/logging/macros.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+/// See the note in RangeWrittenByGpu: the definitive census of GPU-written guest memory, for
+/// finding textures the native D3D9 renderer can never decode correctly from CPU RAM.
+REXCVAR_DEFINE_UINT32(nx1_dbg_gpu_written_log, 0, "GPU",
+                      "Log each distinct GPU-written guest range once (memexport, resolves -- "
+                      "every path that diverges GPU memory from CPU-visible RAM)");
 
 namespace rex::graphics {
 
@@ -313,6 +323,31 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
+  }
+  // NX1 diagnostic: THE chokepoint for "the GPU wrote guest memory". Every path that makes the
+  // reference's GPU-side copy diverge from CPU-visible guest RAM -- memexport, resolves, all of
+  // them -- announces the range here. The native D3D9 renderer decodes CPU RAM, so any texture
+  // living inside a range logged here and not covered by a readback/writeback is a texture the
+  // reference renders correctly and the native renderer cannot. Logged once per distinct start,
+  // budget-capped; a repeated per-frame range costs one line for the whole session.
+  if (REXCVAR_GET(nx1_dbg_gpu_written_log)) {
+    static std::mutex nx1_gw_mutex;
+    static std::vector<uint32_t> nx1_gw_seen;
+    std::lock_guard<std::mutex> lock(nx1_gw_mutex);
+    // Deduplicated by 1 MB REGION, not by exact start. Exact starts saturated the census in
+    // seconds: memexport particle/skinning traffic produces hundreds of distinct tiny ranges
+    // in one small neighbourhood, and the cap was reached before the streaming pool regions
+    // were ever tested -- an inconclusive run that looked conclusive. Region granularity is
+    // what the question needs anyway: does the GPU EVER write the pool region a bad texture
+    // lives in? A hit names the region; a re-run with a tighter filter can then get exact
+    // ranges for it.
+    const uint32_t region = start >> 20;
+    if (nx1_gw_seen.size() < 512 &&
+        std::find(nx1_gw_seen.begin(), nx1_gw_seen.end(), region) == nx1_gw_seen.end()) {
+      nx1_gw_seen.push_back(region);
+      REXGPU_WARN("nx1_d3d9: GPUWRITTEN region {:03X}xxxxx first range {:08X}+{:X} (#{})",
+                  region, start, length, nx1_gw_seen.size());
+    }
   }
   length = std::min(length, kBufferSize - start);
   uint32_t end = start + length - 1;
