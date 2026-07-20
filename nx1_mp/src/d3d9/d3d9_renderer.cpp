@@ -2431,24 +2431,6 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     }
   }
 
-  // D9FETCH: our half of the draw-sequence fetch comparison (CPFETCH is the reference command
-  // processor's half; one cvar arms both, and that side decrements it so both stop together).
-  // The earlier FETCHCMP probe read the register file from THIS thread at THIS draw and was
-  // invalid by construction: the register file is a different clock, advanced by the CP thread
-  // as it consumes the ring, so an instantaneous comparison only measures how far apart the two
-  // clocks happen to be -- its "mismatches" were addresses we ourselves bound a few draws
-  // earlier, echoed back. Logging each stream at its own draw and aligning the s0 sequences
-  // offline is the valid form: a real divergence is an address present in one stream and absent
-  // or different at the aligned position in the other.
-  if (REXCVAR_GET(nx1_dbg_fetch_seq)) {
-    static std::atomic<uint64_t> d9_fetch_seq{0};
-    const TextureFetchConstant f0 = DecodeTextureFetchConstant(d.texture_fetch(0));
-    const TextureFetchConstant f1 = DecodeTextureFetchConstant(d.texture_fetch(1));
-    REXGPU_WARN("nx1_d3d9: D9FETCH #{} ps={:08X} s0={:08X} s1={:08X}",
-                d9_fetch_seq.fetch_add(1, std::memory_order_relaxed), d.ps_object,
-                f0.base_address, f1.base_address);
-  }
-
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
     if (!(sampler_mask & (1u << sampler))) {
       continue;
@@ -2924,6 +2906,21 @@ void Renderer::DrawIndexed(const uint8_t* base, uint32_t guest_device, uint32_t 
 }
 
 void Renderer::ExecuteDraw(const uint8_t* base, uint32_t guest_device, const RecordedDraw& d) {
+  // D9FETCH moved HERE from the texture-binding function, which depth-only and skipped draws
+  // never reach. The first CP-vs-D9 alignment "found" ~2400 ring draws missing from our stream
+  // and read it as a late-binding divergence -- but the missing draws were plausibly just
+  // shadow-pass draws our old log site filtered out, and a depth draw's s0 is stale garbage
+  // that legitimately differs from ours. Logging EVERY executed draw (ps=0 included, idx for
+  // alignment) makes the two streams the same population; only then does a same-position
+  // substitution mean anything.
+  if (REXCVAR_GET(nx1_dbg_fetch_seq)) {
+    static std::atomic<uint64_t> d9_fetch_seq{0};
+    const TextureFetchConstant f0 = DecodeTextureFetchConstant(d.texture_fetch(0));
+    const TextureFetchConstant f1 = DecodeTextureFetchConstant(d.texture_fetch(1));
+    REXGPU_WARN("nx1_d3d9: D9FETCH #{} idx={} ps={:08X} s0={:08X} s1={:08X}",
+                d9_fetch_seq.fetch_add(1, std::memory_order_relaxed), d.index_count, d.ps_object,
+                f0.base_address, f1.base_address);
+  }
   const D3DPRIMITIVETYPE host_prim = HostPrimitiveType(d.prim_type);
   const uint32_t prim_count = HostPrimitiveCount(d.prim_type, d.index_count);
   const uint32_t base_vertex_index = d.base_vertex_index;

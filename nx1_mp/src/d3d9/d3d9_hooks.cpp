@@ -560,6 +560,14 @@ namespace {
 /// project three times. Idempotent, so a delayed copy that is later flushed through the
 /// immediate path simply copies the same bytes twice.
 void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
+  // OUR-RENDERER ONLY. In pure Xenia mode the GPU-side buffer is authoritative for DMA
+  // results; a CPU write here fires Xenia's watches and replaces the GPU's (possibly
+  // TRANSFORMED) result with our raw byte copy -- observed as the reference going black.
+  // That same possibility -- DmaCopy not being a verbatim move -- is an open question for
+  // our own mirror's correctness.
+  if (!nx1::d3d9::IsEnabled()) {
+    return;
+  }
   if (bytes < 32 || bytes > (16u << 20) || !dst || !src) {
     return;
   }
@@ -584,9 +592,20 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   if (!mode) {
     return;
   }
+  // Volume counters, alongside the first-32 detail lines: the decisive comparison is DmaCopy
+  // TRAFFIC between backend modes (nx1_d3d9 on vs off) for the same walk. The hook runs in
+  // both modes, so identical walks produce directly comparable series -- if the pure-Xenia run
+  // streams early and often where ours waits for approach, the streamer's behaviour itself
+  // diverges by backend, and the far slots legitimately hold placeholder under us.
   static std::atomic<uint32_t> logged{0};
-  if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+  static std::atomic<uint64_t> total_bytes{0};
+  const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t tb = total_bytes.fetch_add(a5, std::memory_order_relaxed) + a5;
+  if (n < 32) {
     REXGPU_WARN("nx1_d3d9: DMACOPY dst={:08X} src={:08X} a5={:08X} a6={:08X}", dst, src, a5, a6);
+  }
+  if ((n % 500) == 499) {
+    REXGPU_WARN("nx1_d3d9: DMACOPY volume {} calls, {} MiB total", n + 1, tb >> 20);
   }
   if (mode >= 2) {
     // a5 confirmed as the byte count by the logged run: clean page multiples, and dst/size
