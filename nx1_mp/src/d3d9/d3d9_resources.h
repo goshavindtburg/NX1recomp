@@ -567,6 +567,8 @@ class ResourceTracker {
   IDirect3DSurface9* writeback_staging_ = nullptr;
   uint32_t writeback_staging_w_ = 0, writeback_staging_h_ = 0;
   uint64_t writebacks_done_ = 0, writeback_bytes_ = 0;
+  void DumpResolveComparison(IDirect3DTexture9* tex, uint32_t width, uint32_t height,
+                             const TextureFetchConstant& dest);
   void ResolveWriteback(IDirect3DTexture9* tex, uint32_t width, uint32_t height,
                         const TextureFetchConstant& dest);
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant

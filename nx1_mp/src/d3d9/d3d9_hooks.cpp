@@ -125,6 +125,10 @@ void RetireRingConstants(const uint8_t* base, uint32_t device) {
 
 /// Lazily bring the host device up on first use, from whichever thread the guest
 /// render backend happens to own the device on.
+/// Defined further down, beside the command-buffer hooks; declared here because the draw
+/// entry points appear earlier in the file. Anonymous namespaces merge within a TU.
+void NoteDrawForCmdBufCensus();
+
 bool EnsureRenderer() {
 #ifdef _WIN32
   if (!nx1::d3d9::IsEnabled()) {
@@ -158,6 +162,7 @@ bool EnsureRenderer() {
 // function's leftovers, not its arguments.
 
 REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVertices) {
+  NoteDrawForCmdBufCensus();
 #ifdef _WIN32
   const uint32_t device = ctx.r3.u32, prim = ctx.r4.u32, base_vtx = ctx.r5.u32,
                  start_index = ctx.r6.u32, index_count = ctx.r7.u32;
@@ -183,6 +188,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVertices) {
 }
 
 REX_HOOK_RAW(rex_D3DDevice_DrawVertices) {
+  NoteDrawForCmdBufCensus();
 #ifdef _WIN32
   // r3 = device, r4 = primType, r5 = StartVertex, r6 = VertexCount
   const uint32_t device = ctx.r3.u32, prim = ctx.r4.u32, start_vtx = ctx.r5.u32,
@@ -207,6 +213,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawVertices) {
 //   r9=indexFormat r10=verts   -- stride is the 9th arg, on the stack at [r1+0x54]
 //   (verified against the callee's own `lwz r30, 0xB0+arg_54(r1)`).
 REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVerticesUP) {
+  NoteDrawForCmdBufCensus();
 #ifdef _WIN32
   const uint32_t device = ctx.r3.u32, prim = ctx.r4.u32, num_verts = ctx.r6.u32,
                  index_count = ctx.r7.u32, indices = ctx.r8.u32, index_fmt = ctx.r9.u32,
@@ -226,6 +233,7 @@ REX_HOOK_RAW(rex_D3DDevice_DrawIndexedVerticesUP) {
 // D3DDevice_DrawVerticesUP(device, PrimType, VertexCount, pVertexData, VertexStride):
 //   r3=device r4=prim r5=vertexCount r6=verts r7=stride
 REX_HOOK_RAW(rex_D3DDevice_DrawVerticesUP) {
+  NoteDrawForCmdBufCensus();
 #ifdef _WIN32
   const uint32_t device = ctx.r3.u32, prim = ctx.r4.u32, vtx_count = ctx.r5.u32, verts = ctx.r6.u32,
                  stride = ctx.r7.u32;
@@ -523,6 +531,24 @@ REX_EXTERN(__imp__rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIte
 
 namespace {
 std::atomic<uint64_t> g_cb_run{0}, g_cb_async{0}, g_cb_r_run{0};
+
+/// THE MEASUREMENT. The theory says the bake/imposter draws live inside command-buffer
+/// playback, which replays PM4 directly and never enters D3DDevice_Draw* -- so we never render
+/// them, our render target is empty where the bake belongs, and the writeback copies nothing.
+/// Before doing surgery on that theory, prove it: mark the playback window on the thread that
+/// runs it, and count how many of OUR draws land inside it. Zero inside a window the reference
+/// fills with thousands of ring draws is the proof; a healthy count refutes it outright and
+/// saves a large piece of misdirected work.
+thread_local uint32_t g_in_cmdbuf = 0;
+std::atomic<uint64_t> g_draws_in_cb{0}, g_draws_out_cb{0}, g_cb_windows_closed{0};
+
+void NoteDrawForCmdBufCensus() {
+  if (g_in_cmdbuf) {
+    g_draws_in_cb.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    g_draws_out_cb.fetch_add(1, std::memory_order_relaxed);
+  }
+}
 void LogCmdBufTraffic() {
   static std::atomic<uint64_t> last{0};
   const uint64_t total = g_cb_run.load() + g_cb_async.load() + g_cb_r_run.load();
@@ -549,8 +575,16 @@ REX_HOOK_RAW(rex_D3DDevice_InsertAsyncCommandBufferCall) {
 REX_HOOK_RAW(rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIter_PBUGfxViewport_PBD_Z) {
   g_cb_r_run.fetch_add(1, std::memory_order_relaxed);
   LogCmdBufTraffic();
+  ++g_in_cmdbuf;
   __imp__rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIter_PBUGfxViewport_PBD_Z(ctx,
                                                                                               base);
+  --g_in_cmdbuf;
+  const uint64_t w = g_cb_windows_closed.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((w % 2000) == 0) {
+    REXGPU_WARN("nx1_d3d9: CBDRAWS {} playbacks | our draws INSIDE={} OUTSIDE={} -- zero inside "
+                "means command-buffer geometry never reaches our renderer at all",
+                w, g_draws_in_cb.load(), g_draws_out_cb.load());
+  }
 }
 
 //=============================================================================
@@ -642,9 +676,16 @@ REX_HOOK_RAW(rex_ImageCache_WaitFence_YAHXZ) {
 // Mode 2 performs the mirror copy, page-wise through GuestPointer: image cache pointers are
 // physical-mirror EAs, and a single bulk memcpy through `base +` arithmetic has already
 // blacked the screen three times in this project's history.
-REXCVAR_DEFINE_UINT32(nx1_d3d9_dmacopy_mirror, 1, "GPU",
-                      "ImageCache_DmaCopy handling: 0=off, 1=log arguments (first 32), "
-                      "2=log and mirror the GPU copy in CPU-visible guest RAM");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dmacopy_mirror, 0, "GPU",
+                      "ImageCache_DmaCopy handling: 0=off (default), 1=log arguments, "
+                      "2=log and mirror the GPU copy in CPU-visible guest RAM. MODE 2 IS "
+                      "HARMFUL as written: DmaCopy is a GPU blit through a vertex shader with "
+                      "memexport, and the reason to move data that way rather than by memcpy "
+                      "is that it TRANSFORMS the layout in flight. Our verbatim byte copy puts "
+                      "untiled data in a slot the decoder reads as tiled, which renders as a "
+                      "regular block CHECKERBOARD -- measured directly: a dumpster whose body "
+                      "was checkered with mirroring on came back as correct rusty metal with it "
+                      "off. Re-enable only with the tiling transform replicated");
 
 REX_EXTERN(__imp__rex_ImageCache_DmaCopy);
 REX_EXTERN(__imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z);

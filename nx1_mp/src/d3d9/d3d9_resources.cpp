@@ -199,6 +199,10 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_resolve_size_check, true, "GPU",
                     "the render target. Off = legacy address-only matching, which serves stale "
                     "targets forever for addresses the streaming pool has since recycled");
 
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_framediff, 0, "GPU",
+                      "Debug: dump the next N resolves as a PAIR -- our rendered target and "
+                      "the guest-RAM contents at the same address -- for backend comparison");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_classify, 0, "GPU",
                       "Debug: log the next N textures whose SOURCE bytes classify as "
                       "placeholder-like (short repeat period) or garbage-like (saturated byte "
@@ -4980,6 +4984,77 @@ bool ResourceTracker::WantResolveWriteback(const TextureFetchConstant& dest) {
   return true;
 }
 
+/// THE PIXEL DIFF. Every theory tonight has hinged on one unanswered question: do we RENDER
+/// the same image as the reference, or a different one? Fetch constants, memory contents and
+/// streaming rates all failed to settle it. Pixels will.
+///
+/// Run with our resolve writeback OFF and the reference's readback_resolve="full" ON (plus
+/// nx1_skip_reference_raster=false so its EDRAM is real). Then at the same resolve, guest RAM
+/// holds the REFERENCE's pixels while our host target holds OURS -- same address, same frame.
+///   ours matches ref      -> we render the same image; the fault is texture SAMPLING.
+///   ours missing content  -> we genuinely do not draw it; unrendered-content proven in pixels.
+void ResourceTracker::DumpResolveComparison(IDirect3DTexture9* tex, uint32_t width,
+                                            uint32_t height, const TextureFetchConstant& dest) {
+  const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_framediff);
+  if (!budget || !tex || !device_) {
+    return;
+  }
+  REXCVAR_SET(nx1_d3d9_dbg_framediff, budget - 1);
+  char path[256];
+
+  IDirect3DSurface9* rt = nullptr;
+  IDirect3DSurface9* stage = nullptr;
+  if (SUCCEEDED(tex->GetSurfaceLevel(0, &rt)) && rt &&
+      SUCCEEDED(device_->CreateOffscreenPlainSurface(width, height, D3DFMT_A8R8G8B8,
+                                                     D3DPOOL_SYSTEMMEM, &stage, nullptr)) &&
+      SUCCEEDED(device_->GetRenderTargetData(rt, stage))) {
+    D3DLOCKED_RECT lr{};
+    if (SUCCEEDED(stage->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+      std::vector<Rgba8> img(size_t(width) * height);
+      for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* row = static_cast<const uint8_t*>(lr.pBits) + size_t(y) * lr.Pitch;
+        for (uint32_t x = 0; x < width; ++x) {
+          const uint8_t* px = row + size_t(x) * 4;
+          img[size_t(y) * width + x] = {px[2], px[1], px[0], px[3]};
+        }
+      }
+      stage->UnlockRect();
+      std::snprintf(path, sizeof(path), "texdump/ours_%08X_f%llu.bmp", dest.base_address,
+                    static_cast<unsigned long long>(frame_));
+      DumpRgbaBmp(path, img, width, height);
+    }
+  }
+  if (stage) stage->Release();
+  if (rt) rt->Release();
+
+  if (const auto* fmt = rex::graphics::FormatInfo::Get(dest.format)) {
+    const uint32_t bpb = fmt->bytes_per_block();
+    const uint32_t pitch_px = dest.pitch_pixels ? dest.pitch_pixels : width;
+    rex::graphics::TextureExtent ex =
+        rex::graphics::TextureExtent::Calculate(fmt, pitch_px, height, 1, dest.tiled, true);
+    ex.block_width = (width + fmt->block_width - 1) / fmt->block_width;
+    ex.block_height = (height + fmt->block_height - 1) / fmt->block_height;
+    const size_t need = size_t(ex.block_height) * ex.block_width * bpb;
+    if (const uint8_t* g = TranslatePhysical(PhysicalAddress(dest.base_address))) {
+      uint8_t* scratch = DetileScratch(need);
+      DetileMip2D(scratch, ex.block_width * bpb, g, ex, bpb, dest.endian, dest.tiled, 0, 0);
+      std::vector<Rgba8> img(size_t(width) * height);
+      for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* row = scratch + size_t(y) * ex.block_width * bpb;
+        for (uint32_t x = 0; x < width; ++x) {
+          const uint8_t* px = row + size_t(x) * 4;
+          img[size_t(y) * width + x] = {px[0], px[1], px[2], px[3]};
+        }
+      }
+      std::snprintf(path, sizeof(path), "texdump/ref_%08X_f%llu.bmp", dest.base_address,
+                    static_cast<unsigned long long>(frame_));
+      DumpRgbaBmp(path, img, width, height);
+    }
+  }
+  REXGPU_WARN("nx1_d3d9: FRAMEDIFF {:08X} {}x{} -> texdump/ours_* and texdump/ref_*",
+              dest.base_address, width, height);
+}
+
 void ResourceTracker::ResolveWriteback(IDirect3DTexture9* tex, uint32_t width, uint32_t height,
                                        const TextureFetchConstant& dest) {
   namespace tu = rex::graphics::texture_util;
@@ -5170,6 +5245,9 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
   // thread is drained behind ALL of them before the game can read.
   if (writeback && entry.tex) {
     ResolveWriteback(entry.tex, width, height, dest);
+  }
+  if (entry.tex) {
+    DumpResolveComparison(entry.tex, width, height, dest);
   }
 }
 
