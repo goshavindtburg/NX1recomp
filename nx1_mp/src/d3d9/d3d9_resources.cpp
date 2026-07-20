@@ -2421,6 +2421,31 @@ void ResourceTracker::AdvanceFrame() {
                 baseline_addrs_.size());
   }
   ++frame_;
+
+  // DEBUG DUMP BUDGETS EXPIRE. The forced rebuild that makes a settled texture dump again is
+  // armed by these cvars and used to terminate only when the budget decremented -- and that
+  // decrement lives on the CPU block-compressed decode path alone. A material whose textures
+  // take any other path (DXN, BC-alpha, uncompressed) never decremented it, so every matching
+  // texture rebuilt EVERY FRAME forever, creating and destroying staging textures faster than
+  // D3D9Ex reclaims them. Measured at 33 GB of process memory before the game was killed.
+  // Termination must not depend on which decode path happens to run, so an armed dump now dies
+  // after a fixed number of frames regardless.
+  if (REXCVAR_GET(nx1_d3d9_dbg_mipdump) || REXCVAR_GET(nx1_d3d9_dbg_texdump)) {
+    constexpr uint32_t kDumpArmFrames = 240;  // ~4s at 60 fps; dumps land in the first few
+    if (++dump_arm_frames_ > kDumpArmFrames) {
+      REXGPU_WARN("nx1_d3d9: dump budget expired after {} frames (mipdump {} texdump {} left) -- "
+                  "disarming so the forced rebuild cannot run forever",
+                  kDumpArmFrames, REXCVAR_GET(nx1_d3d9_dbg_mipdump),
+                  REXCVAR_GET(nx1_d3d9_dbg_texdump));
+      REXCVAR_SET(nx1_d3d9_dbg_mipdump, 0u);
+      REXCVAR_SET(nx1_d3d9_dbg_texdump, 0u);
+      REXCVAR_SET(nx1_d3d9_dbg_texdump_force, false);
+      dump_arm_frames_ = 0;
+    }
+  } else {
+    dump_arm_frames_ = 0;
+  }
+
   DrainMemoryWrites();
 
   // Proactive early snapshot: capture physical memory into the mirror a chunk at a time over the
@@ -3552,7 +3577,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     char dump_path[256];
     if (dump_left) {
       REXCVAR_SET(nx1_d3d9_dbg_mipdump, dump_left - 1);
-      std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_L0.bmp", t.base_address);
+      // FRAME-STAMPED. Repeated dumps of the same texture used to overwrite each other, which
+      // made the one question everything now hinges on unanswerable: does a stale-prefix
+      // texture HEAL? Stamping the frame lets the same surface be dumped twice, seconds apart,
+      // and the two images compared. Heals => we are displaying a transient mid-refill state
+      // and the fix is to not commit one. Never heals => the refill genuinely never completes.
+      std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_f%llu_L0.bmp", t.base_address,
+                    static_cast<unsigned long long>(frame_));
       DumpRgbaBmp(dump_path, cur, t.width, height);
       // Source-state alongside the picture, because "level 0 is garbage" has two very different
       // causes and the image alone cannot separate them: empty pages mean the data has not
@@ -3563,9 +3594,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // on an unused high slot says nothing about what is on screen, while noise on slot 0 (the
       // colormap) is the artifact itself.
       REXGPU_INFO("nx1_d3d9: mip dump s{} {}x{} fmt {} levels={} mip_filter={} aniso={} "
-                  "src_empty_pages={}/{} mip_address={:08X} -> texdump/mip_{:08X}_L*.bmp",
+                  "src_empty_pages={}/{} mip_address={:08X} -> texdump/mip_{:08X}_f{}_L*.bmp",
                   sampler, t.width, height, t.format, levels, t.mip_filter, t.aniso_filter,
-                  partial_pages, src_pages_total, t.mip_address, t.base_address);
+                  partial_pages, src_pages_total, t.mip_address, t.base_address, frame_);
 
       // OUR LAYOUT vs THE REFERENCE'S, on the same texture. Both backends run over the same
       // recompiled game and the same memory -- the reference renders these correctly, so the
@@ -3685,8 +3716,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         }
       }
       if (dump_left) {
-        std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_L%u.bmp", t.base_address,
-                      level);
+        std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_f%llu_L%u.bmp",
+                      t.base_address, static_cast<unsigned long long>(frame_), level);
         DumpRgbaBmp(dump_path, next, lw, lh);
       }
 

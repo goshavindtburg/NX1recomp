@@ -497,6 +497,11 @@ class ResourceTracker {
   uint64_t unfrozen_writes_ = 0;
   bool dump_draw_ = false;           ///< see SetDumpDraw
   bool dump_filter_active_ = false;  ///< see SetDumpDraw
+  /// Frames an armed texture/mip dump has been live. The dump forces settled textures to
+  /// rebuild; that force MUST expire on a timer rather than on a budget decrement, because the
+  /// decrement only happens on one decode path and a material that never takes it rebuilt
+  /// forever (33 GB of staging textures). See AdvanceFrame.
+  uint32_t dump_arm_frames_ = 0;
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;
