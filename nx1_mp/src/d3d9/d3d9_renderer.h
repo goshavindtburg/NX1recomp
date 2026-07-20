@@ -158,12 +158,24 @@ class Renderer {
     /// geometry from a composite: the composite covers every pixel and does not depth-test at
     /// all, so it wins any "frontmost" ranking wherever you point.
     bool depth_test;
+    /// Sampler 0 (the colormap) of THIS draw, captured at pick time. ps_object names the
+    /// shader, which most of the world shares -- following it re-latched a different texture
+    /// per draw, ~40k times a session. The address of the clicked draw is the only way to
+    /// track ONE surface's texture.
+    uint32_t s0_addr;
+    uint32_t s0_w, s0_h, s0_fmt;
   };
 
-  /// Ask for a pick at a WINDOW-space pixel on the next frame. The frame it runs on renders
-  /// only a small box around that pixel (the scissor is clamped so the occlusion queries measure
+  /// Ask for a pick at a window pixel on the next frame. The frame it runs on renders only a
+  /// small box around that pixel (the scissor is clamped so the occlusion queries measure
   /// coverage there) -- one odd-looking frame, then normal.
-  void RequestPick(int x, int y);
+  ///
+  /// `w`/`h` are the window's client size, because the pixel MUST be normalised: NX1 renders
+  /// its scene at 1024x600 while the window is typically 1920x1080, and the scissor is applied
+  /// in RENDER TARGET space. Passing raw window pixels straight through put the box right and
+  /// below the click -- clicking a dumpster on the left reported the gun on the right, which
+  /// read as "the picker returns a random draw" and cost several rounds of investigation.
+  void RequestPick(int x, int y, int w, int h);
 
   /// Shaders dropped from pick results. A LIST, not one slot: the viewmodel alone is three
   /// separate shaders (hands, weapon, sight), so a single-entry ignore can never cover it.
@@ -373,10 +385,12 @@ class Renderer {
     uint32_t rt_surface;
     bool depth_write;
     bool depth_test;
+    uint32_t s0_addr;
+    uint32_t s0_w, s0_h, s0_fmt;
   };
   bool pick_active_ = false;
   std::atomic<bool> pick_requested_{false};
-  int pick_x_ = 0, pick_y_ = 0;
+  float pick_nx_ = 0.5f, pick_ny_ = 0.5f;  ///< normalised window position of the pick
   RECT pick_box_{};
   std::vector<uint32_t> pick_ignore_;
   std::vector<IDirect3DQuery9*> pick_queries_;

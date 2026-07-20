@@ -47,6 +47,8 @@ REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_pick_size);
 REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_ox);
 REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_oy);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipdump);
+REXCVAR_DECLARE(bool, nx1_d3d9_dbg_texdump_force);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam,
                                                              LPARAM lparam);
@@ -179,7 +181,12 @@ LRESULT CALLBACK Overlay::WndProcThunk(HWND hwnd, UINT msg, WPARAM wparam, LPARA
       }
       ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
       if (msg == WM_LBUTTONDOWN && !ImGui::GetIO().WantCaptureMouse) {
-        Renderer::Get().RequestPick(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+        // Client size, not the render target's: the pick is normalised against the window the
+        // click happened in, and resolved per draw against each target's viewport.
+        RECT cr{};
+        GetClientRect(hwnd, &cr);
+        Renderer::Get().RequestPick(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam),
+                                    int(cr.right - cr.left), int(cr.bottom - cr.top));
         self.pick_awaiting_ = true;
       }
       return 0;  // never reaches the game: no mouselook, no recentre, no re-hide
@@ -422,7 +429,8 @@ void Overlay::DrawPicker() {
     const ImGuiIO& hio = ImGui::GetIO();
     if (++throttle >= 8 && !r.pick_pending() && !hio.WantCaptureMouse) {
       throttle = 0;
-      Renderer::Get().RequestPick(int(hio.MousePos.x), int(hio.MousePos.y));
+      Renderer::Get().RequestPick(int(hio.MousePos.x), int(hio.MousePos.y),
+                                  int(hio.DisplaySize.x), int(hio.DisplaySize.y));
       pick_awaiting_ = true;
     }
   }
@@ -587,6 +595,42 @@ void Overlay::DrawPicker() {
       if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Hides every draw using this material. If the surface you aimed at "
                           "does not disappear, this is not its shader.");
+      }
+      ImGui::SameLine();
+      // Dump THIS MATERIAL's textures and generated mip chain on its next draw. Draw-scoped on
+      // purpose: an address filter captured whatever the streaming pool had moved into that
+      // address by dump time, which is how a 512x512 DXT1 surface came back as a 64x64 DXT5.
+      if (ImGui::Button("DUMP MIPS")) {
+        REXCVAR_SET(nx1_d3d9_dbg_blend_ps, h.ps_object);
+        REXCVAR_SET(nx1_d3d9_dbg_mipdump, 6u);
+        // texdump covers what mipdump CANNOT: the mip dump lives in the CPU block-compressed
+        // path, so DXN normal maps and BC-alpha masks -- which decode to A8R8G8B8 and take the
+        // driver auto-mip path -- never dumped at all. That blind spot hid exactly the
+        // speckle-prone content while every texture we did inspect came back healthy.
+        REXCVAR_SET(nx1_d3d9_dbg_texdump, 8u);
+        REXCVAR_SET(nx1_d3d9_dbg_texdump_force, true);
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Write texdump/mip_<addr>_L*.bmp for the textures this material binds, "
+                          "forcing a rebuild so a settled texture still dumps. Check the log for "
+                          "'mip dump' lines -- they report the size and format actually captured.");
+      }
+      ImGui::SameLine();
+      // Track THIS DRAW's colormap address, captured at pick time. Not keyed on ps_object:
+      // that names the shader, which most of the world shares, so a "follow the material"
+      // tracker re-latched a different texture per draw (~40k TRACKFOLLOWs in one session)
+      // and its WRITE detection watched a rotating window -- silence proved nothing.
+      const bool tracking =
+          h.s0_addr != 0 && REXCVAR_GET(nx1_d3d9_dbg_track_addr) == h.s0_addr;
+      std::snprintf(buf, sizeof(buf), "%s s0 %08X (%ux%u f%u)",
+                    tracking ? "untrack" : "TRACK", h.s0_addr, h.s0_w, h.s0_h, h.s0_fmt);
+      if (h.s0_addr && ImGui::Button(buf)) {
+        REXCVAR_SET(nx1_d3d9_dbg_track_addr, tracking ? 0u : h.s0_addr);
+      }
+      if (h.s0_addr && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Watch this texture's memory: TRACK BIND lines report its live bytes "
+                          "every frame (base_nonzero), TRACK WRITE lines report guest writes. "
+                          "The tracked texture paints white on screen -- judge it from the log.");
       }
       ImGui::PopID();
       ImGui::Separator();

@@ -203,6 +203,30 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_bc_mips, true, "GPU",
                     "Build mip chains for block-compressed textures on the CPU (diagnostic: "
                     "set false to leave BC textures unmipped while keeping driver auto-mips)");
 
+/// Decode the guest's own mip chain from mip_address instead of generating one from level 0.
+///
+/// DISPROVEN TWICE, kept only as a diagnostic. Applied to every declared chain it painted the
+/// world with garbage; restricted to textures declaring a SAMPLED chain (mip_filter != kBaseMap)
+/// it still did. The dumps settle it: gmip_*_L0 comes out a clean, correct image while every
+/// guest level below it is pure noise -- not a scrambled L0 (which would mean our addressing is
+/// wrong) and not a coherent foreign image (a recycled pool slot), just noise. And those same
+/// fetch constants ask for the levels with mip_filter=0/1, mip_max=6..7, lod_bias=0 and
+/// grad_exp=0/0 -- no LOD adjustment of any kind, so on hardware they WOULD be sampled.
+///
+/// The conclusion is the one the original comment in this file already reached: this build
+/// never fills the mip pool. The game's streaming system populates mip_address on console; the
+/// recompilation does not. That is a residency gap upstream of the renderer -- nothing the
+/// texture path can fix -- so we generate our own chain from level 0, which is data we know is
+/// good (nx1_d3d9_dbg_nomips renders the scene cleanly, which is level 0 alone).
+REXCVAR_DEFINE_BOOL(nx1_d3d9_guest_mips, false, "GPU",
+                    "Decode the guest's mip chain from mip_address for textures whose mip "
+                    "filter actually samples it (not kBaseMap). OFF: measured, this build "
+                    "never fills the mip pool -- the dumps are noise while level 0 is clean, "
+                    "and the fetch constants ask for those levels with no LOD bias at all");
+
+// Defined in d3d9_renderer.cpp beside the sampler-state translation that honours it.
+REXCVAR_DECLARE(bool, nx1_d3d9_basemap);
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
                     "Give textures a mip chain, filtered down from level 0 by the driver. Off "
                     "leaves every minified surface aliasing (the coloured speckle).")
@@ -703,6 +727,15 @@ struct TextureEntry {
   bool dirty = false;
   uint32_t watch_addr = 0;
   uint32_t watch_size = 0;
+  /// Second watched range: the guest mip chain at mip_address, when this texture's levels were
+  /// decoded from it (mip_source == 3). The mip pool streams and relocates like the base pool,
+  /// so a write there must dirty the entry exactly as a base write does.
+  uint32_t mip_watch_addr = 0;
+  uint32_t mip_watch_size = 0;
+  /// The mip_address this entry's levels were decoded from. NOT part of the cache key (the pool
+  /// relocates mip tails, and keying on it would duplicate entries); instead a mismatch at bind
+  /// time marks the entry dirty so it re-decodes from the new location.
+  uint32_t mip_addr_seen = 0;
   /// Commit-and-freeze. While a texture is on screen its slot holds valid bytes, and the write-watch
   /// keeps the decode tracking them (clean up close). But when it goes non-resident the streaming
   /// pool recycles its slot, dribbling high-noise garbage into the exact bytes -- and re-reading that
@@ -725,9 +758,9 @@ struct TextureEntry {
   uint32_t zero_retries = 0;
   uint64_t retry_frame = 0;
   /// How this texture's mip chain was actually provided: 0 = none, 1 = CPU-built (block
-  /// compressed), 2 = driver auto-generated. Classified by OUTCOME, not by intent, so the
-  /// nx1_d3d9_bc_mips diagnostic cannot mislabel a BC texture as auto-mipped when it in fact
-  /// ended up with no chain at all.
+  /// compressed), 2 = driver auto-generated, 3 = decoded from the guest's own chain at
+  /// mip_address. Classified by OUTCOME, not by intent, so the nx1_d3d9_bc_mips diagnostic
+  /// cannot mislabel a BC texture as auto-mipped when it in fact ended up with no chain at all.
   uint8_t mip_source = 0;
 };
 
@@ -2081,8 +2114,10 @@ void ResourceTracker::LogCacheStats() {
       frame_, textures, vbs, ibs, resolves, tex_uploads_, tex_rebuilds_, tex_evicted_,
       tex_failures_, unsupported_texture_formats_,
       device_->GetAvailableTextureMem() / (1024 * 1024));
-  REXGPU_INFO("nx1_d3d9: mipgen built={} auto={} skipped(no chain declared)={} skipped(fmt)={}",
-              mips_built_, mips_auto_, mips_skip_nochain_, mips_skip_unsupported_);
+  REXGPU_INFO("nx1_d3d9: mipgen guest={} built={} auto={} basemap(level0 only)={} "
+              "skipped(no chain declared)={} skipped(fmt)={} mip_relocs={}",
+              mips_guest_, mips_built_, mips_auto_, mips_basemap_, mips_skip_nochain_,
+              mips_skip_unsupported_, mip_relocs_);
   REXGPU_INFO("nx1_d3d9: packedmip enabled={} small_decodes={} packed_decodes={} offsets_applied={}"
               " ({})",
               REXCVAR_GET(nx1_d3d9_packed_mip_offset) ? 1 : 0, small_decodes_, packed_decodes_,
@@ -2288,6 +2323,10 @@ void ResourceTracker::DrainMemoryWrites() {
     if (!entry.watch_size) continue;
     const uint32_t a0 = entry.watch_addr;
     const uint32_t a1 = entry.watch_addr + entry.watch_size;
+    // Guest-mip textures watch a second range: their levels were decoded from mip_address, and
+    // the mip pool streams into that memory exactly as the base pool does into the base.
+    const uint32_t m0 = entry.mip_watch_addr;
+    const uint32_t m1 = entry.mip_watch_addr + entry.mip_watch_size;
     // Settled texture: frozen against the pool's later garbage. The cvar is honoured HERE, at the
     // point of use, not only at the commit site -- `committed` is one-way and survives the cvar
     // going false, so gating only the commit meant toggling it off mid-session left every
@@ -2312,12 +2351,16 @@ void ResourceTracker::DrainMemoryWrites() {
     // the failure mode that has already voided this test once.
     if (entry.committed) ++unfrozen_writes_;
     for (const auto& [addr, len] : writes) {
-      if (addr < a1 && addr + len > a0) {
+      const bool hit_base = addr < a1 && addr + len > a0;
+      const bool hit_mips = entry.mip_watch_size != 0 && addr < m1 && addr + len > m0;
+      if (hit_base || hit_mips) {
         entry.dirty = true;
         if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
             track && entry.watch_addr == track) {
-          REXGPU_INFO("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} (watch {}+{})",
-                      track, frame_, addr, len, entry.watch_addr, entry.watch_size);
+          REXGPU_INFO("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} ({} {}+{})",
+                      track, frame_, addr, len, hit_base ? "watch" : "MIP watch",
+                      hit_base ? entry.watch_addr : entry.mip_watch_addr,
+                      hit_base ? entry.watch_size : entry.mip_watch_size);
         }
         break;
       }
@@ -2727,19 +2770,29 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     static uint64_t last_bind_frame = 0;
     if (frame_ != last_bind_frame) {
       last_bind_frame = frame_;
-      // mip_address/mip_min_level matter here: the reference discards base_address entirely
-      // when mip_min_level != 0 and reads the texels from mip_address instead. We always read
-      // base_address, so such a texture decodes from memory nobody ever fills.
-      uint32_t mip_nz = 0;
+      // Poll BOTH allocations' live bytes every bound frame. This is the discriminator for the
+      // "never resolves" textures: if base_nonzero stays garbage-shaped forever AND no TRACK
+      // WRITE line ever appears, the guest never streams this memory in our session at all --
+      // the failure is upstream of the texture cache (the game's streaming decision), not in
+      // decode or invalidation. If a WRITE does appear and the texture stays wrong, the
+      // invalidation chain lost it and the bug is ours.
+      uint32_t base_nz = 0, mip_nz = 0;
+      if (const uint8_t* bp = TranslatePhysical(t.base_address)) {
+        for (uint32_t i = 0; i < 8192; ++i) {
+          base_nz += bp[i] != 0 ? 1 : 0;
+        }
+      }
       if (const uint8_t* mp = t.mip_address ? TranslatePhysical(t.mip_address) : nullptr) {
         for (uint32_t i = 0; i < 8192; ++i) {
           mip_nz += mp[i] != 0 ? 1 : 0;
         }
       }
       REXGPU_INFO("nx1_d3d9: TRACK {:08X} BIND frame={} sampler={} {}x{} fmt={} dim={} "
-                  "mip_min={} mip_max={} packed={} mip_address={:08X} mip_nonzero={}/8192",
+                  "mip_min={} mip_max={} mip_filter={} lod_bias={} packed={} "
+                  "base_nonzero={}/8192 mip_address={:08X} mip_nonzero={}/8192",
                   t.base_address, frame_, sampler, t.width, t.height, t.format, t.dimension,
-                  t.mip_min_level, t.mip_max_level, t.packed_mips ? 1 : 0, t.mip_address, mip_nz);
+                  t.mip_min_level, t.mip_max_level, t.mip_filter, t.lod_bias,
+                  t.packed_mips ? 1 : 0, base_nz, t.mip_address, mip_nz);
     }
   }
 
@@ -2867,6 +2920,28 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // entry.dirty -- and a dirty entry fails this test and takes the full path, re-snapshotting then.
   // `frame_ < entry.retry_frame` holds only for a sprite that keeps decoding to nothing; it is
   // what stops the never-streamed ones re-decoding every frame in perpetuity.
+  //
+  // A guest-mip texture whose mip tail MOVED must re-decode: mip_address is deliberately not in
+  // the cache key (the pool relocates tails; keying on it would mint a new entry per location),
+  // so the move is caught here instead. mip_relocs_ counts these -- an earlier session measured
+  // one surface cycling its mip_address every few frames, and if that churn is real this check
+  // turns it into a rebuild storm; the counter in the periodic mipgen stats is how we would see.
+  if (entry.tex && entry.mip_source == 3 && entry.mip_addr_seen != t.mip_address) {
+    entry.dirty = true;
+    ++mip_relocs_;
+  }
+  // A dump budget armed while a MATERIAL filter is active means "dump what this draw binds,
+  // now". The rebuild has to be forced because a settled entry (dirty=0, committed=1) takes the
+  // early-out below and never reaches the decode where dumping lives.
+  //
+  // Keyed on the DRAW, not on an address. Guest addresses are not stable identities: the
+  // streaming pool reassigns them, and a dump aimed at a tracked address came back as a 64x64
+  // DXT5 when the surface picked at that address had been a 512x512 DXT1 -- a different
+  // texture entirely, silently. Acting on whatever the draw binds right now cannot go stale.
+  if (entry.tex && REXCVAR_GET(nx1_d3d9_dbg_mipdump) && dump_filter_active_ && dump_draw_) {
+    entry.dirty = true;
+    entry.retry_frame = 0;  // the backoff must not defer the very rebuild we asked for
+  }
   if (entry.tex && entry.layout_key == layout_key && (!entry.dirty || frame_ < entry.retry_frame)) {
     entry.last_frame = frame_;
     // Painting the tracked address white answers "which surface is this texture?" without a
@@ -2879,9 +2954,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       if (frame_ != last_logged) {
         last_logged = frame_;
         REXGPU_INFO("nx1_d3d9: TRACK {:08X} CACHED frame={} dirty={} committed={} retry_frame={} "
-                    "layout_ok=1 good_frames={}",
+                    "layout_ok=1 good_frames={} mip_source={} ({})",
                     t.base_address, frame_, entry.dirty ? 1 : 0, entry.committed ? 1 : 0,
-                    entry.retry_frame, entry.good_frames);
+                    entry.retry_frame, entry.good_frames, entry.mip_source,
+                    entry.mip_source == 1   ? "cpu-built"
+                    : entry.mip_source == 2 ? "driver auto"
+                    : entry.mip_source == 3 ? "guest chain"
+                                            : "NO CHAIN");
       }
       if (white_) {
         return white_;
@@ -2983,20 +3062,101 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // surfaces have mips and are filtered; honouring the declaration reproduced a statement the
   // guest only makes because its data is missing, and left ~10% of the world aliasing. We
   // filter from level 0 regardless, so the guest's chain is not something we need.
+  // GUEST MIP CHAIN. Plan the levels stored at mip_address, exactly as the reference's
+  // GetMipLocation/GetMipExtent walk them: each level's storage is its pow2 dimensions padded
+  // to 32x32 blocks (Calculate with is_guest), levels are laid out back to back, and once a
+  // level's pow2 size drops to <=16 texels the whole remaining tail shares ONE 32x32-block
+  // tile with per-level sub-tile offsets (GetPackedTileOffset). Decoding this chain instead of
+  // generating one from level 0 is the distance-confetti fix -- see the cvar comment.
+  struct GuestMip {
+    uint32_t offset;  ///< byte offset of the level's storage from mip_address
+    uint32_t ox, oy;  ///< packed-tail origin within that storage, in blocks
+    uint32_t lw, lh;  ///< visible texel dimensions (what the host level holds)
+    rex::graphics::TextureExtent ext;
+  };
+  std::vector<GuestMip> guest_plan;
+  uint32_t guest_mip_bytes = 0;
+  // Gate on the mip filter, UNCONDITIONALLY of any cvar: kBaseMap says the chain is not
+  // resident, and decoding it painted nearly the whole world with the pool's garbage. A
+  // texture that declares a SAMPLED chain (point/linear) is the opposite case -- hardware
+  // reads its levels from mip_address, so that memory must be valid or the console itself
+  // would show garbage.
+  if (REXCVAR_GET(nx1_d3d9_guest_mips) && REXCVAR_GET(nx1_d3d9_mips) && t.mip_address &&
+      t.mip_max_level > 0 && t.mip_filter != 2) {
+    const uint32_t wp2 = rex::next_pow2(t.width);
+    const uint32_t hp2 = rex::next_pow2(height);
+    const uint32_t size_max = rex::log2_floor(std::max(wp2, hp2));
+    const uint32_t guest_max = std::min(t.mip_max_level, size_max);
+    uint32_t offset = 0;
+    // Index of the first packed level; counts up while levels still get their own storage.
+    // Matches the reference's packed_mip_base walk in GetMipLocation.
+    uint32_t packed_base = 1;
+    bool packed_reached = false;
+    for (uint32_t m = 1; m <= guest_max; ++m) {
+      const uint32_t sw = std::max(wp2 >> m, 1u), sh = std::max(hp2 >> m, 1u);
+      const uint32_t lw = std::max(t.width >> m, 1u), lh = std::max(height >> m, 1u);
+      if (lw < 4 || lh < 4) {
+        break;  // stop where BcMipLevels stops: a 4x4 tail level is already one flat block
+      }
+      if (t.packed_mips && !packed_reached && std::min(sw, sh) <= 16) {
+        packed_reached = true;
+      }
+      GuestMip gm;
+      gm.offset = offset;
+      gm.ox = 0;
+      gm.oy = 0;
+      gm.lw = lw;
+      gm.lh = lh;
+      gm.ext = rex::graphics::TextureExtent::Calculate(fmt, sw, sh, /*depth=*/1, t.tiled,
+                                                       /*is_guest=*/true);
+      if (packed_reached) {
+        rex::graphics::TextureInfo::GetPackedTileOffset(sw, sh, fmt, int(m - packed_base),
+                                                        &gm.ox, &gm.oy);
+      }
+      const uint32_t level_bytes = gm.ext.block_pitch_h * gm.ext.block_pitch_v * bpb;
+      guest_mip_bytes = std::max(guest_mip_bytes, gm.offset + level_bytes);
+      // Cap the COPY to the visible blocks (the host level's real size); the full pow2 pitch
+      // stays in block_pitch_h/v for source addressing -- the same trick as level 0 above.
+      gm.ext.block_width = (lw + fmt->block_width - 1) / fmt->block_width;
+      gm.ext.block_height = (lh + fmt->block_height - 1) / fmt->block_height;
+      guest_plan.push_back(gm);
+      if (!packed_reached) {
+        offset += level_bytes;
+        ++packed_base;
+      }
+      // Once packed, every remaining level shares the tile at the current offset.
+    }
+  }
+  const bool guest_mips = !guest_plan.empty();
+
+  // A kBaseMap texture is sampled at level 0 only (the sampler carries MIPFILTER=NONE for it,
+  // see nx1_d3d9_basemap) -- generating a chain for it is pure wasted decode time, and any
+  // path that accidentally samples it reads fabricated data the hardware never touches.
+  const bool base_map_only = t.mip_filter == 2 && REXCVAR_GET(nx1_d3d9_basemap);
   const bool auto_mips = SupportsAutoMips(device_, host.d3d);
   const bool bc_mips = IsBlockCompressed(host.d3d);
-  const bool want_mips = REXCVAR_GET(nx1_d3d9_mips) && (auto_mips || bc_mips);
-  const bool build_mips = want_mips && !auto_mips && REXCVAR_GET(nx1_d3d9_bc_mips);
-  const uint32_t levels = build_mips ? BcMipLevels(t.width, height) : 1;
+  const bool want_mips =
+      !base_map_only && REXCVAR_GET(nx1_d3d9_mips) && (guest_mips || auto_mips || bc_mips);
+  const bool build_mips =
+      want_mips && !guest_mips && !auto_mips && REXCVAR_GET(nx1_d3d9_bc_mips);
+  const uint32_t levels = guest_mips ? uint32_t(1 + guest_plan.size())
+                                     : (build_mips ? BcMipLevels(t.width, height) : 1);
 
-  // Track how each texture's mip chain is provided (built here / driver auto-gen / skipped), so the
-  // periodic "mipgen" stats line can show the split across the whole run.
-  const bool driver_mips = auto_mips && want_mips;
-  entry.mip_source = build_mips ? 1 : (driver_mips ? 2 : 0);
-  if (build_mips) {
+  // Track how each texture's mip chain is provided (guest chain / built here / driver auto-gen /
+  // skipped), so the periodic "mipgen" stats line can show the split across the whole run.
+  const bool driver_mips = auto_mips && want_mips && !guest_mips;
+  // A change of mip-source class changes the host texture's level structure, and UpdateTexture
+  // requires staging and target to match -- force a recreate below (the cvars can flip live).
+  const uint8_t prev_mip_source = entry.mip_source;
+  entry.mip_source = guest_mips ? 3 : build_mips ? 1 : (driver_mips ? 2 : 0);
+  if (guest_mips) {
+    ++mips_guest_;
+  } else if (build_mips) {
     ++mips_built_;
   } else if (want_mips) {
     ++mips_auto_;
+  } else if (base_map_only) {
+    ++mips_basemap_;
   } else if (t.mip_max_level == 0) {
     ++mips_skip_nochain_;
   } else {
@@ -3049,7 +3209,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ArmWriteWatch(t.base_address, uint32_t(guest_bytes));
     src = TranslatePhysical(t.base_address);
   }
-  if (entry.tex && entry.layout_key != layout_key) {
+  if (entry.tex && (entry.layout_key != layout_key || prev_mip_source != entry.mip_source)) {
     entry.tex->Release();
     entry.tex = nullptr;
     ++tex_rebuilds_;
@@ -3191,6 +3351,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   }
 
   uint32_t partial_pages = 0;
+  uint32_t src_pages_total = 0;
   // Blanket partial-source check: same measurement the tracked-address path makes, but for
   // EVERY texture, so a transiently-corrupt one does not have to be named in advance. The
   // decoded hash is logged alongside so successive decodes of the same address can be compared:
@@ -3210,6 +3371,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       pages_empty += nz == 0 ? 1 : 0;
     }
     partial_pages = pages_empty;
+    src_pages_total = pages_total;
     if (pages_empty && budget) {
       uint64_t h = 1469598103934665603ull;
       const size_t hashed = size_t(dst_row_bytes) * extent.block_height;
@@ -3380,14 +3542,117 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   if (build_mips && dst) {
     std::vector<Rgba8> cur, next;
     DecodeBcImage(host.d3d, mip_source, dst_row_bytes, t.width, height, cur);
-    const uint32_t dump_left = REXCVAR_GET(nx1_d3d9_dbg_mipdump);
+    // Spend the budget on the MATERIAL being investigated, not on whichever textures happen to
+    // rebuild first -- four clean chains once "proved" the mip builder sound while the
+    // speckling surfaces went unexamined. Use the picker's DUMP MIPS button, which filters to
+    // the draw. An address filter was tried and is wrong: the pool reassigns addresses, so the
+    // dump silently captured a different texture than the one picked.
+    const uint32_t dump_left =
+        (dump_filter_active_ && !dump_draw_) ? 0 : REXCVAR_GET(nx1_d3d9_dbg_mipdump);
     char dump_path[256];
     if (dump_left) {
       REXCVAR_SET(nx1_d3d9_dbg_mipdump, dump_left - 1);
       std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_L0.bmp", t.base_address);
       DumpRgbaBmp(dump_path, cur, t.width, height);
-      REXGPU_INFO("nx1_d3d9: mip dump {}x{} fmt {} -> texdump/mip_{:08X}_L*.bmp", t.width, height,
-                  t.format, t.base_address);
+      // Source-state alongside the picture, because "level 0 is garbage" has two very different
+      // causes and the image alone cannot separate them: empty pages mean the data has not
+      // streamed in yet (residency), while a FULL source that decodes to noise means the slot
+      // holds foreign bytes -- a recycled pool entry -- and no amount of waiting will fix it.
+      // The SAMPLER SLOT matters as much as the picture: this dump captures every texture the
+      // material binds, and a material can bind slots its shader never reads. A noise texture
+      // on an unused high slot says nothing about what is on screen, while noise on slot 0 (the
+      // colormap) is the artifact itself.
+      REXGPU_INFO("nx1_d3d9: mip dump s{} {}x{} fmt {} levels={} mip_filter={} aniso={} "
+                  "src_empty_pages={}/{} mip_address={:08X} -> texdump/mip_{:08X}_L*.bmp",
+                  sampler, t.width, height, t.format, levels, t.mip_filter, t.aniso_filter,
+                  partial_pages, src_pages_total, t.mip_address, t.base_address);
+
+      // OUR LAYOUT vs THE REFERENCE'S, on the same texture. Both backends run over the same
+      // recompiled game and the same memory -- the reference renders these correctly, so the
+      // bytes are there and any disagreement about WHERE they are is ours. GetGuestTextureLayout
+      // is the exact function its texture cache uses, so a mismatch in row pitch or extent is
+      // the bug outright, and a match rules the whole addressing question out for good.
+      {
+        const auto ref = rex::graphics::texture_util::GetGuestTextureLayout(
+            static_cast<rex::graphics::xenos::DataDimension>(t.dimension),
+            t.pitch_pixels >> 5, t.width, height, /*depth_or_array_size=*/1, t.tiled,
+            static_cast<rex::graphics::xenos::TextureFormat>(t.format), t.packed_mips,
+            /*has_base=*/true, t.mip_max_level);
+        const uint32_t our_row = extent.block_pitch_h * bpb;
+        const uint32_t ref_row = ref.base.row_pitch_bytes;
+        const bool agree = our_row == ref_row &&
+                           uint32_t(guest_bytes) >= ref.base.level_data_extent_bytes;
+        REXGPU_WARN("nx1_d3d9: LAYOUTCMP {:08X} {} -- ours row={} bytes={} blocks={}x{} (pitch "
+                    "{}x{}) | ref row={} extent={} packed_level={}",
+                    t.base_address, agree ? "AGREE" : "*** MISMATCH ***", our_row,
+                    uint32_t(guest_bytes), extent.block_width, extent.block_height,
+                    extent.block_pitch_h, extent.block_pitch_v, ref_row,
+                    ref.base.level_data_extent_bytes, ref.packed_level);
+      }
+
+      // THE OTHER ALLOCATION. NX1 keeps a permanent low-res image and STREAMS the high-res
+      // level 0 (see the HUD's "tex perm" vs "tex stm" counters), so when base_address decodes
+      // to noise the real picture may be sitting in the mip allocation right now. Decode the
+      // first guest mip level and dump it beside the base: if it is a clean half-size image
+      // while the base is noise, the two allocations stream INDEPENDENTLY and picking the one
+      // that actually holds data is the fix -- which is also why applying guest mips to every
+      // texture failed, since for other textures it is the base that is good and the mips noise.
+      if (t.mip_address && t.mip_address != t.base_address && t.width > 4 && height > 4) {
+        const uint32_t mw = std::max(1u, rex::next_pow2(t.width) >> 1);
+        const uint32_t mh = std::max(1u, rex::next_pow2(height) >> 1);
+        rex::graphics::TextureExtent mx = rex::graphics::TextureExtent::Calculate(
+            fmt, mw, mh, /*depth=*/1, t.tiled, /*is_guest=*/true);
+        const size_t mbytes = size_t(mx.block_pitch_h) * mx.block_pitch_v * bpb;
+        mx.block_width = (std::max(1u, t.width >> 1) + fmt->block_width - 1) / fmt->block_width;
+        mx.block_height = (std::max(1u, height >> 1) + fmt->block_height - 1) / fmt->block_height;
+        if (const uint8_t* ms = MirrorSnapshot(t.mip_address, uint32_t(mbytes))) {
+          uint32_t mnz = 0;
+          for (size_t i = 0; i < mbytes; i += 64) mnz += ms[i] != 0 ? 1 : 0;
+          const uint32_t mrow = mx.block_width * bpb;
+          uint8_t* msc = DetileScratch(size_t(mx.block_height) * mrow);
+          DetileMip2D(msc, mrow, ms, mx, bpb, t.endian, t.tiled, 0, 0);
+          std::vector<Rgba8> mimg;
+          DecodeBcImage(host.d3d, msc, mrow, std::max(1u, t.width >> 1),
+                        std::max(1u, height >> 1), mimg);
+          std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_GUEST1.bmp",
+                        t.base_address);
+          DumpRgbaBmp(dump_path, mimg, std::max(1u, t.width >> 1), std::max(1u, height >> 1));
+          REXGPU_WARN("nx1_d3d9: ALTSRC {:08X} guest mip1 from {:08X} ({}x{}) nonzero={}/{} "
+                      "-> texdump/mip_{:08X}_GUEST1.bmp",
+                      t.base_address, t.mip_address, std::max(1u, t.width >> 1),
+                      std::max(1u, height >> 1), mnz, mbytes / 64, t.base_address);
+        }
+      }
+
+      // THE MIRROR TEST. Decode the same texture straight from live guest memory and dump it
+      // beside the mirror's version, plus a per-page diff. The corruption we are chasing is
+      // page-granular -- part of a texture correct, part foreign, split on 4 KB boundaries --
+      // which is the signature of a per-page cache holding pages captured at the wrong moment.
+      // If LIVE is clean where MIRROR is noise, the mirror is serving stale pages and that is
+      // the whole bug. If both are identically wrong, the mirror is innocent and the guest
+      // memory really does hold this, which sends us back upstream to streaming.
+      if (REXCVAR_GET(nx1_d3d9_texture_mirror)) {
+        if (const uint8_t* live = TranslatePhysical(t.base_address)) {
+          uint32_t diff_pages = 0;
+          for (uint32_t p = 0; p * 4096 < guest_bytes; ++p) {
+            const size_t off = size_t(p) * 4096;
+            const size_t len = std::min<size_t>(4096, guest_bytes - off);
+            if (std::memcmp(src + off, live + off, len) != 0) ++diff_pages;
+          }
+          const size_t l0 = size_t(extent.block_height) * dst_row_bytes;
+          uint8_t* lscratch = DetileScratch(l0);
+          DetileMip2D(lscratch, dst_row_bytes, live, extent, bpb, t.endian, t.tiled, packed_ox,
+                      packed_oy);
+          std::vector<Rgba8> limg;
+          DecodeBcImage(host.d3d, lscratch, dst_row_bytes, t.width, height, limg);
+          std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_LIVE.bmp",
+                        t.base_address);
+          DumpRgbaBmp(dump_path, limg, t.width, height);
+          REXGPU_WARN("nx1_d3d9: MIRRORDIFF {:08X} {} of {} pages differ from live guest memory "
+                      "-> texdump/mip_{:08X}_LIVE.bmp",
+                      t.base_address, diff_pages, src_pages_total, t.base_address);
+        }
+      }
     }
     if (REXCVAR_GET(nx1_d3d9_dbg_mipfill) == 2) {
       // Overwrite the decoded source with a smooth gradient. BoxFilterHalf and EncodeBcImage
@@ -3441,9 +3706,125 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                                            ? ((lw + 3) / 4) * BcBlockBytes(host.d3d)
                                            : uint32_t(mip.Pitch);
         EncodeBcImage(host.d3d, next, lw, lh, static_cast<uint8_t*>(mip.pBits), mip_row_bytes);
+        // ROUND TRIP. Decode the blocks we just wrote straight back out and dump THAT. The
+        // ordinary mip dump above captures `next` -- the encoder's INPUT -- so it proves the box
+        // filter correct and says nothing about what the GPU receives. Level 0 never re-encodes
+        // (it is the guest's own blocks), which is why every dump so far has looked perfect
+        // while the screen speckled. If ENC is garbage where the plain dump is clean, the fault
+        // is EncodeBcImage or mip_row_bytes, and it is invisible to every other diagnostic.
+        if (dump_left) {
+          std::vector<Rgba8> back;
+          DecodeBcImage(host.d3d, static_cast<const uint8_t*>(mip.pBits), mip_row_bytes, lw, lh,
+                        back);
+          char enc_path[256];
+          std::snprintf(enc_path, sizeof(enc_path), "texdump/mip_%08X_ENC%u.bmp", t.base_address,
+                        level);
+          DumpRgbaBmp(enc_path, back, lw, lh);
+          if (level == 1) {
+            REXGPU_WARN("nx1_d3d9: ENCTRIP {:08X} L1 {}x{} row={} (lock pitch {}, opaque_block={})"
+                        " -> texdump/mip_{:08X}_ENC*.bmp",
+                        t.base_address, lw, lh, mip_row_bytes, int(mip.Pitch),
+                        host.opaque_block ? 1 : 0, t.base_address);
+          }
+        }
         staging->UnlockRect(level);
       }
       cur.swap(next);
+    }
+  }
+  // Decode the guest's own mip levels from mip_address. Same source handling as the base:
+  // through the mirror when it is on (snapshot-and-hold, write-watch re-arms on capture), or a
+  // live read with the watch armed explicitly. Either way a guest write to the mip range lands
+  // in writes_pending_ and DrainMemoryWrites dirties this entry via mip_watch_addr/size.
+  if (!guest_plan.empty() && dst) {
+    const uint8_t* mip_base_src;
+    if (REXCVAR_GET(nx1_d3d9_texture_mirror)) {
+      mip_base_src = MirrorSnapshot(t.mip_address, guest_mip_bytes);
+    } else {
+      ArmWriteWatch(t.mip_address, guest_mip_bytes);
+      mip_base_src = TranslatePhysical(t.mip_address);
+    }
+    const Swizzle32 mip_swz = MakeSwizzle32(t.swizzle);
+    // Visual dump of the guest chain, BC formats only: decode L0 and every guest level to BMPs
+    // (texdump/gmip_<addr>_L*.bmp) from fresh scratch decodes -- NOT from the mapped staging,
+    // which is write-combined and unreliable to read back. L1 looking like a half-size L0 says
+    // the chain is real and the layout is right; a coherent DIFFERENT image says the pool slot
+    // belongs to another texture; scrambled noise says the layout/addressing is wrong.
+    bool gdump = false;
+    if (const uint32_t gd = REXCVAR_GET(nx1_d3d9_dbg_mipdump);
+        gd && mip_base_src && host.decode == TexDecode::kNone && IsBlockCompressed(host.d3d)) {
+      REXCVAR_SET(nx1_d3d9_dbg_mipdump, gd - 1);
+      gdump = true;
+      const size_t l0_bytes = size_t(extent.block_height) * extent.block_width * bpb;
+      uint8_t* scratch = DetileScratch(l0_bytes);
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled,
+                  packed_ox, packed_oy);
+      std::vector<Rgba8> img;
+      DecodeBcImage(host.d3d, scratch, extent.block_width * bpb, t.width, height, img);
+      char path[256];
+      std::snprintf(path, sizeof(path), "texdump/gmip_%08X_L0.bmp", t.base_address);
+      DumpRgbaBmp(path, img, t.width, height);
+      REXGPU_INFO("nx1_d3d9: guest mip dump {:08X} {}x{} fmt={} mip_address={:08X} levels={} "
+                  "mip_filter={} mip_min={} mip_max={} aniso={} lod_bias={} ({:.2f}) "
+                  "grad_exp={}/{} -> texdump/gmip_{:08X}_L*.bmp",
+                  t.base_address, t.width, height, t.format, t.mip_address, guest_plan.size(),
+                  t.mip_filter, t.mip_min_level, t.mip_max_level, t.aniso_filter, t.lod_bias,
+                  double(t.lod_bias) / 32.0, t.grad_exp_h, t.grad_exp_v, t.base_address);
+    }
+    for (size_t li = 0; mip_base_src && li < guest_plan.size(); ++li) {
+      const GuestMip& gm = guest_plan[li];
+      const uint32_t level = uint32_t(li + 1);
+      D3DLOCKED_RECT mip;
+      const HRESULT mip_hr = staging->LockRect(level, &mip, nullptr, 0);
+      if (FAILED(mip_hr) || !mip.pBits) {
+        REXGPU_ERROR("nx1_d3d9: guest mip level {} of {}x{} (fmt {}) failed to lock ({:#x}); "
+                     "that level holds uninitialised data",
+                     level, t.width, height, t.format, static_cast<uint32_t>(mip_hr));
+        continue;
+      }
+      auto* mdst = static_cast<uint8_t*>(mip.pBits);
+      // Same pitch rule as level 0: for a block format the runtime does not recognise, its
+      // reported pitch counts texels, not the block row it actually has to hold.
+      const uint32_t mrow = host.opaque_block ? gm.ext.block_width * bpb : uint32_t(mip.Pitch);
+      const uint8_t* msrc = mip_base_src + gm.offset;
+      if (host.decode == TexDecode::kColorSwizzle) {
+        uint8_t* scratch = DetileScratch(size_t(gm.ext.block_width) * gm.ext.block_height * bpb);
+        DetileMip2D(scratch, gm.ext.block_width * bpb, msrc, gm.ext, bpb, t.endian, t.tiled,
+                    gm.ox, gm.oy);
+        DecodeBcColorSwizzledToArgb(mdst, uint32_t(mip.Pitch), scratch, gm.ext.block_width,
+                                    gm.ext.block_height, gm.lw, gm.lh, src_bc, bpb, t.swizzle);
+      } else if (host.decode == TexDecode::kDXN) {
+        uint8_t* scratch = DetileScratch(size_t(gm.ext.block_width) * gm.ext.block_height * bpb);
+        DetileMip2D(scratch, gm.ext.block_width * bpb, msrc, gm.ext, bpb, t.endian, t.tiled,
+                    gm.ox, gm.oy);
+        DecodeDXNToArgb(mdst, uint32_t(mip.Pitch), scratch, gm.ext.block_width,
+                        gm.ext.block_height, gm.lw, gm.lh);
+      } else if (host.decode != TexDecode::kNone) {
+        uint8_t* scratch = DetileScratch(size_t(gm.ext.block_width) * gm.ext.block_height * bpb);
+        DetileMip2D(scratch, gm.ext.block_width * bpb, msrc, gm.ext, bpb, t.endian, t.tiled,
+                    gm.ox, gm.oy);
+        DecodeBCAlphaToArgb(mdst, uint32_t(mip.Pitch), scratch, gm.ext.block_width,
+                            gm.ext.block_height, gm.lw, gm.lh,
+                            host.decode == TexDecode::kDXT5A);
+      } else {
+        DetileMip2D(mdst, mrow, msrc, gm.ext, bpb, t.endian, t.tiled, gm.ox, gm.oy);
+        if (host.swizzle32 && !mip_swz.identity) {
+          for (uint32_t by = 0; by < gm.ext.block_height; ++by) {
+            SwizzleRow32(mdst + size_t(by) * mrow, gm.ext.block_width, mip_swz);
+          }
+        }
+        if (gdump) {
+          const uint32_t srow = gm.ext.block_width * bpb;
+          uint8_t* scratch = DetileScratch(size_t(gm.ext.block_height) * srow);
+          DetileMip2D(scratch, srow, msrc, gm.ext, bpb, t.endian, t.tiled, gm.ox, gm.oy);
+          std::vector<Rgba8> img;
+          DecodeBcImage(host.d3d, scratch, srow, gm.lw, gm.lh, img);
+          char path[256];
+          std::snprintf(path, sizeof(path), "texdump/gmip_%08X_L%u.bmp", t.base_address, level);
+          DumpRgbaBmp(path, img, gm.lw, gm.lh);
+        }
+      }
+      staging->UnlockRect(level);
     }
   }
   staging->UnlockRect(0);
@@ -3454,8 +3835,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // driver filters them down from the level 0 UpdateTexture writes. A chain we built ourselves
   // is the ordinary case instead -- real levels on both textures, copied across as they are.
   if (!entry.tex &&
-      FAILED(device_->CreateTexture(t.width, height, auto_mips && want_mips ? 0 : levels,
-                                    auto_mips && want_mips ? D3DUSAGE_AUTOGENMIPMAP : 0, host.d3d,
+      FAILED(device_->CreateTexture(t.width, height, driver_mips ? 0 : levels,
+                                    driver_mips ? D3DUSAGE_AUTOGENMIPMAP : 0, host.d3d,
                                     D3DPOOL_DEFAULT, &entry.tex, nullptr))) {
     REXGPU_ERROR("nx1_d3d9: CreateTexture({}x{}, fmt {}) failed", t.width, height, t.format);
     staging->Release();
@@ -3471,7 +3852,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   }
   staging->Release();
   ++tex_uploads_;
-  if (want_mips && auto_mips) {
+  if (driver_mips) {
     entry.tex->SetAutoGenFilterType(D3DTEXF_LINEAR);
     entry.tex->GenerateMipSubLevels();
   }
@@ -3503,6 +3884,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // it. The mirror itself armed the write-watch when it captured these pages in MirrorSnapshot.
   entry.watch_addr = t.base_address;
   entry.watch_size = uint32_t(guest_bytes);
+  // The mip range participates in invalidation only when the levels actually came from it.
+  entry.mip_watch_addr = guest_plan.empty() ? 0 : t.mip_address;
+  entry.mip_watch_size = guest_plan.empty() ? 0 : guest_mip_bytes;
+  entry.mip_addr_seen = t.mip_address;
 
   // Checkerboard hunt. The artifact is intermittent ACROSS LAUNCHES, which points at something
   // that varies with where the guest happened to allocate the texture -- a tiling/pitch

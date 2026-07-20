@@ -533,6 +533,9 @@ class ResourceTracker {
   uint64_t mips_auto_ = 0;             ///< chain left to the driver (uncompressed)
   uint64_t mips_skip_nochain_ = 0;     ///< guest declares mip_max_level == 0
   uint64_t mips_skip_unsupported_ = 0; ///< no autogen and not block-compressed
+  uint64_t mips_guest_ = 0;            ///< chain decoded from the guest's mip_address
+  uint64_t mips_basemap_ = 0;          ///< kBaseMap: level 0 only, no chain wanted at all
+  uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
 };
 
 /// D3DPT_* on the Xbox 360 is the raw Xenos PrimitiveType, which agrees with the

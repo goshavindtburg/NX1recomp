@@ -335,6 +335,16 @@ struct TextureFetchConstant {
   uint32_t mip_max_level;
   uint32_t mip_address;
   bool packed_mips;
+  /// Signed LOD bias with 5 fractional bits (A2XX_SQ_TEX_4_LOD_BIAS): the value the hardware
+  /// adds to the computed LOD before level selection. Range -32.0 .. +31.97. A large NEGATIVE
+  /// bias pins sampling at level 0 -- a way for a streamer to declare a chain while its levels
+  /// are still in flight, without touching the filter fields.
+  int32_t lod_bias;
+  /// Signed 5-bit exponent adjustments applied to the texture-coordinate gradients before the
+  /// LOD calculation. A negative value scales the derivatives by 2^n toward zero, which ALSO
+  /// pins the computed LOD at 0 -- the other way a streamer can park sampling on the base.
+  int32_t grad_exp_h;
+  int32_t grad_exp_v;
 };
 
 /// Decode a `GPUTEXTURE_FETCH_CONSTANT` (6 dwords) from a host pointer at the constant's raw,
@@ -378,6 +388,11 @@ inline TextureFetchConstant DecodeTextureFetchConstant(const uint8_t* p) {
   t.aniso_filter = (d3 >> 25) & 0x7;
   t.mip_min_level = (d4 >> 2) & 0xF;
   t.mip_max_level = (d4 >> 6) & 0xF;
+  // 10-bit signed at d4 bits 12..21; sign-extend via the shift pair.
+  t.lod_bias = (int32_t(d4 << 10) >> 22);
+  // 5-bit signed at d4 bits 22..26 (H) and 27..31 (V).
+  t.grad_exp_h = (int32_t(d4 << 5) >> 27);
+  t.grad_exp_v = (int32_t(d4) >> 27);
   t.packed_mips = ((d5 >> 11) & 0x1) != 0;
   t.mip_address = ((d5 >> 12) & 0xFFFFF) << 12;
 

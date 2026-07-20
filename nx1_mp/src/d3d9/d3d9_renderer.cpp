@@ -154,6 +154,12 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_nomips, 0, "GPU",
                       "measured clean, so if the speckle vanishes here it is coming from the mip "
                       "chain (which we GENERATE on the host) rather than from the guest texels");
 
+REXCVAR_DEFINE_BOOL(nx1_d3d9_basemap, true, "GPU",
+                    "Honour xenos mip_filter kBaseMap (MIPFILTER=NONE): the game's signal that "
+                    "a texture's mips are not resident and level 0 is the only valid data. The "
+                    "reference clamps sampling to the base for these; overriding it is what "
+                    "sampled the unfilled mip pool as the distance confetti");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipclamp_ps, 0, "GPU",
                       "Debug: pixel-shader object whose sampler mips to clamp");
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipclamp_mask, 0, "GPU",
@@ -494,6 +500,21 @@ IDirect3DQuery9* Renderer::PickBegin(const RecordedDraw& d) {
   // Re-assert per draw. ApplyRenderStates / the guest's own state can clear SCISSORTESTENABLE,
   // and with the scissor gone each query counts the draw's whole coverage -- which is why a
   // single click once reported over a thousand "hits".
+  //
+  // The box is resolved HERE, from this draw's own viewport, because the normalised pick
+  // position means different pixels in different targets: the scene is 1024x600, a shadow
+  // cascade is square and much larger, the composite is the display size. Computing one pixel
+  // box at frame start and reusing it made every query but the scene's measure the wrong place.
+  D3DVIEWPORT9 vp{};
+  if (SUCCEEDED(device_->GetViewport(&vp)) && vp.Width && vp.Height) {
+    const LONG half =
+        LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_size) ? REXCVAR_GET(nx1_d3d9_dbg_pick_size) : 8) / 2;
+    const LONG cx = LONG(vp.X) + LONG(pick_nx_ * float(vp.Width)) +
+                    LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_ox));
+    const LONG cy = LONG(vp.Y) + LONG(pick_ny_ * float(vp.Height)) +
+                    LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_oy));
+    pick_box_ = RECT{cx - half, cy - half, cx + half + 1, cy + half + 1};
+  }
   device_->SetScissorRect(&pick_box_);
   device_->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
   if (pick_count_ >= pick_queries_.size()) {
@@ -507,10 +528,19 @@ IDirect3DQuery9* Renderer::PickBegin(const RecordedDraw& d) {
     return nullptr;
   }
   IDirect3DQuery9* q = pick_queries_[pick_count_];
-  pick_entries_[pick_count_] = {d.ps_object, d.vs_object,
+  // Sampler 0 of this exact draw, so the overlay can track the surface's own texture rather
+  // than every texture its (shared) shader ever binds.
+  const TextureFetchConstant s0 = DecodeTextureFetchConstant(d.texture_fetch(0));
+  pick_entries_[pick_count_] = {d.ps_object,
+                                d.vs_object,
                                 d.ps && d.ps->entry ? d.ps->entry->hash : 0ull,
-                                current_rt_surface_, d.depth.write_enabled,
-                                d.depth.test_enabled && d.depth.compare_function != 7};
+                                current_rt_surface_,
+                                d.depth.write_enabled,
+                                d.depth.test_enabled && d.depth.compare_function != 7,
+                                s0.valid ? s0.base_address : 0u,
+                                s0.width,
+                                s0.height,
+                                s0.format};
   q->Issue(D3DISSUE_BEGIN);
   return q;
 }
@@ -540,17 +570,21 @@ bool Renderer::PickIsIgnored(uint32_t lo32) const {
   return false;
 }
 
-void Renderer::RequestPick(int x, int y) {
+void Renderer::RequestPick(int x, int y, int w, int h) {
   // NO LOCK. This is called from two places that must not contend: the WndProc (window thread)
   // and the overlay's own draw, which runs from Present() -- and Present already holds
   // render_mutex_. Taking it here recursively on a non-recursive mutex crashed the game the
   // moment hover mode issued its first pick.
   //
-  // Lock-free is sound for this: the coordinates are plain ints published BEFORE the flag that
+  // Lock-free is sound for this: the coordinates are plain floats published BEFORE the flag that
   // makes them live, and the consumer only reads them once it sees the flag. A torn value would
   // at worst pick a neighbouring pixel for one frame.
-  pick_x_ = x;
-  pick_y_ = y;
+  //
+  // Stored NORMALISED (0..1 of the window), then resolved against each draw's own viewport in
+  // PickBegin. The scene target, the shadow maps and the composite are all different sizes, so
+  // there is no single pixel box that is correct for all of them -- only a normalised position.
+  pick_nx_ = w > 0 ? float(x) / float(w) : 0.0f;
+  pick_ny_ = h > 0 ? float(y) / float(h) : 0.0f;
   pick_requested_.store(true, std::memory_order_release);
 }
 
@@ -570,27 +604,20 @@ void Renderer::BeginFrame() {
   // Arm the shader picker for exactly this frame.
   if ((pick_requested_.load(std::memory_order_acquire) || REXCVAR_GET(nx1_d3d9_dbg_pick)) &&
       !pick_active_) {
-    D3DVIEWPORT9 vp{};
-    if (SUCCEEDED(device_->GetViewport(&vp))) {
-      const LONG half = LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_size) ? REXCVAR_GET(nx1_d3d9_dbg_pick_size) : 8) / 2;
-      // A requested pick centres on the clicked pixel; the cvar path falls back to screen centre.
-      const bool from_request = pick_requested_.load(std::memory_order_acquire);
-      const LONG cx = from_request ? LONG(pick_x_)
-                                      : LONG(vp.X + vp.Width / 2) +
-                                            LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_ox));
-      const LONG cy = from_request ? LONG(pick_y_)
-                                      : LONG(vp.Y + vp.Height / 2) +
-                                            LONG(REXCVAR_GET(nx1_d3d9_dbg_pick_oy));
-      pick_box_ = RECT{cx - half, cy - half, cx + half + 1, cy + half + 1};
-      device_->SetScissorRect(&pick_box_);
-      device_->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
-      pick_active_ = true;
-      pick_requested_.store(false, std::memory_order_relaxed);
-      pick_count_ = 0;
-      pick_results_.clear();
-      REXGPU_INFO("nx1_d3d9: PICK armed -- box {}x{} at ({}, {})", half * 2 + 1, half * 2 + 1, cx,
-                  cy);
+    // The cvar path (no click) aims at the screen centre; a requested pick keeps the normalised
+    // position the click published. The pixel box itself is resolved per draw in PickBegin --
+    // see the note there about differing target sizes.
+    if (!pick_requested_.load(std::memory_order_acquire)) {
+      pick_nx_ = 0.5f;
+      pick_ny_ = 0.5f;
     }
+    pick_active_ = true;
+    pick_requested_.store(false, std::memory_order_relaxed);
+    pick_count_ = 0;
+    pick_results_.clear();
+    REXGPU_INFO("nx1_d3d9: PICK armed at ({:.3f}, {:.3f}) of the window, box {}px",
+                pick_nx_, pick_ny_,
+                REXCVAR_GET(nx1_d3d9_dbg_pick_size) ? REXCVAR_GET(nx1_d3d9_dbg_pick_size) : 8);
   }
   device_->BeginScene();
 
@@ -631,13 +658,14 @@ void Renderer::Present() {
       const PickEntry& e = pick_entries_[i];
       pick_results_.push_back(
           {e.ps_object, e.vs_object, e.ps_hash, uint32_t(pixels), uint32_t(i), e.rt_surface, false,
-           e.depth_write, e.depth_test});
+           e.depth_write, e.depth_test, e.s0_addr, e.s0_w, e.s0_h, e.s0_fmt});
       // Every field the selection heuristic uses, so a wrong pick can be diagnosed from the log
       // instead of by guessing which filter rejected the surface.
       REXGPU_INFO("nx1_d3d9: PICK hit #{} px={} ps={:08X} vs={:08X} rt={:08X} ztest={} zwrite={} "
-                  "ucode=0x{:016X} lo32={}",
+                  "ucode=0x{:016X} lo32={} s0={:08X} ({}x{} fmt={})",
                   i, pixels, e.ps_object, e.vs_object, e.rt_surface, e.depth_test ? 1 : 0,
-                  e.depth_write ? 1 : 0, e.ps_hash, uint32_t(e.ps_hash & 0xFFFFFFFFu));
+                  e.depth_write ? 1 : 0, e.ps_hash, uint32_t(e.ps_hash & 0xFFFFFFFFu), e.s0_addr,
+                  e.s0_w, e.s0_h, e.s0_fmt);
     }
     // The MAIN pass is whichever target the last covering draw wrote: the scene is composed
     // last, after the shadow and reflection passes. Everything on another target was never on
@@ -1855,11 +1883,16 @@ D3DTEXTUREFILTERTYPE HostFilter(uint32_t xenos_filter) {
 // means "sample the base level and no other", which on D3D9 is D3DTEXF_NONE rather than a
 // filter mode.
 //
-// We do not honour it. The guest asks for base-map-only on exactly the textures whose mips
-// never streamed in -- this build has no imagefile to stream them from -- so pairing it with
-// the chains we generate ourselves left those surfaces reading level 0 at any distance,
-// aliasing into coloured speckle. On the console they have mips and are filtered, which is what
-// the scene was authored for. For a texture that genuinely has one level this is a no-op.
+// kBaseMap is how the game says "this texture's mips are not resident": the mip pool behind
+// mip_address holds other data (or nothing yet), and on hardware the flag means that memory
+// is never read. The reference honours it -- its sampler carries a mip_base_map bit that
+// clamps fetching to the base level -- which is why it renders clean at distance over the very
+// same unfilled pool. We used to override this and pair the texture with a chain we fabricated
+// ourselves (downsampled from a possibly-unstreamed level 0, or decoded from the unfilled
+// pool); either way the distant samples were data the hardware never touches, and that was
+// the distance confetti. The honouring happens at the sampler-state site (nx1_d3d9_basemap),
+// where it must also survive the force-trilinear smoothing; this helper only maps the two
+// plain filter modes.
 D3DTEXTUREFILTERTYPE HostMipFilter(uint32_t xenos_filter) {
   return xenos_filter == 0 ? D3DTEXF_POINT : D3DTEXF_LINEAR;
 }
@@ -2442,8 +2475,14 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // point mip filter under linear/aniso minification leaves hard mip-level steps, visible as bands
     // sweeping across smooth gradients (the sky dome above all). Keep point mip only when the
     // minification itself is point (a deliberately crisp surface).
+    //
+    // kBaseMap (NONE) must survive that smoothing: it is the guest's "my mips are not
+    // resident" signal, and upgrading it to trilinear samples memory the hardware never reads.
     D3DTEXTUREFILTERTYPE mip_filter =
         min_filter == D3DTEXF_POINT ? HostMipFilter(t.mip_filter) : D3DTEXF_LINEAR;
+    if (t.mip_filter == 2 && REXCVAR_GET(nx1_d3d9_basemap)) {
+      mip_filter = D3DTEXF_NONE;
+    }
     if (REXCVAR_GET(nx1_d3d9_dbg_nomips)) {
       mip_filter = D3DTEXF_NONE;
     }
