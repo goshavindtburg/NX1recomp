@@ -138,6 +138,13 @@ REXCVAR_DEFINE_BOOL(nx1_native_shader_cache_log, false, "GPU/D3D12",
                     "Log NX1 native shader cache hits and fallbacks")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(nx1_suppress_reference_resolve, false, "GPU",
+                    "Diagnostic: while nx1_d3d9 owns the output, do not let this backend resolve "
+                    "EDRAM back into guest memory. Resolves are the only guest-memory WRITES it "
+                    "performs, they are host-side (invisible to the guest write-watch), and they "
+                    "run regardless of nx1_skip_reference_raster -- so this is the only way to "
+                    "rule them out as the source of corrupted texture memory");
+
 REXCVAR_DEFINE_BOOL(nx1_skip_reference_raster, true, "GPU",
                     "Skip the reference backend's raster when the native renderer "
                     "owns output (off = let it render, so render-to-texture "
@@ -3738,6 +3745,24 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
     ++nx1_frame_probe.copy_packets;
+    // DIAGNOSTIC: suppress the resolve writeback entirely while another renderer owns the
+    // output. A resolve is the one thing this backend does that WRITES guest memory, and it
+    // does so host-side -- so it never trips the guest page protection the native renderer's
+    // write-watch relies on. That matches the one measurement nothing else explains: texture
+    // content changing between decodes with zero observed guest writes. Note that skipping the
+    // raster (nx1_skip_reference_raster) does NOT test this: resolves return above that skip,
+    // so they run either way, and with the raster skipped they write EDRAM that was never
+    // drawn into. Off by default -- the native renderer serves textures from its own resolve
+    // map, but the guest CPU may still read resolved data, so this is a probe, not a fix.
+    if (gpu_disabled_.load(std::memory_order_relaxed) &&
+        REXCVAR_GET(nx1_suppress_reference_resolve)) {
+      static std::atomic<uint64_t> suppressed{0};
+      const uint64_t n = ++suppressed;
+      if ((n % 10000) == 1) {
+        REXGPU_INFO("nx1_d3d9: reference RESOLVE suppressed (owned by D3D9): {} so far", n);
+      }
+      return true;
+    }
     if (!IssueCopy()) {
       return nx1_log_draw_drop("IssueCopy failed");
     }

@@ -21,6 +21,7 @@
 
 #ifdef _WIN32
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -508,6 +509,23 @@ class ResourceTracker {
   /// READ that memory faithfully. This answers the other question directly: was the prefix ever
   /// written at all? Pages with zero writes were never touched by the guest while we watched.
   std::vector<uint8_t> page_writes_;
+  /// Last decoded content hash per texture address, so a texture that decodes one way and then
+  /// differently later reports the transition (see DECODECHANGE). Keyed on address alone --
+  /// this is a diagnostic, and the pool reassigning an address is itself worth seeing.
+  struct DecodeStamp {
+    uint64_t hash = 0;
+    uint64_t frame = 0;
+    uint32_t writes = 0;
+    /// The FIRST decode's hash and frame, plus how many times this address has been decoded and
+    /// how often the result changed. This is what separates "we re-read good memory and got
+    /// garbage" from "it was garbage the first time we ever looked" -- and no cache policy can
+    /// fix the second, so it decides which half of the problem is even worth attacking.
+    uint64_t first_hash = 0;
+    uint64_t first_frame = 0;
+    uint32_t decodes = 0;
+    uint32_t changes = 0;
+  };
+  std::unordered_map<uint32_t, DecodeStamp> decode_hashes_;
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;

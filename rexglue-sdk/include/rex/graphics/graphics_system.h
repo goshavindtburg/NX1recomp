@@ -71,6 +71,15 @@ class GraphicsSystem : public system::IGraphicsSystem {
   RegisterFile* register_file() { return &register_file_; }
   CommandProcessor* command_processor() const { return command_processor_.get(); }
 
+  /// The live GraphicsSystem, for the native D3D9 renderer's diagnostics. It takes its fetch
+  /// constants from the guest D3D device's SHADOW copy in guest memory, while this backend
+  /// takes them from the PM4 register file -- the state the GPU was actually handed. Those two
+  /// sources have never been compared, and a disagreement would mean the native renderer binds
+  /// a different texture than the guest asked for: consistently wrong from the first decode,
+  /// unchanging, with no memory writes involved, which is exactly the profile of the corruption
+  /// under investigation. Diagnostic only; null before the graphics system is created.
+  static GraphicsSystem* Nx1Current();
+
   virtual void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   virtual void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 

@@ -77,7 +77,19 @@ __declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
 }  // extern "C"
 #endif  // REX_PLATFORM_WIN32
 
-GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+namespace {
+/// See GraphicsSystem::Nx1Current -- diagnostic access for the native D3D9 renderer, which
+/// needs to compare its fetch constants against the PM4 register file this backend uses.
+std::atomic<GraphicsSystem*> g_nx1_current{nullptr};
+}  // namespace
+
+GraphicsSystem* GraphicsSystem::Nx1Current() {
+  return g_nx1_current.load(std::memory_order_acquire);
+}
+
+GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {
+  g_nx1_current.store(this, std::memory_order_release);
+}
 
 GraphicsSystem::~GraphicsSystem() = default;
 

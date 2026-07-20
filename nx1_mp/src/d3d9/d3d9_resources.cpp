@@ -169,6 +169,12 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_writes_always_invalidate, true, "GPU",
 REXCVAR_DEFINE_BOOL(nx1_d3d9_commit_textures, true, "GPU",
                     "Freeze a texture's decode after it has been drawn cleanly for 32 frames");
 
+REXCVAR_DEFINE_BOOL(nx1_d3d9_evict_textures, true, "GPU",
+                    "Release cached textures that have not been bound for ~600 frames. Off "
+                    "keeps every decode for the session: re-decoding is a gamble because guest "
+                    "texture memory changes through a path the write-watch cannot see, so an "
+                    "evicted GOOD decode may come back as the pool's later garbage");
+
 /// Checkerboard hunt: log the full decode geometry of every texture >= 256x256, once per address.
 /// The artifact varies across launches, so the evidence is a diff of a good run against a bad one
 /// -- not anything visible within either.
@@ -2546,8 +2552,21 @@ void ResourceTracker::AdvanceFrame() {
   }
   // Only textures we uploaded live here; the resolve/depth aliases we do not own are in
   // resolves_, which is left alone.
+  //
+  // EVICTION IS NOT FREE HERE, and that is the point of the cvar. Re-decoding is only safe if
+  // guest memory still holds what it held at the first decode -- and it demonstrably does not:
+  // texture content changes between decodes with ZERO observed guest writes (DECODECHANGE),
+  // so something modifies this memory through a path page protection cannot see. Evicting a
+  // GOOD decode therefore gambles: the rebuild reads whatever is there now, and if that is the
+  // pool's later garbage the texture is wrong until something rewrites it. The reference is not
+  // reading better memory than we are -- it uploads once, never sees an invalidation either,
+  // and so keeps its first (good) copy. Holding our decodes makes us behave the same way.
   if (auto* map = static_cast<TextureMap*>(textures_)) {
     for (auto it = map->begin(); it != map->end();) {
+      if (!REXCVAR_GET(nx1_d3d9_evict_textures)) {
+        ++it;
+        continue;
+      }
       if (it->second.last_frame < cutoff) {
         if (it->second.tex) it->second.tex->Release();
         if (it->second.vol) it->second.vol->Release();
@@ -3433,6 +3452,41 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
 
   uint32_t partial_pages = 0;
   uint32_t src_pages_total = 0;
+
+  // DID THIS TEXTURE'S CONTENT CHANGE UNDER US? The corruption is image-space (top quarter,
+  // proportional to height, sub-page on smaller textures), so no single contiguous write can
+  // have produced it -- but PAGEWRITES shows every page written 2-4 times. That fits a texture
+  // decoded correctly once and re-decoded later, after the guest wrote the slot again, with the
+  // reference still showing what the FIRST upload produced. Hash every decode and report only
+  // the transitions: an address whose hash changes tells us exactly when it went bad, and how
+  // many writes had landed by then. Silence means each texture decodes the same way forever and
+  // the "we re-read stale memory" model is wrong too.
+  if (src && dst) {
+    uint64_t h = 1469598103934665603ull;
+    const size_t hashed = size_t(dst_row_bytes) * extent.block_height;
+    for (size_t i = 0; i < hashed; i += 257) h = (h ^ dst[i]) * 1099511628211ull;
+    uint32_t wsum = 0;
+    for (uint32_t i = 0; i < src_pages_total; ++i) {
+      const uint32_t p = (t.base_address >> 12) + i;
+      if (p < page_writes_.size()) wsum += page_writes_[p];
+    }
+    auto& prev = decode_hashes_[t.base_address];
+    if (prev.hash && prev.hash != h) {
+      ++prev.changes;
+      REXGPU_WARN("nx1_d3d9: DECODECHANGE {:08X} {}x{} fmt={} frame {} -> {} | hash {:016X} -> "
+                  "{:016X} | page writes {} -> {}",
+                  t.base_address, t.width, height, t.format, prev.frame, frame_, prev.hash, h,
+                  prev.writes, wsum);
+    }
+    if (!prev.decodes) {
+      prev.first_hash = h;
+      prev.first_frame = frame_;
+    }
+    ++prev.decodes;
+    prev.hash = h;
+    prev.frame = frame_;
+    prev.writes = wsum;
+  }
   // Blanket partial-source check: same measurement the tracked-address path makes, but for
   // EVERY texture, so a transiently-corrupt one does not have to be named in advance. The
   // decoded hash is logged alongside so successive decodes of the same address can be compared:
@@ -3663,6 +3717,20 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                   t.dimension, t.endian, t.swizzle, t.sign[0], t.sign[1], t.sign[2], t.sign[3],
                   extent.block_width, extent.block_height, extent.block_pitch_h,
                   extent.block_pitch_v, t.base_address, frame_);
+
+      // WAS IT EVER GOOD? If a corrupt texture shows decodes=1 (or changes=0), it has looked
+      // exactly like this since the first time we ever read that memory -- so no caching,
+      // eviction or invalidation policy could have produced it, and the whole "we re-read good
+      // memory and lost" family of explanations is wrong. If instead first_hash differs from
+      // the current one, it WAS good once and we replaced it, and the frames tell us when.
+      if (auto it = decode_hashes_.find(t.base_address); it != decode_hashes_.end()) {
+        const auto& st = it->second;
+        REXGPU_WARN("nx1_d3d9: DECODEHIST {:08X} decodes={} changes={} | first frame {} hash "
+                    "{:016X} | now frame {} hash {:016X} | {}",
+                    t.base_address, st.decodes, st.changes, st.first_frame, st.first_hash,
+                    st.frame, st.hash,
+                    st.changes ? "CHANGED since first decode" : "IDENTICAL since first decode");
+      }
 
       // WAS THE BAD REGION EVER WRITTEN? The decisive question, and the one every previous
       // diagnostic talked around: they all established that we read this memory faithfully,

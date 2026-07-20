@@ -7,6 +7,7 @@
 // rex/thread.h declares Sleep(std::chrono::milliseconds), which the Win32
 // Sleep macro otherwise mangles.
 #include <rex/cvar.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/logging/macros.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
@@ -153,6 +154,12 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_nomips, 0, "GPU",
                       "sampled. The confetti speckle is distance-dependent and level 0 is "
                       "measured clean, so if the speckle vanishes here it is coming from the mip "
                       "chain (which we GENERATE on the host) rather than from the guest texels");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_fetchcmp, false, "GPU",
+                    "Debug: for the material in dbg_blend_ps, compare the fetch constant we "
+                    "read (the guest D3D shadow copy) against the PM4 register file the "
+                    "reference backend uses (what the GPU was actually handed). A mismatch "
+                    "means we bind a different texture than the guest asked for");
 
 REXCVAR_DEFINE_BOOL(nx1_d3d9_basemap, true, "GPU",
                     "Honour xenos mip_filter kBaseMap (MIPFILTER=NONE): the game's signal that "
@@ -2412,6 +2419,55 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // Decoded once here and handed to GetTexture: the sampler state below needs the same
     // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
     const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(sampler));
+    // OUR FETCH CONSTANT vs THE GPU'S. We read the guest D3D device's shadow copy; the
+    // reference backend reads the PM4 register file -- the state the GPU was actually handed.
+    // If they disagree we bind a different texture than the guest asked for, which would be
+    // consistently wrong from the first decode, unchanging, and involve no memory writes at
+    // all: the exact profile measured (DECODEHIST changes=0 on a fully corrupt texture).
+    // Reported once per differing slot, only while a dump is armed, so it costs nothing
+    // normally.
+    // Runs on EVERY draw when armed -- no material selection needed. Gating it behind
+    // dbg_blend_ps meant it silently never ran, because that cvar is only set by the picker's
+    // buttons. Mismatches are deduplicated by (ps_object, sampler) and capped, so a real
+    // disagreement shows up in the first seconds without flooding the log.
+    if (REXCVAR_GET(nx1_d3d9_dbg_fetchcmp)) {
+      if (auto* gs = rex::graphics::GraphicsSystem::Nx1Current()) {
+        const auto ref = gs->register_file()->GetTextureFetch(sampler);
+        const uint32_t* ours = reinterpret_cast<const uint32_t*>(d.texture_fetch(sampler));
+        uint32_t swapped[6];
+        for (int i = 0; i < 6; ++i) {
+          swapped[i] = _byteswap_ulong(ours[i]);
+        }
+        // The register file stores HOST-endian dwords; DecodeTextureFetchConstant reads
+        // big-endian guest bytes. Feeding it the registers directly swaps them a second time
+        // and produces nonsense (7937x7937 sizes, addresses outside physical memory), which is
+        // exactly what the first run of this probe reported. Swap back to guest byte order
+        // first so both sides are decoded by the same code.
+        uint32_t ref_be[6];
+        const uint32_t* ref_dw = reinterpret_cast<const uint32_t*>(&ref);
+        for (int i = 0; i < 6; ++i) {
+          ref_be[i] = _byteswap_ulong(ref_dw[i]);
+        }
+        const TextureFetchConstant rt =
+            DecodeTextureFetchConstant(reinterpret_cast<const uint8_t*>(ref_be));
+        // The BASE ADDRESS is the signal. The register file is updated asynchronously by the
+        // ring, so filter/LOD fields drift harmlessly between the two snapshots; pointing at
+        // different memory does not.
+        if (rt.valid && t.valid && rt.base_address != t.base_address) {
+          static std::mutex m;
+          static std::vector<uint64_t> seen;
+          const uint64_t key = (uint64_t(d.ps_object) << 8) | sampler;
+          std::lock_guard<std::mutex> lk(m);
+          if (seen.size() < 32 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+            seen.push_back(key);
+            REXGPU_WARN("nx1_d3d9: FETCHCMP s{} MISMATCH ps={:08X} | ours base={:08X} {}x{} "
+                        "fmt={} | gpu base={:08X} {}x{} fmt={}",
+                        sampler, d.ps_object, t.base_address, t.width, t.height, t.format,
+                        rt.base_address, rt.width, rt.height, rt.format);
+          }
+        }
+      }
+    }
     // Re-point the address tracker at whatever this material binds RIGHT NOW. Following a fixed
     // address does not work while the streaming pool is reassigning them -- an address copied
     // out of a dump is frequently a different texture by the time it is entered, which reads as
