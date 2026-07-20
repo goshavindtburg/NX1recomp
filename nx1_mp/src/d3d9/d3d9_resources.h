@@ -509,9 +509,11 @@ class ResourceTracker {
   /// READ that memory faithfully. This answers the other question directly: was the prefix ever
   /// written at all? Pages with zero writes were never touched by the guest while we watched.
   std::vector<uint8_t> page_writes_;
-  /// Last decoded content hash per texture address, so a texture that decodes one way and then
-  /// differently later reports the transition (see DECODECHANGE). Keyed on address alone --
-  /// this is a diagnostic, and the pool reassigning an address is itself worth seeing.
+  /// Last decoded content hash per texture VIEW (address + every fetch-constant field that
+  /// changes the decoded bytes -- see DecodeViewKey), so a texture that decodes one way and
+  /// then differently later reports the transition (see DECODECHANGE). Address-alone keying
+  /// was a bug that reported phantom changes whenever the same memory was bound through two
+  /// views, which reads exactly like writes invisible to page protection.
   struct DecodeStamp {
     uint64_t hash = 0;
     uint64_t frame = 0;
@@ -525,7 +527,7 @@ class ResourceTracker {
     uint32_t decodes = 0;
     uint32_t changes = 0;
   };
-  std::unordered_map<uint32_t, DecodeStamp> decode_hashes_;
+  std::unordered_map<uint64_t, DecodeStamp> decode_hashes_;
   /// Packed-mip fix instrumentation: decodes of <=16 texel textures, decodes whose fetch constant
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;

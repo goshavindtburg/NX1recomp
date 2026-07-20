@@ -1385,6 +1385,22 @@ void EncodeBcImage(D3DFORMAT fmt, const std::vector<Rgba8>& src, uint32_t width,
 /// Halve an RGBA image with a 2x2 box filter (odd dimensions repeat the last row/column).
 /// Write an Rgba8 image as a 32-bit BMP. Debug-only, so it favours being obviously correct
 /// over being fast: bottom-up rows, BGRA order, no compression.
+/// Key for the decode-history diagnostics (DECODECHANGE / DECODEHIST): the address PLUS every
+/// fetch-constant field that changes the decoded bytes. Keyed on address alone, the same
+/// memory bound through two different VIEWS (a colormap and a broadcast-swizzle mask, or two
+/// samplers with different swizzles) legitimately decodes to different host bytes -- and the
+/// stamp ping-ponged between them, reporting "content changed with zero guest writes". That
+/// produced 1359 phantom changes in one run and sent a whole evening chasing writes invisible
+/// to page protection. The view is part of the identity, not noise.
+uint64_t DecodeViewKey(const TextureFetchConstant& t) {
+  uint64_t v = t.base_address;
+  v = v * 0x9E3779B97F4A7C15ull ^ ((uint64_t(t.width) << 32) | t.height);
+  v = v * 0x9E3779B97F4A7C15ull ^ ((uint64_t(t.format) << 32) | t.swizzle);
+  v = v * 0x9E3779B97F4A7C15ull ^ ((uint64_t(t.endian) << 8) | (t.tiled ? 1u : 0u));
+  v = v * 0x9E3779B97F4A7C15ull ^ t.pitch_pixels;
+  return v;
+}
+
 void DumpRgbaBmp(const char* path, const std::vector<Rgba8>& px, uint32_t w, uint32_t h) {
   if (!w || !h || px.size() < size_t(w) * h) {
     return;
@@ -3470,7 +3486,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       const uint32_t p = (t.base_address >> 12) + i;
       if (p < page_writes_.size()) wsum += page_writes_[p];
     }
-    auto& prev = decode_hashes_[t.base_address];
+    auto& prev = decode_hashes_[DecodeViewKey(t)];
     if (prev.hash && prev.hash != h) {
       ++prev.changes;
       REXGPU_WARN("nx1_d3d9: DECODECHANGE {:08X} {}x{} fmt={} frame {} -> {} | hash {:016X} -> "
@@ -3723,7 +3739,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // eviction or invalidation policy could have produced it, and the whole "we re-read good
       // memory and lost" family of explanations is wrong. If instead first_hash differs from
       // the current one, it WAS good once and we replaced it, and the frames tell us when.
-      if (auto it = decode_hashes_.find(t.base_address); it != decode_hashes_.end()) {
+      if (auto it = decode_hashes_.find(DecodeViewKey(t)); it != decode_hashes_.end()) {
         const auto& st = it->second;
         REXGPU_WARN("nx1_d3d9: DECODEHIST {:08X} decodes={} changes={} | first frame {} hash "
                     "{:016X} | now frame {} hash {:016X} | {}",

@@ -138,6 +138,15 @@ REXCVAR_DEFINE_BOOL(nx1_native_shader_cache_log, false, "GPU/D3D12",
                     "Log NX1 native shader cache hits and fallbacks")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_UINT32(nx1_dbg_fetch_seq, 0, "GPU",
+                      "Diagnostic: log this many draws' texture fetch constants from BOTH "
+                      "sides -- CPFETCH here, read from the PM4 register file at the moment "
+                      "this command processor executes the draw (the one instant it is "
+                      "authoritative), and D9FETCH in the native renderer at its own draw. "
+                      "Aligning the two s0 streams offline is the only valid form of the "
+                      "shadow-copy-vs-ring comparison: an instantaneous register-file read "
+                      "from the other thread only measures ring lag");
+
 REXCVAR_DEFINE_BOOL(nx1_suppress_reference_resolve, false, "GPU",
                     "Diagnostic: while nx1_d3d9 owns the output, do not let this backend resolve "
                     "EDRAM back into guest memory. Resolves are the only guest-memory WRITES it "
@@ -3767,6 +3776,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return nx1_log_draw_drop("IssueCopy failed");
     }
     return true;
+  }
+
+  // CPFETCH: this side of the draw-sequence fetch comparison (see D9FETCH in the native
+  // renderer, and the nx1_dbg_fetch_seq cvar). Placed BEFORE any skip or shader-analysis
+  // early-out so every real draw packet is logged, keeping the sequence alignable against the
+  // native renderer's stream. This side owns the budget decrement; the native side only reads
+  // the cvar, so both stop together.
+  if (const uint32_t fetch_budget = REXCVAR_GET(nx1_dbg_fetch_seq); fetch_budget) {
+    REXCVAR_SET(nx1_dbg_fetch_seq, fetch_budget - 1);
+    static std::atomic<uint64_t> cp_fetch_seq{0};
+    const auto f0 = register_file_->GetTextureFetch(0);
+    const auto f1 = register_file_->GetTextureFetch(1);
+    REXGPU_WARN("nx1_d3d9: CPFETCH #{} idx={} s0={:08X} s1={:08X}",
+                cp_fetch_seq.fetch_add(1, std::memory_order_relaxed), index_count,
+                uint32_t(f0.base_address) << 12, uint32_t(f1.base_address) << 12);
   }
 
   // Vertex shader analysis.

@@ -155,6 +155,9 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_nomips, 0, "GPU",
                       "measured clean, so if the speckle vanishes here it is coming from the mip "
                       "chain (which we GENERATE on the host) rather than from the guest texels");
 
+// Defined in the SDK's d3d12/command_processor.cpp beside CPFETCH, its other half.
+REXCVAR_DECLARE(uint32_t, nx1_dbg_fetch_seq);
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_fetchcmp, false, "GPU",
                     "Debug: for the material in dbg_blend_ps, compare the fetch constant we "
                     "read (the guest D3D shadow copy) against the PM4 register file the "
@@ -2407,6 +2410,24 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     if (kill_ps && kill_mask) {
       REXGPU_INFO("nx1_d3d9: KILLSAMPLER selection now ps={:08X} mask={:#x}", kill_ps, kill_mask);
     }
+  }
+
+  // D9FETCH: our half of the draw-sequence fetch comparison (CPFETCH is the reference command
+  // processor's half; one cvar arms both, and that side decrements it so both stop together).
+  // The earlier FETCHCMP probe read the register file from THIS thread at THIS draw and was
+  // invalid by construction: the register file is a different clock, advanced by the CP thread
+  // as it consumes the ring, so an instantaneous comparison only measures how far apart the two
+  // clocks happen to be -- its "mismatches" were addresses we ourselves bound a few draws
+  // earlier, echoed back. Logging each stream at its own draw and aligning the s0 sequences
+  // offline is the valid form: a real divergence is an address present in one stream and absent
+  // or different at the aligned position in the other.
+  if (REXCVAR_GET(nx1_dbg_fetch_seq)) {
+    static std::atomic<uint64_t> d9_fetch_seq{0};
+    const TextureFetchConstant f0 = DecodeTextureFetchConstant(d.texture_fetch(0));
+    const TextureFetchConstant f1 = DecodeTextureFetchConstant(d.texture_fetch(1));
+    REXGPU_WARN("nx1_d3d9: D9FETCH #{} ps={:08X} s0={:08X} s1={:08X}",
+                d9_fetch_seq.fetch_add(1, std::memory_order_relaxed), d.ps_object,
+                f0.base_address, f1.base_address);
   }
 
   for (uint32_t sampler = 0; sampler < 16; ++sampler) {
