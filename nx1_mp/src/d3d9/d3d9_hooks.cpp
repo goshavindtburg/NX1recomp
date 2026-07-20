@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <string>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -46,6 +47,7 @@ REX_EXTERN(__imp__rex_D3DDevice_DrawIndexedVerticesUP);
 REX_EXTERN(__imp__rex_D3DDevice_DrawVerticesUP);
 REX_EXTERN(__imp__rex_D3DDevice_ClearF);
 REX_EXTERN(__imp__rex_D3DDevice_Resolve);
+REX_EXTERN(__imp__rex_D3DDevice_ResolveEx);
 REX_EXTERN(__imp__rex_D3DDevice_SetRenderTarget);
 REX_EXTERN(__imp__rex_D3DDevice_SetDepthStencilSurface);
 REX_EXTERN(__imp__rex_D3DDevice_Swap);
@@ -301,6 +303,32 @@ REX_HOOK_RAW(rex_D3DDevice_Resolve) {
   if (EnsureRenderer()) {
     nx1::d3d9::Renderer::Get().Resolve(base, dest_texture, src_rect, dest_point, flags,
                                        clear_color, clear_z, clear_stencil);
+  }
+#endif
+}
+
+// THE SECOND RESOLVE ENTRY POINT, never hooked until now. The guest has both Resolve and
+// ResolveEx; we only ever saw the former, so our resolve map held 8 destinations while the
+// reference's PM4 census showed 13. The five we missed (1DFA0000, 1E0A0000, 1E6A0000,
+// 1E6A2000, 1E6C0000 -- up to 4 MB each) are render targets the game later SAMPLES AS
+// TEXTURES. Never having them, we decoded stale guest memory and got structured garbage --
+// and readback_resolve="full" appeared to "fix textures" only because it made the reference
+// write those render targets into CPU RAM for us to decode.
+//
+// Registration only: flags are passed as 0 so this cannot alter EDRAM clear behaviour, which
+// the primary Resolve path already handles. The argument positions match Resolve's (r3 device,
+// r4 flags, r5 source rect, r6 destination texture, r7 destination point) -- confirmed against
+// the recompiled prologue, and confirmable at runtime because the destinations it registers
+// should be exactly the five addresses above (watch RESOLVEDST).
+REX_HOOK_RAW(rex_D3DDevice_ResolveEx) {
+#ifdef _WIN32
+  const uint32_t dest_texture = ctx.r6.u32, src_rect = ctx.r5.u32, dest_point = ctx.r7.u32;
+#endif
+  __imp__rex_D3DDevice_ResolveEx(ctx, base);
+#ifdef _WIN32
+  if (EnsureRenderer()) {
+    nx1::d3d9::Renderer::Get().Resolve(base, dest_texture, src_rect, dest_point, /*flags=*/0,
+                                       /*clear_color=*/0, /*clear_z=*/0.0f, /*clear_stencil=*/0);
   }
 #endif
 }
@@ -627,6 +655,44 @@ namespace {
 /// these are physical-mirror EAs, and bulk `base +` arithmetic across them has burned this
 /// project three times. Idempotent, so a delayed copy that is later flushed through the
 /// immediate path simply copies the same bytes twice.
+/// Is this DMA's SOURCE actually valid in CPU-visible RAM? The mirror assumes it is -- it
+/// copies src->dst so the CPU sees what the GPU blit produced. But if the source is itself a
+/// buffer the GPU filled (a previous memexport destination), CPU RAM holds stale bytes there
+/// too and the mirror faithfully propagates garbage. That would explain why mirroring both DMA
+/// paths, at verified sizes, changed nothing. Sampled, not exhaustive: zero-fraction and
+/// distinct-byte count are enough to tell "never written" and "plausible texture data" apart.
+void ClassifyDmaSource(const uint8_t* base, uint32_t src, uint32_t bytes) {
+  static std::atomic<uint64_t> total{0}, empty{0}, lowvar{0};
+  const uint8_t* s = nx1::d3d9::GuestPointer(base, src);
+  if (!s) {
+    return;
+  }
+  const uint32_t span = std::min(bytes, 4096u);
+  uint32_t zeros = 0, distinct = 0;
+  bool seen[256] = {};
+  for (uint32_t i = 0; i < span; i += 3) {
+    if (!s[i]) ++zeros;
+    if (!seen[s[i]]) { seen[s[i]] = true; ++distinct; }
+  }
+  const uint32_t sampled = (span + 2) / 3;
+  const uint64_t n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (sampled && zeros * 100 / sampled >= 95) {
+    empty.fetch_add(1, std::memory_order_relaxed);
+  } else if (distinct < 32) {
+    lowvar.fetch_add(1, std::memory_order_relaxed);
+  }
+  // WHERE do these copies land? Every destination sampled so far was physical 0x0B-0x0D,
+  // while the textures that visibly speckle live at 0x10-0x17. If the DMA path never touches
+  // that region, then mirroring it -- however correctly -- could never have fixed them, and
+  // hours of work were aimed at the wrong memory. A 16 MB-region histogram settles it.
+  if ((n % 2000) == 0) {
+    REXGPU_WARN("nx1_d3d9: DMASRC {} copies | {} from EMPTY source, {} from low-variance "
+                "source -- a high share means the mirror is propagating garbage, i.e. the data "
+                "never reaches CPU RAM at all",
+                n, empty.load(), lowvar.load());
+  }
+}
+
 void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // OUR-RENDERER ONLY. In pure Xenia mode the GPU-side buffer is authoritative for DMA
   // results; a CPU write here fires Xenia's watches and replaces the GPU's (possibly
@@ -639,6 +705,24 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   if (bytes < 32 || bytes > (16u << 20) || !dst || !src) {
     return;
   }
+  ClassifyDmaSource(base, src, bytes);
+  {
+    // Destination region histogram, keyed by physical high byte.
+    static std::atomic<uint32_t> hist[256];
+    static std::atomic<uint64_t> n{0};
+    const uint32_t region = (dst & 0x1FFFFFFF) >> 24;
+    hist[region].fetch_add(1, std::memory_order_relaxed);
+    if ((n.fetch_add(1, std::memory_order_relaxed) % 20000) == 19999) {
+      std::string out;
+      for (uint32_t i = 0; i < 32; ++i) {
+        const uint32_t c = hist[i].load(std::memory_order_relaxed);
+        if (c) {
+          out += fmt::format("{:02X}x:{} ", i, c);
+        }
+      }
+      REXGPU_WARN("nx1_d3d9: DMADST regions {}", out);
+    }
+  }
   for (uint32_t off = 0; off < bytes; off += 4096) {
     const uint32_t chunk = std::min(4096u, bytes - off);
     uint8_t* d = const_cast<uint8_t*>(nx1::d3d9::GuestPointer(base, dst + off));
@@ -648,6 +732,10 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
     }
     std::memcpy(d, s, chunk);
   }
+  // The write above bypassed guest page protection, so nothing was invalidated by it. Tell the
+  // tracker explicitly, or every texture cached over this range keeps serving its pre-copy
+  // contents -- landing the bytes is only half the job.
+  nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange(dst & 0x1FFFFFFF, bytes);
 }
 
 }  // namespace

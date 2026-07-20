@@ -58,6 +58,11 @@ class Overlay {
   /// drew it. Replaces bisecting material indices by hand, which is how the glass shader was
   /// found and cost most of a day.
   void DrawPicker();
+  /// Live in-game log viewer (F2). The SDK already installs a LogCaptureSink for its own
+  /// console overlay, but that overlay draws into the D3D12 swapchain our PresentEx covers,
+  /// so it is never visible when the native renderer owns the output. This one runs in our
+  /// ImGui context, on top of the frame we actually present.
+  void DrawLog();
   /// The cvar/TOML editor, rebuilt against our own ImGui context. The SDK's SettingsDialog
   /// cannot be reused directly: it is an ImGuiDialog, and ImGuiDialog::GetIO switches the
   /// current ImGui context to the drawer's, which would fight ours mid-frame. Only the
@@ -71,6 +76,7 @@ class Overlay {
   bool show_diagnostics_ = true;
 
   bool picker_visible_ = false;
+  bool log_visible_ = false;
   /// The game hides and re-centres the cursor every frame, so releasing it once is not enough --
   /// it has to be re-asserted while the picker is open, and restored exactly once on close.
   bool cursor_released_ = false;

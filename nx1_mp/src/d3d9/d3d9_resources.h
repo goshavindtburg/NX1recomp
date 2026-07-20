@@ -224,6 +224,15 @@ class ResourceTracker {
   /// CPU-side bakes read real data instead of the pool's leftovers.
   /// The engine's not-resident placeholder buffer (ImageCache_GetDefaultPixels). Returns true
   /// the first time it is learned, so the hook can announce it once. See PlaceholderBinds.
+  /// Invalidate everything cached over [phys, phys+bytes): drop the mirror pages so they
+  /// re-copy, and dirty any texture entry whose watched range overlaps so it re-decodes.
+  ///
+  /// REQUIRED after any host-side write into guest memory (the ImageCache DMA mirror). Such a
+  /// write goes straight to host memory through GuestPointer -- it never touches guest page
+  /// protection, so the write-watch does NOT fire and cached textures would keep serving their
+  /// pre-write contents forever. Landing the right bytes is only half the job.
+  void InvalidateGuestRange(uint32_t phys, uint32_t bytes);
+
   static bool SetDefaultPixelsAddress(uint32_t addr);
   static uint32_t DefaultPixelsAddress();
 
@@ -382,6 +391,13 @@ class ResourceTracker {
   static constexpr uint32_t kResolveFlatMax = 32;
   uint32_t resolve_flat_addr_[kResolveFlatMax] = {};
   IDirect3DTexture9* resolve_flat_tex_[kResolveFlatMax] = {};
+  /// Dimensions of each flat entry. The serve path matched on ADDRESS ALONE, which is unsound:
+  /// resolve entries are never invalidated by guest writes and never aged out, so once an
+  /// address has been a resolve destination every future bind of it was served the stale render
+  /// target -- forever, without ever decoding guest memory. When the streaming pool recycles
+  /// that address into a texture slot, the surface shows the last rendered frame fragment.
+  uint32_t resolve_flat_w_[kResolveFlatMax] = {};
+  uint32_t resolve_flat_h_[kResolveFlatMax] = {};
   uint32_t resolve_flat_count_ = 0;
   bool resolve_flat_valid_ = false;
 
@@ -589,6 +605,11 @@ class ResourceTracker {
   uint64_t mips_auto_ = 0;             ///< chain left to the driver (uncompressed)
   uint64_t mips_skip_nochain_ = 0;     ///< guest declares mip_max_level == 0
   uint64_t mips_skip_unsupported_ = 0; ///< no autogen and not block-compressed
+  uint64_t dma_invalidations_ = 0;     ///< textures re-decoded after a mirrored DMA
+  uint64_t resolve_served_ = 0;        ///< binds served from the resolve map
+  uint64_t resolve_rejected_ = 0;      ///< resolve hits refused on a size mismatch
+  uint64_t repeating_source_binds_ = 0;    ///< source repeats at a short period
+  uint64_t highentropy_source_binds_ = 0;  ///< source saturates the byte histogram
   uint64_t placeholder_binds_ = 0;  ///< binds of the engine's not-resident buffer
   uint64_t mips_guest_ = 0;            ///< chain decoded from the guest's mip_address
   uint64_t mips_basemap_ = 0;          ///< kBaseMap: level 0 only, no chain wanted at all

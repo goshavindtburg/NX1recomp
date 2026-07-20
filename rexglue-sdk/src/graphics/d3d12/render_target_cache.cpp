@@ -1360,6 +1360,25 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          // NX1: the definitive census of what THIS backend resolves. The native D3D9 renderer
+          // only sees resolves issued through D3DDevice_Resolve, and logs exactly 8 (display,
+          // scene, bloom, depth, shadow). If this list is longer -- particularly if it contains
+          // texture-pool addresses -- then the game resolves through a path the native renderer
+          // never observes (prebuilt command buffers replay PM4 directly), which is why only
+          // readback_resolve="full" ever produced a clean picture: the reference is generating
+          // pixels nobody else does.
+          {
+            static std::mutex nx1_rd_mutex;
+            static std::vector<uint32_t> nx1_rd_seen;
+            std::lock_guard<std::mutex> lock(nx1_rd_mutex);
+            const uint32_t nx1_dest = resolve_info.copy_dest_extent_start;
+            if (nx1_rd_seen.size() < 64 &&
+                std::find(nx1_rd_seen.begin(), nx1_rd_seen.end(), nx1_dest) == nx1_rd_seen.end()) {
+              nx1_rd_seen.push_back(nx1_dest);
+              REXGPU_WARN("nx1_d3d9: REFRESOLVE {:08X}+{:X} (#{} distinct seen by the reference)",
+                          nx1_dest, resolve_info.copy_dest_extent_length, nx1_rd_seen.size());
+            }
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;

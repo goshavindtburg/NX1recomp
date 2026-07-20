@@ -7,7 +7,9 @@
 #ifdef _WIN32
 
 #include <rex/cvar.h>
+#include <rex/logging/api.h>
 #include <rex/logging/macros.h>
+#include <rex/logging/sink.h>
 
 #include <algorithm>
 #include <cctype>
@@ -63,6 +65,7 @@ namespace {
 constexpr int kToggleKey = VK_F4;
 // F3 matches the ReXGlue D3D12 side, where F3 is already the debug key.
 constexpr int kPickerKey = VK_F3;
+constexpr int kLogKey = VK_F2;
 }  // namespace
 
 Overlay& Overlay::Get() {
@@ -159,6 +162,10 @@ LRESULT CALLBACK Overlay::WndProcThunk(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     self.picker_visible_ = !self.picker_visible_;
     return 0;
   }
+  if (msg == WM_KEYDOWN && int(wparam) == kLogKey) {
+    self.log_visible_ = !self.log_visible_;
+    return 0;
+  }
 
   // While the picker is open the game must not see the mouse AT ALL. It re-hides the cursor and
   // re-centres it for mouselook in response to these messages, so merely calling ShowCursor
@@ -193,7 +200,7 @@ LRESULT CALLBACK Overlay::WndProcThunk(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     }
   }
 
-  if (self.initialized_ && (self.visible_ || self.picker_visible_)) {
+  if (self.initialized_ && (self.visible_ || self.picker_visible_ || self.log_visible_)) {
     ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
     // Swallow only what ImGui actually wants. Anything else still reaches the game, so the
     // overlay being open does not freeze the rest of the input.
@@ -787,11 +794,77 @@ void Overlay::DrawPanels() {
   ImGui::End();
 }
 
+
+void Overlay::DrawLog() {
+  // Our own sink, registered once. Cheap: LogCaptureSink is a fixed 2048-entry ring, and we
+  // only re-copy when its generation counter moves, so a quiet frame costs one atomic read.
+  static std::shared_ptr<rex::LogCaptureSink> sink = [] {
+    auto s = std::make_shared<rex::LogCaptureSink>();
+    rex::AddSink(s);
+    return s;
+  }();
+  static std::vector<rex::LogEntry> entries;
+  static uint64_t last_generation = 0;
+  static char filter[64] = {};
+  static bool autoscroll = true;
+  static bool nx1_only = true;
+
+  ImGui::SetNextWindowSize(ImVec2(900, 420), ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("Log (F2)", &log_visible_)) {
+    ImGui::End();
+    return;
+  }
+  ImGui::SetNextItemWidth(260.0f);
+  ImGui::InputTextWithHint("##logfilter", "filter (substring)", filter, sizeof(filter));
+  ImGui::SameLine();
+  ImGui::Checkbox("nx1 only", &nx1_only);
+  ImGui::SameLine();
+  ImGui::Checkbox("autoscroll", &autoscroll);
+  ImGui::SameLine();
+  if (ImGui::Button("clear filter")) {
+    filter[0] = 0;
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("%zu entries", entries.size());
+  ImGui::Separator();
+
+  if (const uint64_t gen = sink->generation(); gen != last_generation) {
+    last_generation = gen;
+    sink->CopyEntries(entries);
+  }
+
+  ImGui::BeginChild("##logscroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+  for (const auto& e : entries) {
+    if (nx1_only && e.text.find("nx1_d3d9") == std::string::npos) {
+      continue;
+    }
+    if (filter[0] && e.text.find(filter) == std::string::npos) {
+      continue;
+    }
+    // Warnings are how every probe in this renderer reports; colour them so a result stands
+    // out from the per-frame chatter around it.
+    ImVec4 col(0.80f, 0.80f, 0.80f, 1.0f);
+    if (e.level >= spdlog::level::err) {
+      col = ImVec4(1.0f, 0.45f, 0.45f, 1.0f);
+    } else if (e.level == spdlog::level::warn) {
+      col = ImVec4(1.0f, 0.85f, 0.45f, 1.0f);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextUnformatted(e.text.c_str());
+    ImGui::PopStyleColor();
+  }
+  if (autoscroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+    ImGui::SetScrollHereY(1.0f);
+  }
+  ImGui::EndChild();
+  ImGui::End();
+}
+
 void Overlay::Render() {
   // The picker is independent of the F4 settings panel: either one being open is reason to run
   // a frame. DrawPicker also owns releasing/restoring the cursor, so it must still be called on
   // the frame the picker is turned OFF -- hence it runs whenever the cursor is still released.
-  const bool want_frame = visible_ || picker_visible_ || cursor_released_;
+  const bool want_frame = visible_ || picker_visible_ || log_visible_ || cursor_released_;
   if (!initialized_ || !want_frame || !device_objects_valid_) {
     return;
   }
@@ -802,6 +875,9 @@ void Overlay::Render() {
     DrawPanels();
   }
   DrawPicker();
+  if (log_visible_) {
+    DrawLog();
+  }
   ImGui::EndFrame();
   ImGui::Render();
   // imgui_impl_dx9 brackets this in a D3D9 state block, so nothing it sets leaks into the

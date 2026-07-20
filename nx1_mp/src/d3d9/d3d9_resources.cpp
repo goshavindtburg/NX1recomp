@@ -194,6 +194,16 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_fast_detile, true, "GPU",
 /// what lands on disk is exactly what DecodeBcImage produced and what BoxFilterHalf produced
 /// -- no inference. Level 0 garbled means our BC decoder; level 0 clean but lower levels
 /// garbled means the filter.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_resolve_size_check, true, "GPU",
+                    "Require a resolve-map hit to match the bind's dimensions before serving "
+                    "the render target. Off = legacy address-only matching, which serves stale "
+                    "targets forever for addresses the streaming pool has since recycled");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_classify, 0, "GPU",
+                      "Debug: log the next N textures whose SOURCE bytes classify as "
+                      "placeholder-like (short repeat period) or garbage-like (saturated byte "
+                      "histogram), with the evidence for the call");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipdump, 0, "GPU",
                       "Debug: dump decoded mip levels for the next N BC textures built");
 
@@ -2150,6 +2160,14 @@ void ResourceTracker::LogCacheStats() {
       frame_, textures, vbs, ibs, resolves, tex_uploads_, tex_rebuilds_, tex_evicted_,
       tex_failures_, unsupported_texture_formats_,
       device_->GetAvailableTextureMem() / (1024 * 1024));
+  REXGPU_INFO("nx1_d3d9: DMAINVALIDATE {} cached textures re-decoded after a mirrored GPU copy "
+              "(zero here means the mirror was landing bytes nobody ever re-read)",
+              dma_invalidations_);
+  REXGPU_INFO("nx1_d3d9: RESOLVEMAP served={} rejected_stale={} (entries={})", resolve_served_,
+              resolve_rejected_, resolves_ ? static_cast<ResolveMap*>(resolves_)->size() : 0);
+  REXGPU_INFO("nx1_d3d9: SRCCLASS repeating(placeholder-like)={} high-entropy(garbage-like)={} "
+              "-- two DIFFERENT failures; a fix that moves only one is not the whole bug",
+              repeating_source_binds_, highentropy_source_binds_);
   REXGPU_INFO("nx1_d3d9: PLACEHOLDER binds={} (textures bound at the engine's not-resident "
               "buffer {:08X}); a config that streams properly drives this toward zero",
               placeholder_binds_, DefaultPixelsAddress());
@@ -2251,6 +2269,8 @@ void ResourceTracker::RebuildResolveFlat() {
     }
     resolve_flat_addr_[resolve_flat_count_] = uint32_t(key);
     resolve_flat_tex_[resolve_flat_count_] = entry.tex;
+    resolve_flat_w_[resolve_flat_count_] = entry.width;
+    resolve_flat_h_[resolve_flat_count_] = entry.height;
     ++resolve_flat_count_;
   }
   resolve_flat_valid_ = true;
@@ -2258,6 +2278,39 @@ void ResourceTracker::RebuildResolveFlat() {
 
 const uint8_t* ResourceTracker::PhysicalPointer(uint32_t phys_addr) const {
   return TranslatePhysical(phys_addr);
+}
+
+void ResourceTracker::InvalidateGuestRange(uint32_t phys, uint32_t bytes) {
+  if (!bytes) {
+    return;
+  }
+  const uint32_t a0 = phys;
+  const uint32_t a1 = phys + bytes;
+  // Mirror pages first, so a re-decode re-reads from live memory rather than the snapshot.
+  if (mirror_ && !mirror_valid_.empty()) {
+    const uint32_t p0 = a0 >> 12;
+    const uint32_t p1 = (a1 - 1) >> 12;
+    for (uint32_t p = p0; p <= p1 && (p >> 6) < mirror_valid_.size(); ++p) {
+      mirror_valid_[p >> 6] &= ~(uint64_t(1) << (p & 63));
+      if ((p >> 6) < watch_armed_.size()) {
+        watch_armed_[p >> 6] &= ~(uint64_t(1) << (p & 63));
+      }
+    }
+  }
+  if (auto* textures = static_cast<TextureMap*>(textures_)) {
+    for (auto [key, entry] : *textures) {
+      if (!entry.watch_size) {
+        continue;
+      }
+      const uint32_t e0 = entry.watch_addr;
+      const uint32_t e1 = entry.watch_addr + entry.watch_size;
+      if (a0 < e1 && e0 < a1) {
+        entry.dirty = true;
+        entry.retry_frame = 0;
+        ++dma_invalidations_;
+      }
+    }
+  }
 }
 
 void ResourceTracker::MirrorInvalidateAll() {
@@ -2927,13 +2980,37 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     // Linear scan of at most a few entries, all in cache, instead of hashing into the map.
     const uint32_t phys = PhysicalAddress(t.base_address);
     for (uint32_t i = 0; i < resolve_flat_count_; ++i) {
-      if (resolve_flat_addr_[i] == phys) {
-        if (dbg_track && t.base_address == dbg_track) {
-          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={}", t.base_address,
-                      frame_);
-        }
-        return resolve_flat_tex_[i];
+      if (resolve_flat_addr_[i] != phys) {
+        continue;
       }
+      // The address matching is NOT sufficient on its own. Resolve entries are never
+      // invalidated by a guest write and never aged out, so a recycled address keeps being
+      // served its stale render target instead of the texture that now lives there. Require
+      // the bind to actually describe that target: a 128x128 texture asking for memory that
+      // once held a 1024x600 scene resolve is the pool reusing the address, not a
+      // render-to-texture read.
+      const bool size_ok =
+          resolve_flat_w_[i] == t.width && resolve_flat_h_[i] == t.height;
+      if (!size_ok && REXCVAR_GET(nx1_d3d9_resolve_size_check)) {
+        ++resolve_rejected_;
+        static std::mutex m;
+        static std::vector<uint32_t> seen;
+        std::lock_guard<std::mutex> lk(m);
+        if (std::find(seen.begin(), seen.end(), phys) == seen.end() && seen.size() < 32) {
+          seen.push_back(phys);
+          REXGPU_WARN("nx1_d3d9: RESOLVESTALE {:08X} bind {}x{} fmt={} but resolve target is "
+                      "{}x{} -- decoding guest memory instead of serving the stale target",
+                      t.base_address, t.width, t.height, t.format, resolve_flat_w_[i],
+                      resolve_flat_h_[i]);
+        }
+        break;  // fall through to the normal decode path
+      }
+      ++resolve_served_;
+      if (dbg_track && t.base_address == dbg_track) {
+        REXGPU_INFO("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={}", t.base_address,
+                    frame_);
+      }
+      return resolve_flat_tex_[i];
     }
   } else if (resolves_) {
     auto* rmap = static_cast<ResolveMap*>(resolves_);
@@ -3481,6 +3558,53 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           SwizzleRow32(dst + size_t(by) * dst_row_bytes, extent.block_width, swz);
         }
       }
+    }
+  }
+
+  // CLASSIFY THE FAILURE, don't eyeball it. The capture shows TWO different looks -- a magenta
+  // checker rim and rainbow noise -- and treating them as one bug is why no single-cause theory
+  // has ever explained all the symptoms. They separate on a property that needs no engine
+  // cooperation: a PLACEHOLDER is a small tile repeated across the surface, so its rows repeat
+  // at a short period; unstreamed GARBAGE is high-entropy and repeats at no period at all. A
+  // real texture is neither -- it varies, but smoothly.
+  //
+  // Measured on the guest bytes (pre-decode), so it is independent of every decode path.
+  if (src && dst && guest_bytes >= 4096) {
+    const uint8_t* g = src;
+    const size_t span = std::min<size_t>(guest_bytes, 16384);
+    // Row-period test: does the source repeat at 64/128/256/512 bytes?
+    uint32_t best_period = 0;
+    for (uint32_t period : {64u, 128u, 256u, 512u, 1024u}) {
+      if (span < size_t(period) * 4) continue;
+      size_t same = 0, total = 0;
+      for (size_t i = period; i < span; i += 7) {  // sparse sample
+        same += (g[i] == g[i - period]) ? 1 : 0;
+        ++total;
+      }
+      if (total && (same * 100 / total) >= 92) {
+        best_period = period;
+        break;
+      }
+    }
+    // Entropy proxy: distinct byte values in a sample. Garbage saturates; a placeholder tile
+    // and a smooth texture both use few.
+    bool seen[256] = {};
+    uint32_t distinct = 0;
+    for (size_t i = 0; i < span; i += 3) {
+      if (!seen[g[i]]) { seen[g[i]] = true; ++distinct; }
+    }
+    if (best_period) {
+      ++repeating_source_binds_;
+    } else if (distinct >= 250) {
+      ++highentropy_source_binds_;
+    }
+    if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_classify); budget &&
+        (best_period || distinct >= 250)) {
+      REXCVAR_SET(nx1_d3d9_dbg_classify, budget - 1);
+      REXGPU_WARN("nx1_d3d9: SRCCLASS {:08X} {}x{} fmt={} -> {} (period={} distinct={}/256)",
+                  t.base_address, t.width, height, t.format,
+                  best_period ? "REPEATING (placeholder-like)" : "HIGH-ENTROPY (garbage-like)",
+                  best_period, distinct);
     }
   }
 
