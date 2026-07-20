@@ -4690,6 +4690,39 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
 
   const uint64_t readback_key =
       MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
+
+  // MEASURED LEAK. This map is reclaimed ONLY under `if (is_opening_frame)` in BeginSubmission.
+  // With the native D3D9 renderer presenting, the reference backend's frame does not cycle, so
+  // that branch stops being taken -- and frame_current_ stops advancing, which also pins
+  // EvictOldReadbackBuffers' age floor at 0 and disables the age test even when it does run.
+  // Meanwhile IssueDraw keeps minting entries, and the key embeds the export base address, which
+  // the streaming pool recycles constantly, so nearly every memexporting draw allocates a fresh
+  // pair of COMMITTED, MAPPED readback buffers that nothing ever frees.
+  //
+  // Measured, A/B on one build: readback_memexport on -> private bytes climbed ~100 MB/s to
+  // 5.5 GB and kept going; off -> flat at 1.6 GB. Every pool the D3D9 tracker owns stayed under
+  // 400 MiB throughout, which is what ruled out the renderer side and pointed here.
+  //
+  // Bound it at the allocation site so reclamation no longer depends on the frame lifecycle of a
+  // backend that is not driving presentation. Await first: eviction unmaps and releases buffers
+  // the GPU may still be copying into, a guarantee the frame-open caller got for free. Evict
+  // BEFORE taking the map reference below -- evicting after would dangle it.
+  if (memexport_readback_buffers_.size() > kMaxReadbackBuffers) {
+    if (AwaitAllQueueOperationsCompletion()) {
+      EvictOldReadbackBuffers(memexport_readback_buffers_);
+    }
+  }
+  {
+    // Confirms the mechanism rather than assuming it: a frame number that never moves is the
+    // reason the frame-open reclaim stopped happening.
+    static uint64_t nx1_memexport_allocs = 0;
+    if ((++nx1_memexport_allocs % 512) == 0) {
+      REXGPU_INFO("nx1: MEMEXPORTMAP {} entries, {} allocations, frame_current={} "
+                  "(a frame that never advances is why the frame-open eviction stopped)",
+                  memexport_readback_buffers_.size(), nx1_memexport_allocs, frame_current_);
+    }
+  }
+
   ReadbackBuffer& readback = memexport_readback_buffers_[readback_key];
   readback.last_used_frame = frame_current_;
 

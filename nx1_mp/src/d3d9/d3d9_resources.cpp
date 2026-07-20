@@ -2203,15 +2203,44 @@ void ResourceTracker::LogCacheStats() {
     // itself by index reach (needed_vertices == 0), and the size is grow-only per entry, so
     // one unbounded draw pins an entry at pool size for the rest of the session.
     uint64_t tex_bytes = 0, vb_bytes = 0, vb_max = 0;
+    // COUNTS, not only bytes. A 100 MB/s runaway was reported while this line showed a 1 MiB
+    // texture cache against 4 GB of private bytes -- which is either a leak somewhere else
+    // entirely, or host_bytes under-reporting what the entries actually hold (it is set from the
+    // decode, so any path that grows a texture afterwards -- driver-generated mip chains, most
+    // obviously -- is invisible here). A count beside the bytes separates those two cases in one
+    // run instead of by inspection: many entries + few bytes means this number is lying.
+    size_t tex_n = 0, vb_n = 0, rt_n = 0, rv_n = 0;
+    uint64_t rt_bytes = 0, rv_bytes = 0;
     if (auto* tm = static_cast<TextureMap*>(textures_)) {
+      tex_n = tm->size();
       for (auto [k, e] : *tm) tex_bytes += e.host_bytes;
     }
     if (auto* vm = static_cast<VertexBufferMap*>(vertex_buffers_)) {
+      vb_n = vm->size();
       for (auto [k, e] : *vm) {
         vb_bytes += e.bytes;
         vb_max = std::max<uint64_t>(vb_max, e.bytes);
       }
     }
+    // The two pools this census never covered. Both hold full-size D3DPOOL_DEFAULT surfaces and
+    // neither has any eviction, so "it cannot be these, they are small" needed checking rather
+    // than assuming -- resolves_ measured 8 entries, render_targets_ was never measured at all.
+    if (auto* rm = static_cast<TargetMap*>(render_targets_)) {
+      rt_n = rm->size();
+      for (const auto& [k, t] : *rm) {
+        if (t.tex) rt_bytes += uint64_t(t.width) * t.height * 4;
+      }
+    }
+    if (auto* rvm = static_cast<ResolveMap*>(resolves_)) {
+      rv_n = rvm->size();
+      for (auto [k, e] : *rvm) {
+        if (e.tex && e.owned) rv_bytes += uint64_t(e.width) * e.height * 4;
+      }
+    }
+    REXGPU_INFO("nx1_d3d9: MEMPOOLS textures={} ({} MiB) vbs={} ({} MiB) render_targets={} "
+                "({} MiB) resolves={} ({} MiB)",
+                tex_n, tex_bytes / (1024 * 1024), vb_n, vb_bytes / (1024 * 1024), rt_n,
+                rt_bytes / (1024 * 1024), rv_n, rv_bytes / (1024 * 1024));
     REXGPU_INFO("nx1_d3d9: MEM private={} MiB working={} MiB | tex_cache={} MiB vb_cache={} MiB "
                 "(largest vb {} KiB) | writes_pending={} detile_scratch={} KiB mirror_valid={} MiB",
                 pmc.PrivateUsage / (1024 * 1024), pmc.WorkingSetSize / (1024 * 1024),
