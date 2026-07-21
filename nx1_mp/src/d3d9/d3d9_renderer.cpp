@@ -167,6 +167,15 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_opaque_ps, 0, "GPU",
                       "register probe: under the premultiplied blend a register whose .w is 0 "
                       "turns the draw additive and reads as white whatever its colour is");
 
+/// Aim a texture dump at ONE SURFACE rather than one material. Split across two uint32 cvars
+/// because surface_key is 64-bit (same pattern as dbg_blend_ps_hi/lo). Set by the picker's
+/// DUMP MIPS button; zero falls back to the material filter.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_surface_hi, 0, "GPU",
+                      "High 32 bits of the surface_key a texture dump is aimed at (0 = use the "
+                      "material filter instead)");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_surface_lo, 0, "GPU",
+                      "Low 32 bits of the surface_key a texture dump is aimed at");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_nomips, 0, "GPU",
                       "Debug: force MIPFILTER=NONE on every sampler, so only level 0 is ever "
                       "sampled. The confetti speckle is distance-dependent and level 0 is "
@@ -563,6 +572,7 @@ IDirect3DQuery9* Renderer::PickBegin(const RecordedDraw& d) {
   pe = {d.ps_object,
         d.vs_object,
         d.ps && d.ps->entry ? d.ps->entry->hash : 0ull,
+        d.surface_key,
         current_rt_surface_,
         d.depth.write_enabled,
         d.depth.test_enabled && d.depth.compare_function != 7,
@@ -691,8 +701,8 @@ void Renderer::Present() {
       ++hits;
       const PickEntry& e = pick_entries_[i];
       pick_results_.push_back(
-          {e.ps_object, e.vs_object, e.ps_hash, uint32_t(pixels), uint32_t(i), e.rt_surface, false,
-           e.depth_write, e.depth_test, {}, 0});
+          {e.ps_object, e.vs_object, e.surface_key, e.ps_hash, uint32_t(pixels), uint32_t(i),
+           e.rt_surface, false, e.depth_write, e.depth_test, {}, 0});
       auto& ph = pick_results_.back();
       ph.tex_count = e.tex_count;
       for (uint32_t k = 0; k < e.tex_count; ++k) ph.tex[k] = e.tex[k];
@@ -2726,7 +2736,18 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
   // log silently selects no texture at all, which reads exactly like "the texture is fine".
   // ps_object names the material and is stable for the life of the loaded fastfile.
   const uint32_t dump_ps = REXCVAR_GET(nx1_d3d9_dbg_blend_ps);
-  tracker.SetDumpDraw(dump_ps != 0, dump_ps != 0 && d.ps_object == dump_ps);
+  // SURFACE filter, narrower than the material one. ps_object is shared across most of the world,
+  // so "dump this material" captured a road's textures while aiming at a shed wall and the whole
+  // analysis was of the wrong surface. surface_key is (index buffer, start, count, base vertex) --
+  // stable per surface across LOD swaps -- so this dumps only the thing under the crosshair.
+  // When set it REPLACES the material filter; when zero the material filter behaves as before.
+  const uint64_t dump_surface = (uint64_t(REXCVAR_GET(nx1_d3d9_dbg_dump_surface_hi)) << 32) |
+                                REXCVAR_GET(nx1_d3d9_dbg_dump_surface_lo);
+  if (dump_surface) {
+    tracker.SetDumpDraw(true, d.surface_key == dump_surface);
+  } else {
+    tracker.SetDumpDraw(dump_ps != 0, dump_ps != 0 && d.ps_object == dump_ps);
+  }
 
   // Re-arm the KILLSAMPLER reporting when the selection changes, so the log always describes the
   // mask that is actually live rather than the first one set this session.

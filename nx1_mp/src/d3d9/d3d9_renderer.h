@@ -148,6 +148,11 @@ class Renderer {
   struct PickResult {
     uint32_t ps_object;
     uint32_t vs_object;
+    /// Stable identity of the SURFACE this draw belongs to -- (index buffer, draw range), the
+    /// same key prefer-largest uses to follow a surface across its LOD swaps. ps_object names the
+    /// SHADER, which most of the world shares, so a dump aimed at one wall also captures roads and
+    /// crates; this narrows a dump to the thing actually being looked at.
+    uint64_t surface_key;
     uint64_t ps_hash;
     uint32_t pixels;
     uint32_t draw_index;
@@ -395,6 +400,7 @@ class Renderer {
     uint32_t ps_object;
     uint32_t vs_object;
     uint64_t ps_hash;
+    uint64_t surface_key;  ///< see PickResult::surface_key
     uint32_t rt_surface;
     bool depth_write;
     bool depth_test;

@@ -50,6 +50,8 @@ REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_ox);
 REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_oy);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipdump);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_dump_surface_hi);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_dump_surface_lo);
 REXCVAR_DECLARE(bool, nx1_d3d9_dbg_texdump_force);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wparam,
@@ -625,6 +627,14 @@ void Overlay::DrawPicker() {
       // purpose: an address filter captured whatever the streaming pool had moved into that
       // address by dump time, which is how a 512x512 DXT1 surface came back as a 64x64 DXT5.
       if (ImGui::Button("DUMP MIPS")) {
+        // AIM AT THE SURFACE, NOT THE MATERIAL. dbg_blend_ps names the pixel SHADER, which most of
+        // the world shares -- a dump aimed at a shed wall came back holding a road's albedo, and an
+        // evening was spent analysing the wrong surface. surface_key is (index buffer, draw range),
+        // stable per surface across LOD swaps, so this captures only what is under the crosshair.
+        // dbg_blend_ps is still set: the hide/solo/highlight buttons key off it, and the texture
+        // dump now prefers the surface filter when one is set.
+        REXCVAR_SET(nx1_d3d9_dbg_dump_surface_hi, uint32_t(h.surface_key >> 32));
+        REXCVAR_SET(nx1_d3d9_dbg_dump_surface_lo, uint32_t(h.surface_key & 0xFFFFFFFFu));
         REXCVAR_SET(nx1_d3d9_dbg_blend_ps, h.ps_object);
         REXCVAR_SET(nx1_d3d9_dbg_mipdump, 6u);
         // texdump covers what mipdump CANNOT: the mip dump lives in the CPU block-compressed
@@ -635,7 +645,9 @@ void Overlay::DrawPicker() {
         REXCVAR_SET(nx1_d3d9_dbg_texdump_force, true);
       }
       if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Write texdump/mip_<addr>_L*.bmp for the textures this material binds, "
+        ImGui::SetTooltip("Write texdump/mip_<addr>_L*.bmp for the textures THIS SURFACE binds "
+                          "(keyed on the draw's index range, not on the shader -- shaders are "
+                          "shared, so a material-scoped dump captures unrelated geometry), "
                           "forcing a rebuild so a settled texture still dumps. Check the log for "
                           "'mip dump' lines -- they report the size and format actually captured.");
       }
