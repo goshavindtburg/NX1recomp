@@ -27,6 +27,40 @@ def tiled_offset_2d(x, y, pitch, bpb_log2):
             + (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F))
 
 
+def decode_dxt1_block(b):
+    """b = 8 bytes, little-endian order. Returns 4x4 RGBA uint8.
+
+    Added because this script was DXT5-only, while the specimens that actually
+    corrupt (0505C000, 11BF9000) are format 18 = DXT1 -- so the one tool that can
+    settle bytes-vs-decode could not be pointed at them.
+    """
+    c0 = b[0] | (b[1] << 8)
+    c1 = b[2] | (b[3] << 8)
+    cbits = int.from_bytes(b[4:8], "little")
+
+    def rgb(c):
+        r, g, bl = (c >> 11) & 0x1F, (c >> 5) & 0x3F, c & 0x1F
+        return ((r << 3) | (r >> 2), (g << 2) | (g >> 4), (bl << 3) | (bl >> 2))
+
+    e0, e1 = rgb(c0), rgb(c1)
+    if c0 > c1:
+        cols = [e0, e1,
+                tuple((2 * e0[i] + e1[i]) // 3 for i in range(3)),
+                tuple((e0[i] + 2 * e1[i]) // 3 for i in range(3))]
+        punch = False
+    else:
+        # 3-colour block: index 3 is transparent black.
+        cols = [e0, e1, tuple((e0[i] + e1[i]) // 2 for i in range(3)), (0, 0, 0)]
+        punch = True
+
+    out = np.zeros((4, 4, 4), dtype=np.uint8)
+    for i in range(16):
+        ci = (cbits >> (2 * i)) & 3
+        out[i // 4, i % 4, :3] = cols[ci]
+        out[i // 4, i % 4, 3] = 0 if (punch and ci == 3) else 255
+    return out
+
+
 def decode_dxt5_block(b):
     """b = 16 bytes, little-endian order. Returns 4x4 RGBA uint8."""
     a0, a1 = b[0], b[1]
@@ -67,16 +101,18 @@ def decode(path, w, h, pitch_blocks, bpb=16, swap16=True):
     nbx, nby = w // 4, h // 4
     img = np.zeros((h, w, 4), dtype=np.uint8)
     missing = 0
+    bpb_log2 = 3 if bpb == 8 else 4
+    blk_decode = decode_dxt1_block if bpb == 8 else decode_dxt5_block
     for by in range(nby):
         for bx in range(nbx):
-            off = tiled_offset_2d(bx, by, pitch_blocks, 4)
+            off = tiled_offset_2d(bx, by, pitch_blocks, bpb_log2)
             if off + bpb > len(raw):
                 missing += 1
                 continue
             blk = bytearray(raw[off:off + bpb])
             if swap16:
                 blk[0::2], blk[1::2] = blk[1::2], blk[0::2]
-            img[by * 4:by * 4 + 4, bx * 4:bx * 4 + 4] = decode_dxt5_block(blk)
+            img[by * 4:by * 4 + 4, bx * 4:bx * 4 + 4] = blk_decode(blk)
     return img, missing
 
 
@@ -91,23 +127,45 @@ def score(img):
 
 
 for fn in sorted(os.listdir(D)):
-    m = re.match(r"(bad\d+)_([0-9A-F]+)_(\d+)x(\d+)_f(\d+)\.bin$", fn)
+    # `full_` as well as `bad_`: the dump site was renamed to full_/raw_ (d3d9_resources.cpp:5916)
+    # and this regex was never updated, so the script silently matched nothing on newer captures.
+    m = re.match(r"(bad\d+|full)_([0-9A-F]+)_(\d+)x(\d+)_f(\d+)\.bin$", fn)
     if not m:
         continue
     tag, addr, w, h, fmt = m.group(1), m.group(2), int(m.group(3)), int(m.group(4)), m.group(5)
     txt = os.path.join(D, fn[:-4] + ".txt")
     pitch_blocks = w // 4
+    # ONLY the two formats this script actually implements. Decoding a DXN/ATI2 (49) or any
+    # uncompressed format as DXT5 produces a large mean|diff| that looks exactly like "our decode
+    # is broken" and is purely the script's own error -- it reported 59-146 on three such captures
+    # before this gate existed. An unsupported format must abstain, not guess.
+    if int(fmt) not in (18, 20):
+        print(f"{tag} {addr} {w}x{h} f{fmt}: format not implemented here (only DXT1/DXT5); skipped")
+        continue
+    bpb = 8 if int(fmt) == 18 else 16   # 18 = DXT1, 20 = DXT4/5
     if os.path.exists(txt):
         s = open(txt).read()
         mm = re.search(r"block_pitch_h=(\d+)", s)
         if mm:
             pitch_blocks = int(mm.group(1))
-    mine, missing = decode(os.path.join(D, fn), w, h, pitch_blocks)
-    ours = np.asarray(Image.open(os.path.join(D, fn[:-4] + ".bmp")).convert("RGB"))
-    ms, os_ = score(mine), score(ours[:, :, ::-1])
+    mine, missing = decode(os.path.join(D, fn), w, h, pitch_blocks, bpb)
+    # The renderer's own decode of a `full_` capture is written as `tex_<addr>_<w>x<h>_f<fmt>.bmp`,
+    # not `full_....bmp` -- the sibling name differs from the raw dump's.
+    bmp = os.path.join(D, fn[:-4] + ".bmp")
+    if not os.path.exists(bmp):
+        bmp = os.path.join(D, f"tex_{addr}_{w}x{h}_f{fmt}.bmp")
+    if not os.path.exists(bmp):
+        print(f"{tag} {addr}: no renderer BMP to compare against; skipped")
+        continue
+    ours = np.asarray(Image.open(bmp).convert("RGB"))
+    # NO [:, :, ::-1] HERE. convert("RGB") has already decoded the BMP's on-disk BGR into RGB,
+    # so flipping again yields BGR and manufactures a large mean|diff| between two IDENTICAL
+    # images -- the exact trap this directory's README documents, which was still live in this
+    # file. It briefly read as proof that the renderer's decode was broken; it was not.
+    ms, os_ = score(mine), score(ours)
     same = "n/a"
     if ours.shape[0] == h and ours.shape[1] == w:
-        d = np.abs(mine[:, :, :3].astype(int) - ours[:, :, ::-1].astype(int)).mean()
+        d = np.abs(mine[:, :, :3].astype(int) - ours.astype(int)).mean()
         same = f"{d:.1f}"
     print(f"{tag} {addr} {w}x{h} f{fmt}: independent={ms:5.1f}%  renderer={os_:5.1f}%  "
           f"mean|diff|={same}  oob_blocks={missing}")

@@ -746,6 +746,9 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dmacopy_mirror, 2, "GPU",
 // Owned by d3d9_resources.cpp. Needed here so the DMA path can report against the tracked
 // texture -- without it, "no DMA touched this address" was true only because nothing looked.
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_bytes);
+REXCVAR_DECLARE(bool, nx1_d3d9_dma_drop_clobbered);
+REXCVAR_DECLARE(bool, nx1_d3d9_dma_move_verbatim);
 
 REX_EXTERN(__imp__rex_ImageCache_DmaCopy);
 REX_EXTERN(__imp__rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z);
@@ -1155,6 +1158,10 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dma_retry_ms, 2000, "GPU",
 struct DmaRetry {
   uint32_t dst, src, bytes, seq;
   std::chrono::steady_clock::time_point at;
+  /// Did a LATER copy write into this deferred copy's SOURCE while it waited? See
+  /// DrainDmaRetries -- filled in under the lock, acted on outside it.
+  bool src_clobbered = false;
+  uint32_t clobber_page = 0, clobber_seq = 0;
 };
 std::mutex g_dma_retry_m;
 std::deque<DmaRetry> g_dma_retry;
@@ -1317,9 +1324,44 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_verbatim, false, "GPU",
 /// newer copy claims the same destination. Pass 0 from the retry drain itself (no re-deferral).
 uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes,
                              uint32_t seq) {
-  const bool verbatim = REXCVAR_GET(nx1_d3d9_dma_verbatim);
+  bool verbatim = REXCVAR_GET(nx1_d3d9_dma_verbatim);
+  // IS THIS A MOVE RATHER THAN A FILL?
+  //
+  // TRACK (run 054) caught the ImageCache compacting the pool: a 64 KB region walked DOWN by one
+  // page as a chain of overlapping 16 KB copies, every one with src == dst + 0x1000. For those the
+  // zero-page skip below is WRONG. Skipping is justified for a FILL from staging, where an empty
+  // source page carries nothing and copying it would blank live texels. In a MOVE the zeros are
+  // real content and the destination's old bytes are exactly what must be erased -- skip one page
+  // and that page keeps its PRE-SHIFT content while its neighbours shift, which is a page-granular
+  // displacement. The blit is measured as a verbatim byte move (11,918/14,500 copies byte-exact),
+  // so zeros are data.
+  //
+  // Deferral is equally wrong here: a compaction chain is only correct applied IN ORDER, and
+  // move N's source tail is move N+1's destination head (overlap exactly 4096 bytes). Deferring a
+  // page past the next move makes it read bytes already relocated.
+  const uint32_t dphys = dst & 0x1FFFFFFF, sphys = src & 0x1FFFFFFF;
+  const bool is_move = bytes && dphys < sphys + bytes && sphys < dphys + bytes &&
+                       REXCVAR_GET(nx1_d3d9_dma_move_verbatim);
+  if (is_move) {
+    verbatim = true;  // copy every page, defer nothing
+    static std::atomic<uint64_t> moves{0};
+    const uint64_t m = moves.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (m <= 8 || (m % 5000) == 0) {
+      REXGPU_WARN("nx1_d3d9: DMAMOVE #{} dst={:08X} src={:08X} {} bytes (src-dst {:+d}) -- source "
+                  "and destination OVERLAP, so this is a pool compaction: copying verbatim in "
+                  "memmove order, skipping and deferring disabled",
+                  m, dst, src, bytes, int64_t(sphys) - int64_t(dphys));
+    }
+  }
   uint32_t copied = 0;
-  for (uint32_t off = 0; off < bytes; off += 4096) {
+  // MEMMOVE ORDER. Overlapping ranges must be walked away from the overlap: descending when the
+  // destination is above the source, ascending otherwise. The observed compaction moves DOWN
+  // (dst < src), which ascending already handled, but the opposite direction would have silently
+  // eaten its own source a page at a time.
+  const bool descending = is_move && dphys > sphys;
+  const uint32_t npages = bytes ? (bytes + 4095) / 4096 : 0;
+  for (uint32_t k = 0; k < npages; ++k) {
+    const uint32_t off = (descending ? (npages - 1 - k) : k) * 4096;
     const uint32_t chunk = std::min(4096u, bytes - off);
     uint8_t* d = const_cast<uint8_t*>(nx1::d3d9::GuestPointer(base, dst + off));
     const uint8_t* s = nx1::d3d9::GuestPointer(base, src + off);
@@ -1390,6 +1432,8 @@ void DrainDmaRetries(uint8_t* base) {
   const auto now = std::chrono::steady_clock::now();
   const auto max_age = std::chrono::milliseconds(REXCVAR_GET(nx1_d3d9_dma_retry_ms));
   static std::atomic<uint64_t> filled{0}, abandoned{0}, stale{0}, latency_us{0}, drains{0};
+  /// Deferred copies whose SOURCE a later copy overwrote while they waited. See the check below.
+  static std::atomic<uint64_t> clobbered{0};
   // BOUNDED SCAN, not head-of-line. Taking only the front meant one entry whose source never
   // fills blocked every entry behind it for the whole expiry window, throttling the retry to
   // roughly one copy per expiry -- which is indistinguishable, in the log, from a retry that
@@ -1410,7 +1454,37 @@ void DrainDmaRetries(uint8_t* base) {
         continue;
       }
       if (SourceHasAnyData(base, e.src, e.bytes)) {
-        ready.push_back(e);
+        // *** THE SOURCE-STALENESS CHECK. ***
+        //
+        // The guard above asks "did a newer copy write my DESTINATION". Nothing has ever asked
+        // "did a newer copy write my SOURCE", and SourceHasAnyData only tests that the source is
+        // non-empty -- never that it still holds the ORIGINAL bytes.
+        //
+        // That gap is aimed straight at pool compaction. TRACK (run 054) caught the ImageCache
+        // moving a 64 KB region down by one page as a chain of OVERLAPPING 16 KB copies, each
+        // with src == dst + 0x1000: move N's source tail IS move N+1's destination head, and the
+        // overlap is exactly 4096 bytes. Defer a page of move N past move N+1 and it reads bytes
+        // move N+1 already rewrote, then lands them at move N's destination -- an error of
+        // EXACTLY ONE PAGE, which is the displacement proven by reproduction (15AFF000 held its
+        // asset 4096 bytes from where its descriptor pointed).
+        //
+        // g_dma_dest_seq already carries what is needed: it stamps every destination page with
+        // the seq of the last copy to target it. If any page of OUR SOURCE carries a seq higher
+        // than ours, a later copy wrote it while we waited.
+        DmaRetry r = e;
+        const uint32_t sp0 = (e.src & 0x1FFFFFFF) >> 12;
+        const uint32_t sp1 = ((e.src & 0x1FFFFFFF) + (e.bytes ? e.bytes - 1 : 0)) >> 12;
+        for (uint32_t p = sp0; p <= sp1 && p - sp0 < 4096; ++p) {
+          const auto sit = g_dma_dest_seq.find(p);
+          // Unsigned wrap-safe ordering: seq only ever increases, so "newer" is a plain >.
+          if (sit != g_dma_dest_seq.end() && sit->second > e.seq) {
+            r.src_clobbered = true;
+            r.clobber_page = p;
+            r.clobber_seq = sit->second;
+            break;
+          }
+        }
+        ready.push_back(r);
         g_dma_retry.erase(g_dma_retry.begin() + i);
         continue;
       }
@@ -1423,6 +1497,38 @@ void DrainDmaRetries(uint8_t* base) {
     }
   }
   for (const DmaRetry& e : ready) {
+    // INSTRUMENTATION ONLY for now -- the copy still goes through, so this run's behaviour is
+    // identical to the previous one and the count is a clean measurement rather than a change.
+    // A nonzero count is the proof that the compaction hazard is real and not merely possible;
+    // the fix (treat a MOVE as a verbatim ordered memmove, never skipped, never deferred) follows.
+    //
+    // ARMING: the total prints unconditionally, including zero. This investigation's repeated
+    // failure is a counter that cannot fire being read as a counter reporting nothing.
+    if (e.src_clobbered) {
+      const uint64_t c = clobbered.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (c <= 16 || (c % 500) == 0) {
+        REXGPU_WARN("nx1_d3d9: DMASRCCLOBBER #{} deferred copy dst={:08X} src={:08X} {} bytes "
+                    "seq={} -- a LATER copy (seq {}) wrote source page {:05X} ({:08X}) while this "
+                    "one waited{}",
+                    c, e.dst, e.src, e.bytes, e.seq, e.clobber_seq, e.clobber_page,
+                    e.clobber_page << 12,
+                    REXCVAR_GET(nx1_d3d9_dma_drop_clobbered)
+                        ? ", so it is DROPPED rather than planting relocated bytes"
+                        : ", and it is being applied anyway (drop disabled)");
+      }
+      // MEASURED AT 43%: 101 of 236 landed retries had their source overwritten while queued
+      // (run 055). The sampled cases are staging-source FILLS whose staging page was recycled and
+      // handed to another texture -- so replaying the copy plants ANOTHER TEXTURE'S PAGE into this
+      // one. That is the "foreign content" every provenance detector in this investigation kept
+      // reporting; it did come from guest memory, just from a page that no longer belonged to us.
+      //
+      // Dropping is strictly better than applying. Leaving the destination alone keeps whatever it
+      // had -- possibly stale, and the write-watch will re-dirty it when the real data lands --
+      // whereas applying writes bytes we KNOW belong to someone else. Never plant known-wrong data.
+      if (REXCVAR_GET(nx1_d3d9_dma_drop_clobbered)) {
+        continue;
+      }
+    }
     // seq=0: a retry never re-defers itself. If the source is still not ready it will be
     // re-examined on the next drain until it expires.
     if (CopyLiveSourcePages(base, e.dst, e.src, e.bytes, 0)) {
@@ -1441,6 +1547,19 @@ void DrainDmaRetries(uint8_t* base) {
       std::lock_guard<std::mutex> lk(g_dma_retry_m);
       queued = g_dma_retry.size();
     }
+    // SRCCLOBBER prints even at zero, on purpose: a silent counter is indistinguishable from a
+    // dead one.
+    //
+    // The wording here was WRONG in its first version and printed "63 of 13 landed retries",
+    // because it compared the clobber count against `filled` -- and with dropping enabled a
+    // clobbered retry is never applied, so it never reaches `filled` at all. The two are disjoint
+    // outcomes, not a subset. Report them as disjoint.
+    REXGPU_WARN("nx1_d3d9: DMARETRY SRCCLOBBER {} retries had their SOURCE overwritten while "
+                "queued and were {} ({} other retries applied normally). Nonzero means a later "
+                "copy recycled the staging page underneath a deferred copy",
+                clobbered.load(),
+                REXCVAR_GET(nx1_d3d9_dma_drop_clobbered) ? "DROPPED" : "applied anyway",
+                filled.load());
     REXGPU_WARN("nx1_d3d9: DMARETRY {} deferred copies LANDED (mean {} us late), {} abandoned "
                 "still-empty, {} dropped as stale, {} still queued. Landed>0 means the source "
                 "was simply NOT YET FILLED at call time and we now recover it",
@@ -1459,10 +1578,31 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track && bytes) {
     const uint32_t tphys = track & 0x1FFFFFFF;
     const uint32_t dphys = dst & 0x1FFFFFFF;
-    if (tphys >= dphys && tphys < dphys + bytes) {
-      REXGPU_WARN("nx1_d3d9: TRACK {:08X} DMACOPY dst={:08X} (phys {:08X}) src={:08X} {} bytes -- "
-                  "a copy lands ON the tracked texture",
-                  track, dst, dphys, src, bytes);
+    // RANGE OVERLAP, not "does the base address fall inside this copy".
+    //
+    // The old test was `tphys >= dphys && tphys < dphys + bytes`, which fires ONLY for a copy
+    // covering the texture's BASE PAGE. Measured consequence: tracking a visibly corrupt wall
+    // (10FAD000, run 053) produced 2901 TRACK lines and NOT ONE DMACOPY, which reads as "no copy
+    // ever delivered this texture" when it only ever meant "no copy covered page 0".
+    //
+    // That blindness is aimed exactly at the artifact. Textures are 8-16 pages but copies are
+    // 1-4 pages to scattered destinations (run 052's DMACOPY lines), so most of a texture is
+    // delivered by copies that never touch its base page -- and the proven defect is a copy
+    // landing ONE PAGE off (15AFF000 held its asset displaced by 4096 bytes). A predicate anchored
+    // to the base page cannot see either.
+    //
+    // Track the whole texture span instead. nx1_d3d9_dbg_track_bytes defaults to 64 KB, which
+    // covers every 256x256 BC texture in these captures; set it larger for bigger textures. The
+    // log prints the copy's offset RELATIVE to the tracked base, because that offset is the
+    // measurement: 0/4096/8192... means the copies tile the texture, and anything not a multiple
+    // of 4096 -- or a repeat of an offset already seen -- is the bug, visible directly in the log.
+    const uint32_t tspan = std::max(REXCVAR_GET(nx1_d3d9_dbg_track_bytes), 1u);
+    if (dphys < tphys + tspan && tphys < dphys + bytes) {
+      const int64_t rel = int64_t(dphys) - int64_t(tphys);
+      REXGPU_WARN("nx1_d3d9: TRACK {:08X} DMACOPY dst={:08X} (phys {:08X}) src={:08X} {} bytes "
+                  "-- lands on the tracked texture at offset {:+d} ({:+d} pages){}",
+                  track, dst, dphys, src, bytes, rel, rel / 4096,
+                  (rel % 4096) ? "  *** NOT PAGE ALIGNED ***" : "");
     }
   }
   // OUR-RENDERER ONLY. In pure Xenia mode the GPU-side buffer is authoritative for DMA

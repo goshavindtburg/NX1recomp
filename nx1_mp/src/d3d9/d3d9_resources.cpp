@@ -84,6 +84,30 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_sampler_n, 0, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
                       "Debug: log every write/resolve/decode touching this guest address, and "
                       "paint whatever samples it solid white so it can be identified on screen");
+/// How many bytes from nx1_d3d9_dbg_track_addr count as "the tracked texture" when matching DMA
+/// copy destinations. The DMA test used to anchor on the base address alone and so only saw
+/// copies covering page 0 -- see MirrorDmaCopy. A texture is delivered by many 1-4 page copies to
+/// scattered destinations, so the span is what has to be watched. 64 KB covers a 256x256 BC
+/// texture including its mip chain; raise it for larger ones.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_bytes, 65536, "GPU",
+                      "Debug: byte span from nx1_d3d9_dbg_track_addr treated as the tracked "
+                      "texture when matching DMA copy destinations");
+
+/// Drop a deferred DMA copy whose SOURCE a later copy overwrote while it was queued, instead of
+/// replaying it. Measured at 43% of landed retries (101 of 236, run 055): the staging page had
+/// been recycled to another texture, so replaying planted that texture's bytes into this one.
+/// Off restores the old behaviour for an A/B.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_drop_clobbered, true, "GPU",
+                    "Drop a deferred image-cache copy whose source was overwritten while it "
+                    "waited, rather than moving bytes that have already been relocated");
+
+/// Treat an image-cache copy whose source and destination OVERLAP as a pool compaction: copy
+/// every page verbatim in memmove order, never skipping empty pages and never deferring. The
+/// zero-page skip and the retry queue are both correct for a staging FILL and both corrupt a
+/// MOVE -- see CopyLiveSourcePages. Off restores the old behaviour for an A/B.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_move_verbatim, true, "GPU",
+                    "Copy overlapping (pool-compaction) image-cache moves verbatim and in "
+                    "memmove order, without the empty-page skip or deferral");
 
 /// Dump the next N texture DECODES: the full fetch constant, the first bytes of the guest
 /// source, and the decoded image. Unlike the mip dump this fires for every decode, so with
@@ -6077,7 +6101,14 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         }
         // The same span from the KNOWN-GOOD second tile row, as a control: whatever analysis
         // says about the bad bytes has to say something different about these.
-        if (guest_bytes > tile_row_bytes * 2) {
+        //
+        // `>=`, not `>`. A texture exactly two tile rows tall -- 256x256, the size of every
+        // specimen this dump has been aimed at -- has guest_bytes == tile_row_bytes * 2, so the
+        // strict test was false and the control was NEVER WRITTEN. Every capture taken with this
+        // instrument shipped the bad row with nothing to compare it against, which is the whole
+        // point of the pairing. Twelfth instrument to fail silently; the arming rule applies to
+        // dumps too, not just counters.
+        if (guest_bytes >= tile_row_bytes * 2) {
           std::snprintf(raw_path, sizeof(raw_path), "texdump/rawok_%08X_f%llu.bin",
                         t.base_address, static_cast<unsigned long long>(frame_));
           if (FILE* f = std::fopen(raw_path, "wb")) {
