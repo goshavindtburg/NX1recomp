@@ -61,6 +61,21 @@ inline constexpr uint32_t kAluConstantCount = 256;  ///< per stage
 inline constexpr uint32_t kValuesPacket = 0x28CC;   ///< GPU_VALUESPACKET
 inline constexpr uint32_t kControlPacket = 0x2934;  ///< GPU_CONTROLPACKET
 
+/// GPU_WINDOWPACKET (packet 1), immediately BELOW the values packet. Derived the same way as
+/// kPointPacket and cross-checked: sizeof(GPU_WINDOWPACKET) is 3 dwords, so 0x28CC - 0xC = 0x28C0,
+/// which also puts GPU_DESTINATIONPACKET at 0x2880 and its ScreenScissorTL at 0x28B8 -- both
+/// matching an independent derivation from the XDK docs.
+/// Each field is a GPU_POINT: `int X : 15, :1, int Y : 15, :1` -- SIGNED 15-bit at bits 0..14 and
+/// 16..30.
+inline constexpr uint32_t kWindowPacket = 0x28C0;
+inline constexpr uint32_t kWindowOffset = kWindowPacket + 0x00;
+inline constexpr uint32_t kWindowScissorTL = kWindowPacket + 0x04;
+inline constexpr uint32_t kWindowScissorBR = kWindowPacket + 0x08;
+
+/// GPU_STENCILREFMASK pair, GPU_VALUESPACKET indices 12 and 13 -- BACK FACE FIRST, then front.
+/// Layout: Ref 0..7, Mask 8..15, WriteMask 16..23.
+inline constexpr uint32_t kStencilRefMaskBF = kValuesPacket + 0x30;
+inline constexpr uint32_t kStencilRefMask = kValuesPacket + 0x34;
 inline constexpr uint32_t kAlphaRef = kValuesPacket + 0x38;      ///< float, already 0..1
 inline constexpr uint32_t kColorMask = kValuesPacket + 0x10;     ///< RB_COLOR_MASK, 4 bits per RT
 
@@ -71,6 +86,25 @@ inline constexpr uint32_t kColorControl = kControlPacket + 0x08;   ///< GPU_COLO
 inline constexpr uint32_t kClipControl = kControlPacket + 0x10;    ///< GPU_CLIPCONTROL
 inline constexpr uint32_t kModeControl = kControlPacket + 0x14;    ///< GPU_MODECONTROL (cull/fill)
 inline constexpr uint32_t kVteControl = kControlPacket + 0x18;     ///< GPU_VTECONTROL
+
+/// GPU_POINTPACKET (packet 7) -- where POLYGON OFFSET lives. Not adjacent to the packets above:
+/// the device mirrors the GPU packets contiguously in packet order, so this sits past the
+/// tessellator and misc packets.
+///
+/// DERIVED, then cross-checked three ways rather than trusted:
+///   packet sizes counted from d3d9gpu.h (minding `DWORD Unused[3]`, which is 3 dwords in one
+///   member and is exactly what makes GPU_VALUESPACKET 0x54 rather than 0x4C);
+///   the known anchors then reproduce themselves -- 0x28CC + 0x54 (values) + 0x14 (program)
+///   = 0x2934, the CONTROLPACKET offset already verified against the PDB;
+///   and walking backwards puts GPU_WINDOWPACKET at 0x28C0 and ScreenScissorTL at 0x28B8, both
+///   of which match an independent derivation made from the XDK's docs.
+/// Layout: 0x2A50 + {0,4,8,C} = PolyOffset Front Scale / Front Offset / Back Scale / Back Offset,
+/// then PointXRad, PointYRad, PointConstantSize, PointCullRad.
+inline constexpr uint32_t kPointPacket = 0x2A50;
+inline constexpr uint32_t kPolyOffsetFrontScale = kPointPacket + 0x00;
+inline constexpr uint32_t kPolyOffsetFrontOffset = kPointPacket + 0x04;
+inline constexpr uint32_t kPolyOffsetBackScale = kPointPacket + 0x08;
+inline constexpr uint32_t kPolyOffsetBackOffset = kPointPacket + 0x0C;
 
 // GPU_VALUESPACKET viewport scale/offset (PA_CL_VPORT_*), floats.
 inline constexpr uint32_t kVportXScale = kValuesPacket + 0x3C;
@@ -175,6 +209,16 @@ inline constexpr uint32_t kCookieHasSecondPass = 0x20;
 // path is out-of-line (guest_d3d.cpp) so this header need not pull in the kernel
 // memory system -- which drags std::min in behind <windows.h>'s min macro.
 const uint8_t* GuestTranslatePhysical(uint32_t guest_addr);
+
+/// What the last mirrored image-cache copy into this physical address covered. Defined beside the
+/// DMA hooks, which own the coverage map. Lets the texture decoder ask whether the copy that
+/// filled a slot was big enough for the texture now being decoded out of it.
+bool DmaCoverageFor(uint32_t phys, uint32_t* base_out, uint32_t* bytes_out, uint32_t* alt_out);
+/// Per-PAGE coverage verdict: 0 = no mirrored copy ever spanned this page, 1 = a copy spanned it
+/// but never wrote it (skipped for an empty source), 2 = a copy really wrote it. Asking per page is
+/// the whole point -- the earlier form asked only about a texture's BASE page, which is a different
+/// question from the one the provenance report prints answers to.
+uint32_t DmaPageVerdictFor(uint32_t phys);
 
 /// Host pointer to a raw GPU *physical* address (< 0x20000000): a vertex-fetch base, or a
 /// shader's literal-constant payload. Not the same translation as the 0xA0000000+ mirrors
@@ -335,6 +379,8 @@ struct TextureFetchConstant {
   uint32_t mip_max_level;
   uint32_t mip_address;
   bool packed_mips;
+  /// Whether the texture carries a border. The XDK's untiler requires this flag; ours ignores it.
+  bool border;
   /// Signed LOD bias with 5 fractional bits (A2XX_SQ_TEX_4_LOD_BIAS): the value the hardware
   /// adds to the computed LOD before level selection. Range -32.0 .. +31.97. A large NEGATIVE
   /// bias pins sampling at level 0 -- a way for a streamer to declare a chain while its levels
@@ -345,6 +391,24 @@ struct TextureFetchConstant {
   /// pins the computed LOD at 0 -- the other way a streamer can park sampling on the base.
   int32_t grad_exp_h;
   int32_t grad_exp_v;
+  /// Signed 6-bit exponent applied to the fetched TEXEL VALUES (`INT ExpAdjust : 6`). Non-zero
+  /// scales every sample by 2^n, and we have no way to express that on a D3D9 sampler -- so if
+  /// this is ever non-zero the affected texture is uniformly too bright or too dark by a power of
+  /// two, invisibly. Parsed so the question is answerable instead of structurally unaskable.
+  int32_t exp_adjust;
+  /// A 2D texture whose size field is a STACK (array) rather than a plain 2D surface. Both use
+  /// GPUDIMENSION_2D, so without this bit an array is bound as slice 0 of a plain 2D.
+  bool stacked;
+  /// GPUCLAMPPOLICY, from `ClampPolicy = !PointBorderEnable`. 0 = D3D policy (border modes act as
+  /// borders), 1 = OGL policy (BORDER and BORDER_HALF behave as CLAMP, and the MIRRORONCE_BORDER
+  /// pair as MIRRORONCE, when point filtering). It OVERRIDES the address modes, so the clamp
+  /// mapping cannot be corrected without reading it.
+  uint32_t clamp_policy;
+  /// GPUBORDERCOLOR (2 bits). The D3D layer only ever writes 0 = ABGR_BLACK or 1 = ABGR_WHITE.
+  /// Only observable once a border address mode is genuinely in play.
+  uint32_t border_color;
+  /// D3DSAMP_WHITEBORDERCOLORW: force the border colour's w component to 1 when sampled.
+  bool force_bcw_to_max;
 };
 
 /// Decode a `GPUTEXTURE_FETCH_CONSTANT` (6 dwords) from a host pointer at the constant's raw,
@@ -393,8 +457,23 @@ inline TextureFetchConstant DecodeTextureFetchConstant(const uint8_t* p) {
   // 5-bit signed at d4 bits 22..26 (H) and 27..31 (V).
   t.grad_exp_h = (int32_t(d4 << 5) >> 27);
   t.grad_exp_v = (int32_t(d4) >> 27);
+  // BorderSize (d3 bit 31). Parsed because the XDK's own untiler, XGUntileTextureLevel, takes the
+  // border flag as a REQUIRED argument alongside the packed-tail flag -- a bordered texture's
+  // levels are laid out with border texels included, so decoding one as unbordered reads shifted
+  // data. Our DetileMip2D takes neither flag. Counted first: if nothing in NX1 sets this, the gap
+  // is theoretical and can be closed with a comment instead of code.
+  t.border = ((d3 >> 31) & 0x1) != 0;
   t.packed_mips = ((d5 >> 11) & 0x1) != 0;
   t.mip_address = ((d5 >> 12) & 0xFFFFF) << 12;
+  // Fields the decode used to skip over entirely. Layout from GPUTEXTURE_FETCH_CONSTANT: d1 has
+  // RequestSize:2 (8..9), Stacked:1 (10), ClampPolicy:1 (11) between Endian and BaseAddress; d3
+  // carries ExpAdjust:6 at 13..18; d5 opens with BorderColor:2, ForceBCWToMax:1, TriClamp:2,
+  // AnisoBias:4 before Dimension at bit 9.
+  t.stacked = ((d1 >> 10) & 0x1) != 0;
+  t.clamp_policy = (d1 >> 11) & 0x1;
+  t.exp_adjust = (int32_t(d3 << 13) >> 26);  // 6-bit signed at d3 bits 13..18
+  t.border_color = d5 & 0x3;
+  t.force_bcw_to_max = ((d5 >> 2) & 0x1) != 0;
 
   // Size is stored with 1 subtracted from each component; the field layout
   // depends on the dimension.
@@ -642,7 +721,21 @@ struct GuestVertexElement {
   bool is_normalized;
   uint32_t usage;        ///< D3DDECLUSAGE (same numbering as the PC enum)
   uint32_t usage_index;  ///< D3DDECLUSAGE index
+  /// Type bits 10..21, GPUSWIZZLE. THE ONLY THING SEPARATING D3DDECLTYPE_D3DCOLOR FROM
+  /// D3DDECLTYPE_UBYTE4N: the XDK defines both as 8_8_8_8 / 8IN32 / UNSIGNED / FRACTION and they
+  /// differ solely here -- D3DCOLOR is GPUSWIZZLE_ARGB, UBYTE4N is GPUSWIZZLE_ABGR. Dropping it
+  /// mapped every D3DCOLOR to UBYTE4N, which exchanges RED and BLUE in vertex colours.
+  uint32_t swizzle;
 };
+
+/// GPUSWIZZLE component selectors: X=0 Y=1 Z=2 W=3 (0=const 0, 1=const 1), packed 3 bits per
+/// output channel from bit 0. Derived from the XDK's own macros:
+///   GPUSWIZZLE_ARGB = (Z | Y<<3 | X<<6 | W<<9) = 0x60A   -- D3DDECLTYPE_D3DCOLOR
+///   GPUSWIZZLE_ABGR = (X | Y<<3 | Z<<6 | W<<9) = 0x688   -- D3DDECLTYPE_UBYTE4N
+/// (Same encoding as the TEXTURE fetch constant's swizzle, where 0x60A is likewise the common
+/// 8_8_8_8 case -- see the texture swizzle notes.)
+inline constexpr uint32_t kGpuSwizzleArgb = 0x60A;
+inline constexpr uint32_t kGpuSwizzleAbgr = 0x688;
 
 inline uint32_t VertexDeclarationCount(const uint8_t* base, uint32_t decl) {
   return GuestRead32(base, decl + guest_resource::kDeclCount);
@@ -660,6 +753,8 @@ inline GuestVertexElement ReadVertexElement(const uint8_t* base, uint32_t decl, 
   return GuestVertexElement{
       d0 >> 16, d0 & 0xFFFF, type & 0x3F, ((type >> 8) & 1) != 0, ((type >> 9) & 1) == 0,
       (d2 >> 16) & 0xFF, (d2 >> 8) & 0xFF,
+      // Swizzle at bits 10..21 (D3DDECLTYPE_SWIZZLE{X,Y,Z,W}_SHIFT = 10/13/16/19, 3 bits each).
+      (type >> 10) & 0xFFF,
   };
 }
 
@@ -781,6 +876,119 @@ struct CullState {
 inline CullState ReadCullState(const uint8_t* base, uint32_t device) {
   const uint32_t mc = GuestRead32(base, device + guest_device::kModeControl);
   return CullState{(mc & 0x1) != 0, (mc & 0x2) != 0, (mc & 0x4) != 0};
+}
+
+/// The guest's window scissor. Never honoured until now -- and we stack shadow cascades into a
+/// single 1024x2048 atlas, which is exactly the arrangement a per-cascade scissor exists to keep
+/// separate, so cross-cascade bleed is the expected symptom of ignoring it.
+struct ScissorState {
+  bool valid;  ///< false when the rect is empty/degenerate, i.e. nothing to apply
+  int32_t left, top, right, bottom;
+};
+
+/// GPU_POINT packs two SIGNED 15-bit values at bits 0..14 and 16..30.
+inline int32_t GuestPointX(uint32_t v) { return int32_t(v << 17) >> 17; }
+inline int32_t GuestPointY(uint32_t v) { return int32_t(v << 1) >> 17; }
+
+inline ScissorState ReadScissorState(const uint8_t* base, uint32_t device) {
+  namespace gd = guest_device;
+  const uint32_t tl = GuestRead32(base, device + gd::kWindowScissorTL);
+  const uint32_t br = GuestRead32(base, device + gd::kWindowScissorBR);
+  ScissorState s{};
+  s.left = GuestPointX(tl);
+  s.top = GuestPointY(tl);
+  s.right = GuestPointX(br);
+  s.bottom = GuestPointY(br);
+  s.valid = s.right > s.left && s.bottom > s.top && s.left >= 0 && s.top >= 0;
+  return s;
+}
+
+/// Two-sided stencil, read straight out of GPU_DEPTHCONTROL and GPU_STENCILREFMASK. Measured live
+/// on 16,270 draws and previously not implemented at all -- stencil-masked effects rendered
+/// unmasked.
+///
+/// Bit layout is the XDK's verbatim (d3d9gpu.h GPU_DEPTHCONTROL): StencilEnable 0, ZEnable 1,
+/// ZWriteEnable 2, (reserved) 3, ZFunc 4..6, BackFaceEnable 7, then four 3-bit fields per face --
+/// Func, Fail, ZPass, ZFail -- front at 8..19 and back at 20..31.
+struct StencilState {
+  bool enabled;
+  bool two_sided;                              ///< BackFaceEnable
+  uint32_t func, fail, zpass, zfail;           ///< front face
+  uint32_t func_bf, fail_bf, zpass_bf, zfail_bf;  ///< back face
+  uint32_t ref, mask, write_mask;              ///< front GPU_STENCILREFMASK
+  uint32_t ref_bf, mask_bf, write_mask_bf;     ///< back GPU_STENCILREFMASK
+};
+
+/// GPUSTENCILOP is 0-based (KEEP=0 .. DECR=7) exactly like GPUCMPFUNC, and the XBOX D3DSTENCILOP is
+/// redefined to match it. DESKTOP D3D9 is 1-based (D3DSTENCILOP_KEEP=1 .. DECR=8), so the host
+/// value is xenos + 1 -- the same off-by-one as HostCompare. Reading "the Xbox enum is numerically
+/// identical to the GPU enum" as "no translation needed" would put every op one slot out, turning
+/// KEEP into ZERO and REPLACE into INCRSAT.
+inline uint32_t HostStencilOp(uint32_t xenos_op) { return (xenos_op & 0x7) + 1; }
+
+inline StencilState ReadStencilState(const uint8_t* base, uint32_t device) {
+  const uint32_t dc = GuestRead32(base, device + guest_device::kDepthControl);
+  StencilState s{};
+  s.enabled = (dc & 0x1) != 0;
+  if (!s.enabled) {
+    return s;  // common case: do not touch the values packet
+  }
+  s.two_sided = ((dc >> 7) & 0x1) != 0;
+  s.func = (dc >> 8) & 0x7;
+  s.fail = (dc >> 11) & 0x7;
+  s.zpass = (dc >> 14) & 0x7;
+  s.zfail = (dc >> 17) & 0x7;
+  s.func_bf = (dc >> 20) & 0x7;
+  s.fail_bf = (dc >> 23) & 0x7;
+  s.zpass_bf = (dc >> 26) & 0x7;
+  s.zfail_bf = (dc >> 29) & 0x7;
+  // GPU_STENCILREFMASK: Ref 0..7, Mask 8..15, WriteMask 16..23. Back-face pair sits FIRST in the
+  // values packet (index 12), front second (index 13).
+  const uint32_t rm = GuestRead32(base, device + guest_device::kStencilRefMask);
+  const uint32_t rm_bf = GuestRead32(base, device + guest_device::kStencilRefMaskBF);
+  s.ref = rm & 0xFF;
+  s.mask = (rm >> 8) & 0xFF;
+  s.write_mask = (rm >> 16) & 0xFF;
+  s.ref_bf = rm_bf & 0xFF;
+  s.mask_bf = (rm_bf >> 8) & 0xFF;
+  s.write_mask_bf = (rm_bf >> 16) & 0xFF;
+  return s;
+}
+
+/// Depth bias (PA_SU_POLY_OFFSET). Measured live on ~18% of NX1's draws and previously ignored
+/// outright, which is the classic cause of z-fighting on decals, bullet holes and any coplanar
+/// overlay.
+struct PolyOffsetState {
+  bool front_enable;  ///< GPU_MODECONTROL bit 11
+  bool back_enable;   ///< bit 12
+  bool para_enable;   ///< bit 13 -- used for NON-polygonal primitives
+  float front_scale, front_offset;
+  float back_scale, back_offset;
+};
+
+/// The 1/16 on the scale is not arbitrary: Xenos expresses the slope scale in SUBPIXEL units, and
+/// the reference backend applies `kPolygonOffsetScaleSubpixelUnit = 1.0f / 16.0f` for exactly this
+/// reason (rexglue-sdk xenos.h, applied in d3d12/command_processor.cpp). Passing the raw value to
+/// D3DRS_SLOPESCALEDEPTHBIAS would bias by 16x too much. The OFFSET term needs no conversion.
+///
+/// No sign flip for reverse-Z: our depth buffer carries the guest's Z verbatim under GREATEREQUAL,
+/// so host and guest depth are the same space and the bias applies identically in both.
+inline PolyOffsetState ReadPolyOffsetState(const uint8_t* base, uint32_t device) {
+  namespace gd = guest_device;
+  const uint32_t mc = GuestRead32(base, device + gd::kModeControl);
+  PolyOffsetState p{};
+  p.front_enable = ((mc >> 11) & 0x1) != 0;
+  p.back_enable = ((mc >> 12) & 0x1) != 0;
+  p.para_enable = ((mc >> 13) & 0x1) != 0;
+  if (!p.front_enable && !p.back_enable && !p.para_enable) {
+    return p;  // the overwhelmingly common case -- do not touch guest memory for it
+  }
+  constexpr float kSubpixel = 1.0f / 16.0f;
+  p.front_scale = GuestReadF32(base, device + gd::kPolyOffsetFrontScale) * kSubpixel;
+  p.front_offset = GuestReadF32(base, device + gd::kPolyOffsetFrontOffset);
+  p.back_scale = GuestReadF32(base, device + gd::kPolyOffsetBackScale) * kSubpixel;
+  p.back_offset = GuestReadF32(base, device + gd::kPolyOffsetBackOffset);
+  return p;
 }
 
 //=============================================================================

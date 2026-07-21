@@ -256,6 +256,9 @@ struct RecordedDraw {
   BlendState blend{};
   CullState cull{};
   AlphaTestState alpha{};
+  PolyOffsetState poly_offset{};
+  StencilState stencil{};
+  ScissorState scissor{};
   uint32_t color_write_mask = 0;
 
   // --- constants -----------------------------------------------------------------------

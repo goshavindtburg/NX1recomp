@@ -602,10 +602,23 @@ class ResourceTracker {
   };
   std::unordered_map<uint64_t, PageOrigin> page_origin_;
   uint64_t pageorigin_decodes_ = 0, pageorigin_flagged_ = 0;
+  /// Whole-texture moves between pool slots: ALL pages foreign from ONE donor. Benign --
+  /// that is what ImageCache_DmaCopy does -- but counted so it cannot be mistaken for the
+  /// mixed case, which is the artifact.
+  uint64_t pageorigin_relocated_ = 0;
+  /// Uniform (solid/blank) pages excluded from the provenance test: identical blank pages
+  /// in two unrelated textures are coincidence, not shared data.
+  uint64_t pageorigin_uniform_skipped_ = 0;
+  /// Foreign pages of the texture currently being decoded, handed to the detiler when
+  /// nx1_d3d9_dbg_paint_foreign is on so those blocks render as a marker.
+  std::vector<uint32_t> paint_pages_;
   /// Call AFTER the decode source is chosen, outside the mirror/live branch -- the question is the
   /// same either way, and putting it inside one branch is how it silently never ran.
+  /// Takes the extent as primitives rather than a rex::graphics::TextureExtent, so this header
+  /// need not pull in the texture-info headers just for a diagnostic.
   void NotePageOrigin(const uint8_t* src, size_t guest_bytes, const TextureFetchConstant& t,
-                      uint32_t height);
+                      uint32_t height, uint32_t block_width, uint32_t block_height,
+                      uint32_t block_pitch_h, uint32_t bpb);
 
   /// Snapshot-staleness census (nx1_d3d9_dbg_mirrorstale): how often the bytes a decode is about
   /// to read differ from what guest memory holds at that instant.
@@ -635,6 +648,7 @@ class ResourceTracker {
   /// declares a packed mip tail, and decodes that actually got a non-zero sub-tile offset.
   uint64_t small_decodes_ = 0;
   uint64_t packed_decodes_ = 0;
+  uint64_t border_decodes_ = 0;  ///< decodes of textures declaring a border (XDK untiler needs it)
   uint64_t packed_offsets_ = 0;
 
  public:

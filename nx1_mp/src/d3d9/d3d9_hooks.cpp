@@ -47,6 +47,9 @@
 // Original recompiled bodies
 //=============================================================================
 
+REXCVAR_DECLARE(bool, nx1_d3d9_dbg_hwcensus);   // defined in d3d9_resources.cpp
+REXCVAR_DECLARE(bool, nx1_d3d9_dbg_pageorigin);  // defined in d3d9_resources.cpp
+
 REX_EXTERN(__imp__rex_D3DDevice_DrawIndexedVertices);
 REX_EXTERN(__imp__rex_D3DDevice_DrawVertices);
 REX_EXTERN(__imp__rex_D3DDevice_DrawIndexedVerticesUP);
@@ -311,6 +314,39 @@ REX_HOOK_RAW(rex_D3DDevice_Resolve) {
   const uint32_t flags = ctx.r4.u32, clear_color = ctx.r10.u32;
   const uint32_t clear_stencil = nx1::d3d9::GuestRead32(base, ctx.r1.u32 + 0x5C);
   const float clear_z = float(ctx.f1.f64);
+  // RESOLVE CENSUS (nx1_d3d9_dbg_hwcensus). Four documented arguments we currently discard, each
+  // of which silently changes the result if the guest ever uses it:
+  //  * EXPONENTBIAS (flags >> 26, signed): "Bias each component by multiplying by 2^Bias" -- the
+  //    classic 360 HDR-in-8888 idiom. Ignoring a non-zero bias leaves the resolved image off by an
+  //    exact power of two while the source target itself looks correct.
+  //  * source select (flags & 0x7): 0..3 pick RENDERTARGET0..3, 4 is DEPTHSTENCIL. We instead
+  //    infer depth-vs-colour from the DESTINATION format and always read render target 0, so an
+  //    MRT resolve or a depth resolve into a colour-format destination takes the wrong source.
+  //  * fragment select (flags & 0x70): MSAA fragment extraction. ALLFRAGMENTS is 0, so the common
+  //    downsample is indistinguishable from "no flags" -- only a non-zero value proves it matters.
+  //  * DestLevel (r8) / DestSliceOrFace (r9): we always write mip 0, face 0.
+  if (REXCVAR_GET(nx1_d3d9_dbg_hwcensus)) {
+    static std::atomic<uint32_t> expbias{0}, srcsel{0}, frags{0}, level{0}, slice{0};
+    static std::atomic<uint64_t> n{0};
+    if (int32_t(flags) >> 26) expbias.fetch_add(1, std::memory_order_relaxed);
+    if (flags & 0x7) srcsel.fetch_or(1u << (flags & 0x7), std::memory_order_relaxed);
+    // Record WHICH fragment selector, not merely that one is set. D3DRESOLVE_ALLFRAGMENTS is 0x00
+    // and FRAGMENT0 is 0x10, and on a single-sampled buffer those two are equivalent -- so a
+    // non-zero count alone cannot tell a benign "take sample 0" from a genuine multi-fragment
+    // extraction (FRAGMENT1/2/3, 0x20/0x30/0x40), which we could not honour. Bit N set here means
+    // selector value N*0x10 was observed.
+    if (flags & 0x70) frags.fetch_or(1u << ((flags & 0x70) >> 4), std::memory_order_relaxed);
+    if (ctx.r8.u32) level.fetch_add(1, std::memory_order_relaxed);
+    if (ctx.r9.u32) slice.fetch_add(1, std::memory_order_relaxed);
+    if ((n.fetch_add(1, std::memory_order_relaxed) % 2000) == 0) {
+      REXGPU_WARN("nx1_d3d9: HWCENSUS resolve: exponent_bias!=0 {}x | source_select mask 0x{:X} "
+                  "(bit4 = DEPTHSTENCIL, bits1-3 = RT1..3) | fragment_select mask 0x{:X} (bit N = "
+                  "selector N*0x10; bit1 = FRAGMENT0, which is EQUIVALENT to ALLFRAGMENTS on a "
+                  "single-sampled buffer and therefore harmless -- bits 2/3/4 = FRAGMENT1/2/3 are "
+                  "the ones we could not honour) | dest_level!=0 {}x | dest_slice_or_face!=0 {}x",
+                  expbias.load(), srcsel.load(), frags.load(), level.load(), slice.load());
+    }
+  }
 #endif
   __imp__rex_D3DDevice_Resolve(ctx, base);
 #ifdef _WIN32
@@ -1107,7 +1143,12 @@ void NoteDmaChain(uint32_t dst, uint32_t src, uint32_t bytes, bool src_empty) {
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_retry, true, "GPU",
                     "Retry image-cache copies whose source was not yet filled at call time, "
                     "instead of dropping them. Off = the old drop-on-empty behaviour");
-REXCVAR_DEFINE_UINT32(nx1_d3d9_dma_retry_ms, 400, "GPU",
+/// Raised from 400 ms once deferral became PER PAGE. A whole-copy deferral was waiting on a
+/// staging buffer that fills in milliseconds; a per-page one waits on the streamer to deliver that
+/// part of the texture, which can take far longer. Landing late is safe -- the destination stamp
+/// makes a retry drop itself the moment a newer copy claims the same page -- so the only cost of a
+/// longer window is queue occupancy.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dma_retry_ms, 2000, "GPU",
                       "How long a deferred image-cache copy keeps retrying before it is "
                       "abandoned as genuinely empty");
 
@@ -1122,6 +1163,90 @@ std::atomic<uint32_t> g_dma_seq{1};
 
 /// Stamp every destination page this copy covers, so a later retry can tell whether it would be
 /// writing over a fresher occupant. Independent of the debug census: correctness depends on it.
+/// What the last mirrored copy into a given page actually covered. Recorded so the provenance
+/// detector can answer the question its masks raise: when a texture decodes half-new/half-old,
+/// did the copy that filled it cover the WHOLE texture or only part of it? A copy size smaller
+/// than the texture's extent means we under-copied and left the rest holding the previous
+/// occupant -- which is exactly the alternating page bands the masks show.
+struct DmaCoverage {
+  uint32_t base;   ///< destination base of that copy
+  uint32_t bytes;  ///< size we mirrored
+  uint32_t alt;    ///< the OTHER half of the packed ImageAllocInfo (hi when we used lo)
+  /// SPANNED vs ACTUALLY WRITTEN -- the distinction the whole provenance argument turns on.
+  /// `targeted` counts copies whose byte range covered this page; `wrote` counts the ones that
+  /// really memcpy'd it. They differ because CopyLiveSourcePages SKIPS pages whose source is
+  /// empty, so a copy can span a texture end to end and still leave pages holding the previous
+  /// occupant. Without both numbers "covered" is unfalsifiable: it cannot be told apart from
+  /// "covered and silently skipped", which is precisely the case under investigation.
+  uint32_t targeted;
+  uint32_t wrote;
+};
+std::mutex g_dma_cover_m;
+std::unordered_map<uint32_t, DmaCoverage> g_dma_cover;  // page -> what covered it
+
+bool LookupDmaCoverage(uint32_t phys, uint32_t* base, uint32_t* bytes, uint32_t* alt) {
+  std::lock_guard<std::mutex> lk(g_dma_cover_m);
+  const auto it = g_dma_cover.find(phys >> 12);
+  if (it == g_dma_cover.end()) {
+    return false;
+  }
+  *base = it->second.base;
+  *bytes = it->second.bytes;
+  *alt = it->second.alt;
+  return true;
+}
+
+/// Per-PAGE verdict, which is the only form of this question worth asking. The caller that matters
+/// is the provenance report, and it holds a list of FOREIGN pages -- asking whether a copy landed
+/// on the texture's BASE page (which is what it used to do) answers a different question entirely
+/// and was reporting "no mirrored copy recorded" for textures whose foreign pages sat 12 pages in.
+/// Returns 0 = no copy ever spanned this page, 1 = spanned but never written (the empty-source
+/// skip), 2 = actually written by a copy.
+uint32_t DmaPageVerdict(uint32_t phys) {
+  std::lock_guard<std::mutex> lk(g_dma_cover_m);
+  const auto it = g_dma_cover.find(phys >> 12);
+  if (it == g_dma_cover.end()) {
+    return 0;
+  }
+  return it->second.wrote ? 2u : 1u;
+}
+
+/// Mark a page the mirror genuinely memcpy'd. Called from the copy loop, so it sees exactly the
+/// pages that were NOT skipped for an empty source.
+void MarkDmaPageWritten(uint32_t dst) {
+  std::lock_guard<std::mutex> lk(g_dma_cover_m);
+  const auto it = g_dma_cover.find((dst & 0x1FFFFFFF) >> 12);
+  if (it != g_dma_cover.end()) {
+    ++it->second.wrote;
+  }
+}
+
+void NoteDmaCoverage(uint32_t dst, uint32_t bytes, uint32_t alt) {
+  const uint32_t first = (dst & 0x1FFFFFFF) >> 12;
+  const uint32_t last = ((dst & 0x1FFFFFFF) + (bytes ? bytes - 1 : 0)) >> 12;
+  std::lock_guard<std::mutex> lk(g_dma_cover_m);
+  // The 400,000-entry cap cannot bind for this title and is kept only as a runaway guard: the
+  // destination histogram spans 16 distinct 16 MB regions, so the map tops out near 65,536 pages.
+  // Counted anyway -- a silent cap is exactly the kind of instrument defect this file is full of.
+  if (g_dma_cover.size() > 400000) {
+    static std::atomic<uint64_t> capped{0};
+    if ((capped.fetch_add(1, std::memory_order_relaxed) % 10000) == 0) {
+      REXGPU_WARN("nx1_d3d9: DMACOVER map hit its {} entry cap -- coverage verdicts from here on "
+                  "are UNRELIABLE (pages will read as 'never targeted' merely because we stopped "
+                  "recording)",
+                  g_dma_cover.size());
+    }
+    return;
+  }
+  for (uint32_t p = first; p <= last && p - first < 4096; ++p) {
+    // Preserve `wrote` across re-targeting: the question is whether this page has EVER been
+    // written by a mirrored copy, not whether the most recent one wrote it.
+    auto& e = g_dma_cover[p];
+    const uint32_t prev_wrote = e.wrote;
+    e = {dst & 0x1FFFFFFF, bytes, alt, e.targeted + 1, prev_wrote};
+  }
+}
+
 uint32_t StampDmaDest(uint32_t dst, uint32_t bytes) {
   const uint32_t seq = g_dma_seq.fetch_add(1, std::memory_order_relaxed);
   const uint32_t first = (dst & 0x1FFFFFFF) >> 12;
@@ -1188,7 +1313,10 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_verbatim, false, "GPU",
                     "also writes the allocation's alignment gaps, which the guest packs other "
                     "data into, and multiplies InvalidateGuestRange traffic into a known race");
 
-uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
+/// `seq` is the destination stamp from StampDmaDest, so a page deferred here can be dropped if a
+/// newer copy claims the same destination. Pass 0 from the retry drain itself (no re-deferral).
+uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes,
+                             uint32_t seq) {
   const bool verbatim = REXCVAR_GET(nx1_d3d9_dma_verbatim);
   uint32_t copied = 0;
   for (uint32_t off = 0; off < bytes; off += 4096) {
@@ -1198,16 +1326,55 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
     if (!d || !s) {
       break;
     }
-    if (!verbatim) {
-      bool any = false;
-      for (uint32_t i = 0; i < chunk && !any; ++i) {
-        any = s[i] != 0;
-      }
-      if (!any) {
+    bool any = false;
+    for (uint32_t i = 0; i < chunk && !any; ++i) {
+      any = s[i] != 0;
+    }
+    if (!any) {
+      if (!verbatim) {
+        // DEFER THIS PAGE. Skipping is right -- an empty source page carries nothing, and copying
+        // it would blank live texels -- but skipping and FORGETTING is what leaves the previous
+        // occupant's bytes in the slot forever. That is the alternating page bands the provenance
+        // masks show, and why the artifact never heals.
+        //
+        // The existing retry could not catch this: it defers a copy only when SourceHasAnyData is
+        // false for the WHOLE source, so a half-populated source passes and is copied with holes.
+        // Deferral has to be per page, because that is the granularity the holes have.
+        if (seq && REXCVAR_GET(nx1_d3d9_dma_retry)) {
+          static std::atomic<uint64_t> dropped{0};
+          std::lock_guard<std::mutex> lk(g_dma_retry_m);
+          if (g_dma_retry.size() < 8192) {
+            g_dma_retry.push_back(
+                {dst + off, src + off, chunk, seq, std::chrono::steady_clock::now()});
+          } else if ((dropped.fetch_add(1, std::memory_order_relaxed) % 5000) == 0) {
+            REXGPU_WARN("nx1_d3d9: DMARETRY queue full, {} deferred pages dropped -- those slots "
+                        "keep their previous occupant",
+                        dropped.load());
+          }
+        }
         continue;
+      }
+      // VERBATIM BLANKS LIVE TEXELS. Copying an all-zero source page writes zeros over whatever
+      // the destination held, and the destination may hold texels that already arrived -- the
+      // effect measured earlier as a tracked texture going 8134/8192 nonzero -> 2033/8192. It
+      // shows on screen as solid black banding, which is visibly worse in the verbatim
+      // screenshots than the skipping ones. Counted so the harm is a number, not an impression.
+      static std::atomic<uint64_t> blanked{0};
+      const uint64_t k = blanked.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((k % 20000) == 0) {
+        REXGPU_WARN("nx1_d3d9: DMABLANK {} destination pages overwritten with ZEROS by verbatim "
+                    "copying (empty source page). Each one erases whatever texels the slot already "
+                    "held -- this is the black banding",
+                    k);
       }
     }
     std::memcpy(d, s, chunk);
+    // Record that THIS PAGE was really written, not merely spanned. Gated on the provenance
+    // census because it is a locked map update per page copied, and the only consumer is that
+    // report. See DmaCoverage::wrote.
+    if (REXCVAR_GET(nx1_d3d9_dbg_pageorigin)) {
+      MarkDmaPageWritten(dst + off);
+    }
     nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange((dst + off) & 0x1FFFFFFF, chunk);
     ++copied;
   }
@@ -1256,7 +1423,9 @@ void DrainDmaRetries(uint8_t* base) {
     }
   }
   for (const DmaRetry& e : ready) {
-    if (CopyLiveSourcePages(base, e.dst, e.src, e.bytes)) {
+    // seq=0: a retry never re-defers itself. If the source is still not ready it will be
+    // re-examined on the next drain until it expires.
+    if (CopyLiveSourcePages(base, e.dst, e.src, e.bytes, 0)) {
       filled.fetch_add(1, std::memory_order_relaxed);
       latency_us.fetch_add(
           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - e.at).count()),
@@ -1304,7 +1473,27 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   if (!nx1::d3d9::IsEnabled()) {
     return;
   }
+  // SILENT DROPS. This gate returns without mirroring and without recording anything, so a copy
+  // rejected here is indistinguishable downstream from a copy that never happened -- which is
+  // exactly what the provenance cross-reference reports as "no mirrored copy recorded" for the
+  // pages that render wrong. The 16 MB ceiling in particular would drop a large texture move
+  // whole, leaving every page of it holding the previous occupant. Counted by reason so the
+  // question is answered rather than assumed.
   if (bytes < 32 || bytes > (16u << 20) || !dst || !src) {
+    static std::atomic<uint64_t> too_small{0}, too_big{0}, null_addr{0};
+    if (!dst || !src) {
+      null_addr.fetch_add(1, std::memory_order_relaxed);
+    } else if (bytes < 32) {
+      too_small.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      const uint64_t k = too_big.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (k <= 8 || (k % 500) == 0) {
+        REXGPU_WARN("nx1_d3d9: DMAGATE dropped a {} byte copy to {:08X} -- OVER the 16 MB mirror "
+                    "ceiling, so every page of it keeps its previous occupant ({} such copies, {} "
+                    "under-32, {} null)",
+                    bytes, dst, k, too_small.load(), null_addr.load());
+      }
+    }
     return;
   }
   DrainDmaRetries(base);
@@ -1373,7 +1562,7 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // held back.
   static std::atomic<uint64_t> pages_copied{0}, pages_skipped{0};
   const uint32_t total_pages = (bytes + 4095) / 4096;
-  const uint32_t copied = CopyLiveSourcePages(base, dst, src, bytes);
+  const uint32_t copied = CopyLiveSourcePages(base, dst, src, bytes, seq);
   // Approximate: the helper also stops early on an untranslatable page, which counts here as
   // skipped. Both are "we did not land these bytes", which is what the counter is for.
   const uint32_t not_copied = total_pages - std::min(copied, total_pages);
@@ -1390,6 +1579,15 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
 }
 
 }  // namespace
+
+namespace nx1::d3d9 {
+/// Public forwarder so the texture decoder can ask what the last mirrored copy into an address
+/// actually covered. Lives here because the coverage map is owned by the DMA hooks.
+bool DmaCoverageFor(uint32_t phys, uint32_t* base_out, uint32_t* bytes_out, uint32_t* alt_out) {
+  return LookupDmaCoverage(phys, base_out, bytes_out, alt_out);
+}
+uint32_t DmaPageVerdictFor(uint32_t phys) { return DmaPageVerdict(phys); }
+}  // namespace nx1::d3d9
 
 REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, a5 = ctx.r5.u32, a6 = ctx.r6.u32;
@@ -1418,6 +1616,7 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   if (mode >= 2) {
     // a5 confirmed as the byte count by the logged run: clean page multiples, and dst/size
     // pairs that match the GPU-written census entry for entry.
+    NoteDmaCoverage(dst, a5, a6);  // immediate path: a6 is the only other candidate size
     MirrorDmaCopy(base, dst, src, a5);
   }
 #endif
@@ -1451,6 +1650,9 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopyDelayed_YAXPAEPBEUImageAllocInfo_Z) {
     // exactly +3000, and lo=3000 where hi=5000). hi is the slot's ALLOCATION size; using it
     // overcopied past the image and trampled the neighbouring slot, which presented as some
     // textures healing while others newly broke.
+    // Record BOTH halves: if the mixed textures turn out to need `hi`, the size choice
+    // documented as verified for one destination is wrong for others.
+    NoteDmaCoverage(dst, lo, hi);
     MirrorDmaCopy(base, dst, src, lo);
   }
 #endif

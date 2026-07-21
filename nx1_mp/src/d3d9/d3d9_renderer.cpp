@@ -59,6 +59,24 @@ REXCVAR_DEFINE_INT32(nx1_d3d9_dbg_blend_dst, -1, "GPU",
 
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_sampler_n);  // defined in d3d9_resources.cpp
+REXCVAR_DECLARE(bool, nx1_d3d9_dbg_hwcensus);             // defined in d3d9_resources.cpp
+/// Honour the guest's polygon offset. On by default -- it is measured live on ~18% of draws and
+/// ignoring it is a visible defect -- but a cvar because it is the first consumer of a DERIVED
+/// packet offset, so an A/B is the fastest way to attribute any depth regression.
+/// Each hardware-fidelity change lands behind its own cvar so a regression is a one-toggle bisect
+/// rather than a rebuild. Earned the hard way: making the resolve source-select flag authoritative
+/// broke DOF, and the only reason it was diagnosable in one step was that the change reported when
+/// it disagreed with the behaviour it replaced.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_scissor, true, "GPU",
+                    "Honour the guest's window scissor (GPU_WINDOWPACKET at device+0x28C0). Off "
+                    "restores the previous behaviour of ignoring it. Suspect this first if "
+                    "anything is clipped or missing that used to draw");
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_highlight_stencil, false, "GPU",
+                    "Blink every stencil-using draw as wireframe. Answers 'where is stencil used' "
+                    "by showing it, instead of hunting for a surface that might be masked");
+REXCVAR_DEFINE_BOOL(nx1_d3d9_poly_offset, true, "GPU",
+                    "Apply the guest's PA_SU_POLY_OFFSET depth bias (GPU_POINTPACKET at "
+                    "device+0x2A50). Off restores the previous behaviour of ignoring it");
 
 /// Narrow the blend isolate to a SINGLE material, keyed by its guest pixel-shader object.
 ///
@@ -1307,7 +1325,58 @@ void Renderer::ResolveCopy(const uint8_t* base, const RecordedCommand& c) {
     at.y = c.dest_point[1];
   }
 
-  if (dest.format == 22 || dest.format == 23) {
+  // WHICH SURFACE THE GUEST ASKED FOR, not which one we guess from the destination's format.
+  // D3DRESOLVE's low three bits are a source SELECTOR: 0..3 = RENDERTARGET0..3, 4 = DEPTHSTENCIL.
+  // We used to infer depth-vs-colour from `dest.format == 22 || 23` and always read render target
+  // 0, which happens to agree with the guest for this title but is a different question: a depth
+  // resolve into a colour-format destination (the XDK lists 32_FLOAT and 8_8_8_8 as legal resolve
+  // destinations) would take the colour path and copy the scene instead of depth.
+  //
+  // Measured: source_select is only ever 0 or 4 here, so this changes no behaviour today -- it
+  // removes the reliance on a coincidence. Any disagreement between the flag and the old heuristic
+  // is logged rather than silently resolved, because that is the case worth knowing about.
+  constexpr uint32_t kResolveSourceMask = 0x7;
+  constexpr uint32_t kResolveDepthStencil = 0x4;
+  const uint32_t source_select = c.clear_flags & kResolveSourceMask;
+  const bool format_says_depth = dest.format == 22 || dest.format == 23;
+  // UNION, NOT REPLACEMENT -- and this is a correction, not a design choice.
+  //
+  // Making the flag authoritative broke DOF outright: NX1 issues its depth resolves with
+  // source_select == 0 (RENDERTARGET0) while the destination format is 23 (k_24_8_FLOAT), so
+  // 10,000+ depth resolves per run took the colour path, the depth buffer was never published,
+  // and every consumer of it (DOF samples depth at s6) got a stale or wrong surface.
+  //
+  // The census that "proved" the flag was safe could not have shown this: it recorded source_select
+  // only when NON-ZERO, so value 0 -- the majority case -- was structurally invisible, and
+  // "mask 0x10" meant "4 is the only non-zero value", not "4 is the only value".
+  //
+  // So the destination FORMAT remains the reliable signal for this title, and the flag is honoured
+  // additionally for the case the format cannot express (depth resolved into a colour-format
+  // destination, which the XDK permits).
+  const bool wants_depth = format_says_depth || source_select == kResolveDepthStencil;
+  if (source_select == kResolveDepthStencil && !format_says_depth) {
+    static std::atomic<uint64_t> flag_only{0};
+    const uint64_t k = flag_only.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (k <= 8 || (k % 5000) == 0) {
+      REXGPU_WARN("nx1_d3d9: RESOLVESRC flag says DEPTHSTENCIL while the destination format is {} "
+                  "(a colour format) -- taking the depth path on the flag's word, which the format "
+                  "heuristic alone would have missed. {} such resolves",
+                  dest.format, k);
+    }
+  }
+  if (source_select != 0 && source_select != kResolveDepthStencil && !format_says_depth) {
+    // RENDERTARGET1..3. We bind a single colour target, so there is nothing else to read; say so
+    // rather than silently resolving RT0's contents into an MRT destination.
+    static std::atomic<uint64_t> mrt{0};
+    const uint64_t k = mrt.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (k <= 4 || (k % 5000) == 0) {
+      REXGPU_WARN("nx1_d3d9: RESOLVESRC asked for RENDERTARGET{} but only target 0 is bound -- "
+                  "resolving target 0 instead ({} such resolves)",
+                  source_select, k);
+    }
+  }
+
+  if (wants_depth) {
     auto& tracker = ResourceTracker::Get();
     if (IDirect3DTexture9* depth = tracker.GetDepthTexture(base, current_depth_surface_)) {
       tracker.ResolveDepth(dest.base_address, dest.width, dest.height, depth, rect, at);
@@ -1930,10 +1999,78 @@ D3DTEXTUREFILTERTYPE HostFilter(uint32_t xenos_filter) {
 // ourselves (downsampled from a possibly-unstreamed level 0, or decoded from the unfilled
 // pool); either way the distant samples were data the hardware never touches, and that was
 // the distance confetti. The honouring happens at the sampler-state site (nx1_d3d9_basemap),
-// where it must also survive the force-trilinear smoothing; this helper only maps the two
-// plain filter modes.
+// where it must also survive the force-trilinear smoothing.
+//
+// The mapping is an IDENTITY, not a translation: the XDK defines D3DTEXF_NONE == 2 and
+// GPUMIPFILTER_BASEMAP == 2, and D3DDevice_SetSamplerState_MipFilter_Inline writes the value
+// straight through with no conversion -- the Xbox D3D enum IS the GPU enum. Returning LINEAR for
+// everything non-zero silently upgraded "mips are not resident" to trilinear over an unfilled
+// pool, and left that correctness resting entirely on the nx1_d3d9_basemap cvar downstream.
+// GPUMIPFILTER_KEEP (3) is marked "Texture fetch instructions only" in the header, so it should
+// never appear in a fetch constant; treat it as BASEMAP rather than inventing a filter for it.
+/// Render-state half of the hardware-fidelity census (see nx1_d3d9_dbg_hwcensus).
+///
+/// Everything here is a documented field of a register we ALREADY fetch every draw, so the cost is
+/// a few masked ORs. It answers, in one run, four questions that otherwise each need their own
+/// experiment: does NX1 use stencil (GPU_DEPTHCONTROL bits 0 and 7..31 are a full two-sided stencil
+/// state we ignore entirely), does it request a non-solid FILL mode or POLYGON OFFSET (both in
+/// GPU_MODECONTROL, which we read for cull and then overwrite fill unconditionally), does it enable
+/// ALPHA-TO-MASK (GPU_COLORCONTROL bit 4), and does it ever use the CONSTANT blend factors 12..15
+/// (for which we never source D3DRS_BLENDFACTOR from the guest's values packet).
+void NoteRenderStateCensus(const uint8_t* base, uint32_t device) {
+  if (!REXCVAR_GET(nx1_d3d9_dbg_hwcensus)) {
+    return;
+  }
+  namespace gd = nx1::d3d9::guest_device;
+  static std::atomic<uint32_t> stencil_seen{0}, fill_mask{0}, polyoff_seen{0}, a2m_seen{0};
+  static std::atomic<uint32_t> blendfactor_seen{0}, persp_seen{0}, vtxfmt_seen{0},
+      primreset_seen{0};
+  static std::atomic<uint64_t> n{0};
+  const uint32_t dc = nx1::d3d9::GuestRead32(base, device + gd::kDepthControl);
+  const uint32_t mc = nx1::d3d9::GuestRead32(base, device + gd::kModeControl);
+  const uint32_t cc = nx1::d3d9::GuestRead32(base, device + gd::kColorControl);
+  const uint32_t bc = nx1::d3d9::GuestRead32(base, device + gd::kBlendControl0);
+  const uint32_t vte = nx1::d3d9::GuestRead32(base, device + gd::kVteControl);
+  if ((dc & 0x1) || (dc >> 8)) stencil_seen.fetch_add(1, std::memory_order_relaxed);
+  if ((mc >> 11) & 0x7) polyoff_seen.fetch_add(1, std::memory_order_relaxed);
+  if ((cc >> 4) & 0x1) a2m_seen.fetch_add(1, std::memory_order_relaxed);
+  if ((mc >> 20) & 0x1) persp_seen.fetch_add(1, std::memory_order_relaxed);
+  // WHICH VTE bits, not merely that some are set. Bits 8/9/10 are VtxXyFmt / VtxZFmt / VtxW0Fmt,
+  // and they mean different things: they say whether the incoming vertex XY, Z and W are already
+  // post-divide. A count of "some bit set on ~100% of draws" cannot distinguish a benign always-set
+  // W0 format from an XY format we would be mis-transforming, which is the same
+  // measure-the-aggregate-not-the-value mistake that produced the DOF regression.
+  vtxfmt_seen.fetch_or((vte >> 8) & 0x7, std::memory_order_relaxed);
+  // MultiPrimIbEnable = PRIMITIVE RESTART (D3DRS_PRIMITIVERESETENABLE). If this is never set the
+  // whole feature is dead for this title and needs no implementation; if it IS set, every reset
+  // index (default 0xFFFF) is currently being consumed as a real vertex index.
+  if ((mc >> 21) & 0x1) primreset_seen.fetch_add(1, std::memory_order_relaxed);
+  fill_mask.fetch_or((mc >> 3) & 0xFF, std::memory_order_relaxed);
+  // Blend factors are 5-bit fields; 12..15 are BLENDFACTOR/INVBLENDFACTOR/CONSTANTALPHA/INV.
+  const auto is_const = [](uint32_t f) { return f >= 12 && f <= 15; };
+  if (is_const(bc & 0x1F) || is_const((bc >> 8) & 0x1F) || is_const((bc >> 16) & 0x1F) ||
+      is_const((bc >> 24) & 0x1F)) {
+    blendfactor_seen.fetch_add(1, std::memory_order_relaxed);
+  }
+  if ((n.fetch_add(1, std::memory_order_relaxed) % 200000) == 0) {
+    REXGPU_WARN("nx1_d3d9: HWCENSUS state: stencil {}x | poly_offset {}x | alpha_to_mask {}x | "
+                "const_blend_factor {}x | persp_corr_disable {}x | primitive_restart {}x | "
+                "vte_vtx_fmt mask 0x{:X} (bit0=VtxXyFmt bit1=VtxZFmt bit2=VtxW0Fmt) | fill bits "
+                "0x{:X} (0 = always plain solid, so our unconditional FILLMODE is harmless)",
+                stencil_seen.load(), polyoff_seen.load(), a2m_seen.load(), blendfactor_seen.load(),
+                persp_seen.load(), primreset_seen.load(), vtxfmt_seen.load(), fill_mask.load());
+  }
+}
+
 D3DTEXTUREFILTERTYPE HostMipFilter(uint32_t xenos_filter) {
-  return xenos_filter == 0 ? D3DTEXF_POINT : D3DTEXF_LINEAR;
+  switch (xenos_filter) {
+    case 0:
+      return D3DTEXF_POINT;
+    case 1:
+      return D3DTEXF_LINEAR;
+    default:
+      return D3DTEXF_NONE;  // 2 = BASEMAP (the hardware DEFAULT), 3 = KEEP (shader-side only)
+  }
 }
 
 /// The maximum anisotropy the guest is asking for: xenos::AnisoFilter counts ratios, not
@@ -2014,9 +2151,15 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   // Blinking keeps the frame correct half the time while still being impossible to miss. And
   // FILLMODE is set on EVERY draw, both branches -- setting a state only for the matching draw
   // leaves it applied to every draw after it.
-  const bool lit = REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) != 0 &&
-                   d.ps_object == REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) &&
-                   ((highlight_frame_ / 12u) & 1u) != 0;
+  // Blinking wireframe on every stencil-using draw. "Where do I look for stencil?" is otherwise a
+  // guessing game -- this answers it on screen instead, and blinks for the same reason the
+  // material highlight does (holding wireframe on a full-screen pass never paints the frame).
+  const bool stencil_lit = REXCVAR_GET(nx1_d3d9_dbg_highlight_stencil) && d.stencil.enabled &&
+                           ((highlight_frame_ / 12u) & 1u) != 0;
+  const bool lit = stencil_lit ||
+                   (REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) != 0 &&
+                    d.ps_object == REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) &&
+                    ((highlight_frame_ / 12u) & 1u) != 0);
   SetRenderStateCached(D3DRS_FILLMODE, lit ? D3DFILL_WIREFRAME : D3DFILL_SOLID);
   if (const uint32_t solo_ps = REXCVAR_GET(nx1_d3d9_dbg_solo_ps);
       solo_ps && d.ps_object != solo_ps) {
@@ -2040,6 +2183,163 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
   SetRenderStateCached(D3DRS_ZENABLE, depth.test_enabled ? D3DZB_TRUE : D3DZB_FALSE);
   SetRenderStateCached(D3DRS_ZWRITEENABLE, depth.write_enabled ? TRUE : FALSE);
   SetRenderStateCached(D3DRS_ZFUNC, HostCompare(depth.compare_function));
+
+  // DEPTH BIAS (PA_SU_POLY_OFFSET). Measured on ~18% of this title's draws and previously not
+  // applied at all -- the standard cause of z-fighting on decals, bullet holes and coplanar
+  // overlays.
+  //
+  // Which pair applies depends on the primitive, matching the reference: polygons take the FRONT
+  // enable (D3D9 has a single bias, so the back pair cannot be expressed separately and front
+  // wins), while non-polygonal primitives take PARA. The 1/16 subpixel conversion on the slope
+  // scale is already applied in ReadPolyOffsetState.
+  //
+  // D3D9 takes these as DWORD-typed FLOAT bits, hence the bit casts -- passing an int here is a
+  // silent no-op rather than an error.
+  {
+    const PolyOffsetState& po = d.poly_offset;
+    const bool polygonal = d.prim_type != 1 && d.prim_type != 2 && d.prim_type != 3;
+    const bool on = polygonal ? (po.front_enable || po.back_enable) : po.para_enable;
+    float slope = 0.0f, bias = 0.0f;
+    if (on && REXCVAR_GET(nx1_d3d9_poly_offset)) {
+      const bool use_back = polygonal && !po.front_enable && po.back_enable;
+      slope = use_back ? po.back_scale : po.front_scale;
+      bias = use_back ? po.back_offset : po.front_offset;
+      // A derived packet offset feeding a float straight into the depth pipeline is exactly the
+      // shape of change that has blacked this screen before. Reject values that cannot be a real
+      // bias rather than pushing geometry out of the depth range on a bad read.
+      if (!std::isfinite(slope) || !std::isfinite(bias) || std::fabs(slope) > 1024.0f ||
+          std::fabs(bias) > 1.0f) {
+        static std::atomic<uint64_t> bad{0};
+        if ((bad.fetch_add(1, std::memory_order_relaxed) % 10000) == 0) {
+          REXGPU_WARN("nx1_d3d9: POLYOFFSET implausible values slope={} bias={} -- rejecting. If "
+                      "this fires at scale the GPU_POINTPACKET offset (0x2A50) is wrong",
+                      slope, bias);
+        }
+        slope = bias = 0.0f;
+      }
+    }
+    const auto as_dword = [](float f) {
+      DWORD d2;
+      std::memcpy(&d2, &f, sizeof(d2));
+      return d2;
+    };
+    SetRenderStateCached(D3DRS_SLOPESCALEDEPTHBIAS, as_dword(slope));
+    SetRenderStateCached(D3DRS_DEPTHBIAS, as_dword(bias));
+  }
+
+  // WINDOW SCISSOR. Never honoured before this. The shadow cascades all render through one
+  // 1024x2048 atlas, which is precisely the arrangement a per-cascade scissor keeps separate, so
+  // ignoring it lets a cascade's draws spill into its neighbours.
+  //
+  // GUARDED, because kWindowPacket (0x28C0) is a DERIVED offset and a bad scissor is far more
+  // destructive than a bad depth bias -- it can clip the entire frame to nothing, which reads as a
+  // black screen rather than as a subtle artifact. A rect that is degenerate, or that does not
+  // intersect the render target at all, is treated as "no scissor" and reported instead of applied.
+  {
+    const ScissorState& sc = d.scissor;
+    bool applied = false;
+    if (REXCVAR_GET(nx1_d3d9_scissor) && sc.valid) {
+      const LONG rt_w = LONG(current_rt_width_ ? current_rt_width_ : backbuffer_width_);
+      const LONG rt_h = LONG(current_rt_height_ ? current_rt_height_ : backbuffer_height_);
+      RECT r{LONG(sc.left), LONG(sc.top), std::min<LONG>(sc.right, rt_w),
+             std::min<LONG>(sc.bottom, rt_h)};
+      if (r.right > r.left && r.bottom > r.top && r.left < rt_w && r.top < rt_h) {
+        // A scissor covering the whole target is the guest's "no clipping" state; skipping it
+        // keeps the common path free of a redundant state change.
+        if (r.left > 0 || r.top > 0 || r.right < rt_w || r.bottom < rt_h) {
+          device_->SetScissorRect(&r);
+          SetRenderStateCached(D3DRS_SCISSORTESTENABLE, TRUE);
+          applied = true;
+        }
+      } else {
+        static std::atomic<uint64_t> bad{0};
+        const uint64_t k = bad.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (k <= 4 || (k % 20000) == 0) {
+          REXGPU_WARN("nx1_d3d9: SCISSOR rect ({},{})-({},{}) does not intersect the {}x{} target "
+                      "-- ignoring. At scale this means GPU_WINDOWPACKET (0x28C0) is wrong",
+                      sc.left, sc.top, sc.right, sc.bottom, rt_w, rt_h, k);
+        }
+      }
+    }
+    if (!applied) {
+      SetRenderStateCached(D3DRS_SCISSORTESTENABLE, FALSE);
+    }
+  }
+
+  // STENCIL. Measured on 16,270 draws of this title and previously not implemented at all, so
+  // stencil-masked effects rendered unmasked -- a mask pass paints over everything it should have
+  // been confined to.
+  //
+  // WINDING IS THE TRAP HERE. D3D9's two-sided stencil applies the CCW_* states to
+  // counter-clockwise triangles and has no front-face state of its own: clockwise IS front.
+  // Xenos declares its own winding (GPU_MODECONTROL bit 2), and we deliberately do not flip
+  // winding -- ApplyRenderStates folds it into D3DCULL instead. So when the guest says CCW is
+  // front, the guest's FRONT set must drive D3D9's CCW_* states and its BACK set the plain ones.
+  // Assigning front->plain unconditionally would silently swap the two whenever the guest uses
+  // CCW winding, which is exactly the case our cull code already has to special-case.
+  {
+    const StencilState& st = d.stencil;
+    SetRenderStateCached(D3DRS_STENCILENABLE, st.enabled ? TRUE : FALSE);
+    if (st.enabled) {
+      // WHAT IS STENCIL BEING USED FOR? The configuration says it outright, and there are only ever
+      // a handful of distinct ones: func=ALWAYS with zpass=REPLACE is a mask being WRITTEN, while
+      // func=EQUAL/NOTEQUAL with zpass=KEEP is a mask being TESTED. Logging the distinct set (with
+      // the pixel shader that carries it, so it can be fed to dbg_highlight_ps) turns "where do I
+      // look for stencil?" into a readable answer.
+      if (REXCVAR_GET(nx1_d3d9_dbg_hwcensus)) {
+        static std::mutex sm;
+        static std::vector<uint64_t> seen;
+        const uint64_t key = uint64_t(st.func) | (uint64_t(st.fail) << 3) |
+                             (uint64_t(st.zpass) << 6) | (uint64_t(st.zfail) << 9) |
+                             (uint64_t(st.ref) << 12) | (uint64_t(st.mask) << 20) |
+                             (uint64_t(st.write_mask) << 28) | (uint64_t(st.two_sided) << 36);
+        std::lock_guard<std::mutex> lk(sm);
+        if (std::find(seen.begin(), seen.end(), key) == seen.end() && seen.size() < 32) {
+          seen.push_back(key);
+          static const char* kFunc[8] = {"NEVER",  "LESS",   "EQUAL", "LEQUAL",
+                                         "GREATER", "NOTEQUAL", "GEQUAL", "ALWAYS"};
+          static const char* kOp[8] = {"KEEP",   "ZERO", "REPLACE", "INCRSAT",
+                                       "DECRSAT", "INVERT", "INCR",  "DECR"};
+          REXGPU_WARN("nx1_d3d9: STENCILUSE func={} fail={} zpass={} zfail={} ref={:02X} "
+                      "mask={:02X} write={:02X} two_sided={} ps={:08X} -- ALWAYS/REPLACE writes a "
+                      "mask, EQUAL|NOTEQUAL/KEEP tests one",
+                      kFunc[st.func & 7], kOp[st.fail & 7], kOp[st.zpass & 7], kOp[st.zfail & 7],
+                      st.ref, st.mask, st.write_mask, st.two_sided ? 1 : 0, d.ps_object);
+        }
+      }
+      SetRenderStateCached(D3DRS_TWOSIDEDSTENCILMODE, st.two_sided ? TRUE : FALSE);
+      // `plain` gets whichever Xenos face D3D9 considers front (clockwise).
+      const bool swap = !d.cull.front_is_cw;
+      const auto pick = [swap](uint32_t front, uint32_t back) { return swap ? back : front; };
+      SetRenderStateCached(D3DRS_STENCILFUNC, HostCompare(pick(st.func, st.func_bf)));
+      SetRenderStateCached(D3DRS_STENCILFAIL, HostStencilOp(pick(st.fail, st.fail_bf)));
+      SetRenderStateCached(D3DRS_STENCILZFAIL, HostStencilOp(pick(st.zfail, st.zfail_bf)));
+      SetRenderStateCached(D3DRS_STENCILPASS, HostStencilOp(pick(st.zpass, st.zpass_bf)));
+      SetRenderStateCached(D3DRS_STENCILREF, pick(st.ref, st.ref_bf));
+      SetRenderStateCached(D3DRS_STENCILMASK, pick(st.mask, st.mask_bf));
+      SetRenderStateCached(D3DRS_STENCILWRITEMASK, pick(st.write_mask, st.write_mask_bf));
+      if (st.two_sided) {
+        SetRenderStateCached(D3DRS_CCW_STENCILFUNC, HostCompare(pick(st.func_bf, st.func)));
+        SetRenderStateCached(D3DRS_CCW_STENCILFAIL, HostStencilOp(pick(st.fail_bf, st.fail)));
+        SetRenderStateCached(D3DRS_CCW_STENCILZFAIL, HostStencilOp(pick(st.zfail_bf, st.zfail)));
+        SetRenderStateCached(D3DRS_CCW_STENCILPASS, HostStencilOp(pick(st.zpass_bf, st.zpass)));
+        // Xenos carries a SEPARATE GPU_STENCILREFMASK per face; D3D9 has exactly one
+        // STENCILREF/MASK/WRITEMASK shared by both. When the two halves differ there is no way to
+        // express it, so the D3D9-front values win and the back face silently gets the wrong
+        // reference. Report it rather than let a subtly wrong mask pass as implemented.
+        if (st.ref != st.ref_bf || st.mask != st.mask_bf || st.write_mask != st.write_mask_bf) {
+          static std::atomic<uint64_t> unrep{0};
+          const uint64_t k = unrep.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (k <= 4 || (k % 20000) == 0) {
+            REXGPU_WARN("nx1_d3d9: STENCIL two-sided draw wants different ref/mask per face "
+                        "(front {:02X}/{:02X}/{:02X} vs back {:02X}/{:02X}/{:02X}) -- D3D9 has only "
+                        "one set, so the back face uses the front's ({} such draws)",
+                        st.ref, st.mask, st.write_mask, st.ref_bf, st.mask_bf, st.write_mask_bf, k);
+          }
+        }
+      }
+    }
+  }
 
   // Blend. Separate color/alpha factors, exactly as Xenos stores them.
   const BlendState& blend = d.blend;
@@ -2656,6 +2956,10 @@ void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, Reco
   d.cull = ReadCullState(base, guest_device);
   d.alpha = ReadAlphaTestState(base, guest_device);
   d.color_write_mask = ReadColorWriteMask(base, guest_device);
+  d.poly_offset = ReadPolyOffsetState(base, guest_device);
+  d.stencil = ReadStencilState(base, guest_device);
+  d.scissor = ReadScissorState(base, guest_device);
+  NoteRenderStateCensus(base, guest_device);
 
   // Last, because the constant skip is keyed on the shader pair this resolves. Everything above
   // is a plain read of device state; this is the part that MUST stay on the guest thread.
@@ -3110,6 +3414,19 @@ void Renderer::DrawIndexedUP(const uint8_t* base, uint32_t guest_device, uint32_
   const D3DPRIMITIVETYPE host_prim = HostPrimitiveType(prim_type);
   const uint32_t prim_count = HostPrimitiveCount(prim_type, index_count);
   if (!device_ || !host_prim || !prim_count || !num_vertices) {
+    // A primitive type we do not translate was being dropped SILENTLY here, unlike every other
+    // draw path -- so a Xenos-only type (RECTLIST 8, QUADLIST 13) arriving through this entry
+    // point vanished with nothing in the log to say so, and "we never see those" could not be
+    // distinguished from "we see them and discard them without a word".
+    if (device_ && !host_prim && prim_type) {
+      static std::atomic<uint64_t> dropped{0};
+      const uint64_t k = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (k <= 4 || (k % 5000) == 0) {
+        REXGPU_WARN("nx1_d3d9: DrawIndexedUP dropped prim_type {} ({} so far) -- untranslated "
+                    "Xenos primitive (8 = RECTLIST, 13 = QUADLIST)",
+                    prim_type, k);
+      }
+    }
     return;
   }
   DrainWorker();  // inline path, not in the command list -- see Draw()

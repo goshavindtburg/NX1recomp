@@ -292,9 +292,35 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_packed_mip_offset, false, "GPU",
 /// across many textures for real reasons (transparent regions, flat maps), which is the same trap
 /// the convergence detector hit -- there, tiny solid-black images reached 8+ addresses each. So a
 /// page seen at more than kPageOriginMaxAddrs addresses is treated as legitimately shared.
+/// HARDWARE-FIDELITY CENSUS. Every entry here is a documented Xbox 360 field that we either do not
+/// apply or approximate, where the XDK says what the hardware does but nothing says whether NX1
+/// EXERCISES it. Fixing them blind is how this project has repeatedly traded one wrong case for
+/// another, so each is measured before it is acted on.
+///
+/// Deliberately accumulates OR-masks and min/max rather than logging per occurrence: the question
+/// is always "does this value ever appear", which a mask answers in a couple of instructions at a
+/// call site that already has the decoded struct in hand.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_hwcensus, false, "GPU",
+                    "Census the documented Xenos fields we do not currently honour (texel exponent "
+                    "bias, stacked textures, per-component texture signs, clamp modes and policy, "
+                    "border colour, mip filter). Decides which fidelity gaps are real for NX1");
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_pageorigin, false, "GPU",
                     "Flag decodes whose source pages were first seen under a DIFFERENT texture's "
                     "address -- automatic detection of a texture holding foreign blocks");
+/// Write a PROVENANCE MASK for each flagged texture: one pixel per block, green where the block's
+/// bytes came from this texture's own pages and red where they came from another texture's. The
+/// question this answers cannot be answered from addresses: does the SHAPE of the foreign region
+/// match the shape of the corruption on screen? If a wall is corrupt across its whole face while
+/// the mask shows one red corner, the 8.8% is not the artifact and the fault is downstream. If the
+/// shapes agree, it is.
+/// Paint every block whose source page the provenance detector flagged as foreign. The screen
+/// then answers whether those pages are the corruption, which shape-matching cannot.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_paint_foreign, false, "GPU",
+                    "Replace blocks read from another texture's page with a magenta marker. If "
+                    "the corrupt areas turn magenta, the provenance finding is the artifact");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pageorigin_dump, 0, "GPU",
+                      "Write texdump/prov_<addr>_f<frame>.bmp for this many flagged textures: one "
+                      "pixel per block, red = block read from another texture's page");
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pageorigin_pct, 10, "GPU",
                       "Report a decode when at least this percent of its pages trace to another "
                       "texture's address");
@@ -487,7 +513,14 @@ struct HostFormat {
 /// bytes under the very dword byteswap the GPU's 8in32 endian mode would apply.
 /// Xenos numbers a packed element's components from the *low* bits of the
 /// byteswapped dword, which is precisely where D3D9 reads component 0 from.
-bool PickHostFormat(uint32_t format, bool is_signed, bool is_normalized, HostFormat* out) {
+/// `swizzle` is the D3DDECLTYPE's GPUSWIZZLE field (bits 10..21), or kGpuSwizzleAbgr when the
+/// caller has no declaration to read it from. It is load-bearing for exactly one pair of types:
+/// the XDK defines D3DDECLTYPE_D3DCOLOR and D3DDECLTYPE_UBYTE4N identically -- 8_8_8_8, 8IN32,
+/// UNSIGNED, FRACTION -- and distinguishes them ONLY by ARGB vs ABGR here. Ignoring it mapped
+/// every D3DCOLOR to UBYTE4N, which hands the shader (B,G,R,A) where hardware hands it (R,G,B,A).
+/// NX1's own 8_8_8_8 declaration type (0x182886) carries 0x60A = ARGB, so this was live.
+bool PickHostFormat(uint32_t format, bool is_signed, bool is_normalized, uint32_t swizzle,
+                    HostFormat* out) {
   switch (format) {
     case kFmt_32_FLOAT:
       *out = {D3DDECLTYPE_FLOAT1, 4, 4, false};
@@ -511,6 +544,11 @@ bool PickHostFormat(uint32_t format, bool is_signed, bool is_normalized, HostFor
     case kFmt_8_8_8_8:
       if (is_signed) {
         *out = {D3DDECLTYPE_FLOAT4, 4, 16, true};
+      } else if (is_normalized && swizzle == nx1::d3d9::kGpuSwizzleArgb) {
+        // D3DCOLOR. Host D3D9's D3DDECLTYPE_D3DCOLOR has identical semantics, and after our dword
+        // byteswap the bytes are already in the B,G,R,A order it expects -- an exact mapping, not
+        // an approximation.
+        *out = {D3DDECLTYPE_D3DCOLOR, 4, 4, false};
       } else {
         *out = {is_normalized ? D3DDECLTYPE_UBYTE4N : D3DDECLTYPE_UBYTE4, 4, 4, false};
       }
@@ -1071,6 +1109,267 @@ constexpr uint32_t PhysicalAddress(uint32_t address) { return address & 0x1FFFFF
 /// non-zero only for a packed mip tail: once a level shrinks to 16 texels or less, Xenos
 /// stops giving it its own image and parks it alongside its siblings inside one 32x32-block
 /// tile (see TextureInfo::GetPackedTileOffset).
+/// CAUSAL TEST FOR THE PROVENANCE FINDING. Set to the foreign-page list for the texture about to
+/// be detiled; every block whose SOURCE lands in one of those pages is replaced with a solid
+/// marker instead of the real data. Then the screen answers the question directly:
+///
+///   corrupt areas turn magenta -> the pages the detector flags ARE the corruption
+///   corruption survives, magenta lands elsewhere -> the detector measures something benign
+///
+/// Needed because the mask/screenshot "match" argued from SHAPE, and a page boundary in a tiled
+/// texture is always a horizontal band -- so any page-granular effect produces bands on both
+/// sides. Shape agreement there is structurally guaranteed and proves nothing about cause.
+///
+/// Patched inside DetileMip2D because every decode path (colour-swizzle, DXN, BC-alpha, direct BC,
+/// mip-staged) funnels through it, so one hook covers every format without touching each branch.
+const std::vector<uint32_t>* g_paint_pages = nullptr;
+
+/// Write a visually loud block in whatever format the scratch holds. Not exact per format -- the
+/// point is "obviously not the texture".
+inline void PaintMarkerBlock(uint8_t* d, uint32_t bytes_per_block) {
+  switch (bytes_per_block) {
+    case 8:  // DXT1 / DXT3A / DXT5A / CTX1: two identical magenta 5-6-5 endpoints, zero indices
+      d[0] = 0x1F; d[1] = 0xF8; d[2] = 0x1F; d[3] = 0xF8;
+      d[4] = d[5] = d[6] = d[7] = 0;
+      break;
+    case 16:  // DXT2_3 / DXT4_5 / DXN: opaque alpha half, then the same magenta colour block
+      d[0] = 0xFF; d[1] = 0xFF;
+      for (uint32_t i = 2; i < 8; ++i) d[i] = 0;
+      d[8] = 0x1F; d[9] = 0xF8; d[10] = 0x1F; d[11] = 0xF8;
+      d[12] = d[13] = d[14] = d[15] = 0;
+      break;
+    default:  // uncompressed: fill the texel with magenta in any channel order
+      for (uint32_t i = 0; i < bytes_per_block; ++i) d[i] = (i & 1) ? 0x00 : 0xFF;
+      break;
+  }
+}
+
+/// Counted, because "no magenta on screen" has two completely different meanings and the screen
+/// cannot tell them apart: the marker never got written (instrument broken or not reaching these
+/// textures), or it was written into textures that were not in view. Without this the first run of
+/// this test was unreadable.
+std::atomic<uint64_t> g_painted_blocks{0};
+std::atomic<uint64_t> g_painted_textures{0};
+
+inline bool PaintThisBlock(uint32_t src_off) {
+  if (!g_paint_pages) {
+    return false;
+  }
+  const uint32_t pg = src_off >> 12;
+  if (std::find(g_paint_pages->begin(), g_paint_pages->end(), pg) == g_paint_pages->end()) {
+    return false;
+  }
+  g_painted_blocks.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+/// BYTE EXTENT OF A TILED SURFACE -- which is NOT block_pitch_h * block_pitch_v * bpb.
+///
+/// The XDK ships `XGAddress2DTiledExtent` precisely because that area formula is wrong: it
+/// documents the result as "the maximum texel offset that can be referenced by a fetch into the
+/// surface", to sub-tile granularity (8x8 for 1 byte/block, 8x4 for 2). For 1- and 2-byte blocks
+/// the tiled address scatters BEYOND the area -- a 32x32-block 1-bpb surface addresses 2560 bytes
+/// where the area is only 1024. Sizing our snapshot from the area therefore has DetileMip2D read
+/// up to ~1.5 KB past the end of our own allocation.
+///
+/// Computed here rather than guessed, using our own GetTiledOffset2D -- already verified
+/// algebraically equivalent to XGAddress2DTiledOffset. Note the periodic decomposition the fast
+/// detile path uses is documented as exact only for bpb_log2 >= 2, i.e. exactly NOT the case that
+/// needs this, so the max is taken over the real grid.
+///
+/// For 4 bytes/block and up the extent equals the area (measured across pitches and shapes), so
+/// those short-circuit and cost nothing. The 1/2-byte cases are cached because the answer depends
+/// only on the layout, never on the texture.
+/// EVERY address the guest has ever handed to Resolve/ResolveEx, recorded BEFORE any accept or
+/// reject decision. This is deliberately not the resolve MAP: the map holds destinations we
+/// successfully took, and the failure mode under investigation is a destination we saw and then
+/// dropped (zero extent, no device yet, wrong window) or keyed in a way a later texture bind
+/// cannot match. Those are invisible if you only ever look at what the map contains.
+///
+/// A handful of entries in practice (8-13), so a linear scan at decode time is free.
+struct ResolveDestSpan {
+  uint32_t first_page, last_page;
+};
+std::mutex g_resolve_seen_m;
+std::vector<ResolveDestSpan> g_resolve_seen;
+
+void NoteResolveDestSeen(uint32_t dest_address, uint64_t bytes) {
+  if (!dest_address) {
+    return;
+  }
+  const uint32_t phys = dest_address & 0x1FFFFFFF;
+  const uint32_t first = phys >> 12;
+  const uint32_t last = uint32_t((phys + (bytes ? bytes - 1 : 0)) >> 12);
+  std::lock_guard<std::mutex> lk(g_resolve_seen_m);
+  for (const auto& s : g_resolve_seen) {
+    if (s.first_page == first && s.last_page == last) {
+      return;
+    }
+  }
+  if (g_resolve_seen.size() < 512) {
+    g_resolve_seen.push_back({first, last});
+  }
+}
+
+/// Does any page of this texture fall inside a region the guest ever resolved into?
+bool OverlapsResolveDest(uint32_t phys_base, uint64_t bytes) {
+  const uint32_t first = (phys_base & 0x1FFFFFFF) >> 12;
+  const uint32_t last = uint32_t(((phys_base & 0x1FFFFFFF) + (bytes ? bytes - 1 : 0)) >> 12);
+  std::lock_guard<std::mutex> lk(g_resolve_seen_m);
+  for (const auto& s : g_resolve_seen) {
+    if (first <= s.last_page && s.first_page <= last) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// THE RENDER-TO-TEXTURE CENSUS, over every decode rather than a 16-line sample.
+///
+/// The hypothesis it exists to kill or confirm: a surface is rendered in EDRAM, resolved to main
+/// memory, and later SAMPLED as a texture -- and if we miss or mis-key that resolve, GetTexture
+/// falls through to untiling guest RAM, which holds the address's previous occupant. That renders
+/// as structured, picture-like, byte-stable foreign content, i.e. exactly the speckle signature.
+///
+/// `served` says whether this bind was actually satisfied from the resolve map. The three buckets:
+///   overlap + served   -> render-to-texture working as intended
+///   overlap + NOT served -> WE SAW THE RESOLVE AND DID NOT USE IT. This is the bug class, and it
+///                          is currently invisible: nothing else in the renderer reports it.
+///   no overlap         -> this texture is not render-to-texture at all
+///
+/// LIMIT, stated so the result is not over-read: this can only see resolves the guest routed
+/// through an entry point we hook. A resolve we never observe at all cannot appear here, and the
+/// only instrument that closes THAT gap is the reference CP's RangeWrittenByGpu census, which
+/// requires the reference to actually execute.
+void NoteResolveTextureCensus(uint32_t phys_base, uint64_t bytes, bool served) {
+  if (!REXCVAR_GET(nx1_d3d9_dbg_hwcensus)) {
+    return;
+  }
+  static std::atomic<uint64_t> overlap_served{0}, overlap_unserved{0}, no_overlap{0}, n{0};
+  if (OverlapsResolveDest(phys_base, bytes)) {
+    if (served) {
+      overlap_served.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      const uint64_t k = overlap_unserved.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (k <= 8 || (k % 5000) == 0) {
+        REXGPU_WARN("nx1_d3d9: RTTMISS texture {:08X} ({} bytes) overlaps a region the guest "
+                    "RESOLVED into, yet this bind was NOT served from the resolve map -- we are "
+                    "untiling guest RAM where the rendered image should be ({} so far)",
+                    phys_base, bytes, k);
+      }
+    }
+  } else {
+    no_overlap.fetch_add(1, std::memory_order_relaxed);
+  }
+  if ((n.fetch_add(1, std::memory_order_relaxed) % 20000) == 0) {
+    size_t spans = 0;
+    {
+      std::lock_guard<std::mutex> lk(g_resolve_seen_m);
+      spans = g_resolve_seen.size();
+    }
+    REXGPU_WARN("nx1_d3d9: HWCENSUS rtt: {} decodes overlap a resolved region and WERE served, {} "
+                "overlap and were NOT ({} = the render-to-texture bug class), {} do not overlap at "
+                "all. {} distinct resolve destinations observed. Only a NON-ZERO unserved count "
+                "implicates EDRAM/render-to-texture in the speckle",
+                overlap_served.load(), overlap_unserved.load(), overlap_unserved.load(),
+                no_overlap.load(), spans);
+  }
+}
+
+/// See nx1_d3d9_dbg_hwcensus. Called with each bound texture's decoded fetch constant.
+void NoteHwCensus(const nx1::d3d9::TextureFetchConstant& t) {
+  if (!REXCVAR_GET(nx1_d3d9_dbg_hwcensus)) {
+    return;
+  }
+  static std::atomic<uint32_t> exp_seen{0}, stacked_seen{0}, sign_mask{0}, clamp_mask{0};
+  static std::atomic<uint32_t> policy_mask{0}, bcolor_mask{0}, mipfilter_mask{0}, border_seen{0};
+  static std::atomic<uint32_t> lodbias_seen{0}, gradexp_seen{0}, bcw_seen{0};
+  static std::atomic<uint64_t> n{0};
+  const auto orin = [](std::atomic<uint32_t>& a, uint32_t bits) {
+    if (bits && (a.load(std::memory_order_relaxed) & bits) != bits) {
+      a.fetch_or(bits, std::memory_order_relaxed);
+    }
+  };
+  if (t.exp_adjust) exp_seen.fetch_add(1, std::memory_order_relaxed);
+  if (t.stacked) stacked_seen.fetch_add(1, std::memory_order_relaxed);
+  if (t.border) border_seen.fetch_add(1, std::memory_order_relaxed);
+  if (t.lod_bias) lodbias_seen.fetch_add(1, std::memory_order_relaxed);
+  if (t.grad_exp_h || t.grad_exp_v) gradexp_seen.fetch_add(1, std::memory_order_relaxed);
+  if (t.force_bcw_to_max) bcw_seen.fetch_add(1, std::memory_order_relaxed);
+  orin(sign_mask, (1u << t.sign[0]) | (1u << t.sign[1]) | (1u << t.sign[2]) | (1u << t.sign[3]));
+  orin(clamp_mask, (1u << t.clamp_u) | (1u << t.clamp_v) | (1u << t.clamp_w));
+  orin(policy_mask, 1u << t.clamp_policy);
+  orin(bcolor_mask, 1u << t.border_color);
+  orin(mipfilter_mask, 1u << t.mip_filter);
+  // WHICH (FORMAT, SWIZZLE) PAIRS ACTUALLY OCCUR. A swizzle we drop only matters if the title
+  // binds it, and the paths differ sharply in what they honour: the 32-bit path applies the full
+  // per-texel permutation, BC luminance-broadcast textures are decoded to ARGB with the swizzle
+  // applied, but a BC COLOUR texture with a non-identity, non-broadcast swizzle stays compressed
+  // and is sampled RGBA -- dropping it silently. This enumerates the real population so that gap
+  // can be sized instead of argued about.
+  {
+    static std::mutex pm;
+    static std::vector<uint32_t> pairs;  // format << 16 | swizzle
+    const uint32_t key = (t.format << 16) | (t.swizzle & 0xFFFF);
+    std::lock_guard<std::mutex> lk(pm);
+    if (std::find(pairs.begin(), pairs.end(), key) == pairs.end() && pairs.size() < 64) {
+      pairs.push_back(key);
+      std::string all;
+      for (const uint32_t k : pairs) {
+        all += fmt::format("f{}:{:03X} ", k >> 16, k & 0xFFFF);
+      }
+      REXGPU_WARN("nx1_d3d9: HWCENSUS swizzle pairs (format:swizzle) -- {}. 0x688 = identity "
+                  "(ABGR), 0x60A = ARGB. A BLOCK-COMPRESSED format (18/19/20/49/58/59/60) paired "
+                  "with anything other than identity or a broadcast is a swizzle we DROP",
+                  all);
+    }
+  }
+  if ((n.fetch_add(1, std::memory_order_relaxed) % 20000) == 0) {
+    REXGPU_WARN(
+        "nx1_d3d9: HWCENSUS tex: exp_adjust!=0 {}x | stacked {}x | border {}x | lod_bias!=0 {}x | "
+        "grad_exp!=0 {}x | force_bcw {}x | sign values 0x{:X} (bit n = mode n; 2=biased 1=signed) "
+        "| clamp modes 0x{:X} (bits 4/5/6/7 = the BORDER modes) | clamp_policy 0x{:X} (bit1 = OGL, "
+        "which demotes borders to clamp) | border_color 0x{:X} | mip_filter 0x{:X} (bit2 = BASEMAP)",
+        exp_seen.load(), stacked_seen.load(), border_seen.load(), lodbias_seen.load(),
+        gradexp_seen.load(), bcw_seen.load(), sign_mask.load(), clamp_mask.load(),
+        policy_mask.load(), bcolor_mask.load(), mipfilter_mask.load());
+  }
+}
+
+uint32_t TiledSurfaceExtentBytes(uint32_t pitch_blocks, uint32_t rows_blocks, uint32_t bpb) {
+  const size_t area = size_t(pitch_blocks) * rows_blocks * bpb;
+  if (bpb >= 4 || !pitch_blocks || !rows_blocks) {
+    return uint32_t(area);
+  }
+  const uint64_t key = (uint64_t(pitch_blocks) << 40) ^ (uint64_t(rows_blocks) << 8) ^ bpb;
+  static std::mutex m;
+  static std::unordered_map<uint64_t, uint32_t> cache;
+  {
+    std::lock_guard<std::mutex> lk(m);
+    const auto it = cache.find(key);
+    if (it != cache.end()) {
+      return it->second;
+    }
+  }
+  namespace tu = rex::graphics::texture_util;
+  const uint32_t bpb_log2 = Log2Exact(bpb);
+  uint32_t max_end = uint32_t(area);
+  for (uint32_t by = 0; by < rows_blocks; ++by) {
+    for (uint32_t bx = 0; bx < pitch_blocks; ++bx) {
+      const uint32_t end =
+          uint32_t(tu::GetTiledOffset2D(int32_t(bx), int32_t(by), pitch_blocks, bpb_log2)) + bpb;
+      if (end > max_end) {
+        max_end = end;
+      }
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(m);
+    cache[key] = max_end;
+  }
+  return max_end;
+}
+
 void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
                  const rex::graphics::TextureExtent& extent, uint32_t bytes_per_block,
                  uint32_t endian, bool tiled, uint32_t offset_x = 0, uint32_t offset_y = 0) {
@@ -1119,7 +1418,9 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
           const uint32_t x = offset_x + bx;
           const uint32_t src_off = uint32_t(row_tab[x & 31]) + (x >> 5) * macro_stride + row_macro;
           uint8_t* d = dst_row + size_t(bx) * bytes_per_block;
-          if (swap) {
+          if (PaintThisBlock(src_off)) {
+            PaintMarkerBlock(d, bytes_per_block);
+          } else if (swap) {
             tc::CopySwapBlock(xe_endian, d, src + src_off, bytes_per_block);
           } else {
             std::memcpy(d, src + src_off, bytes_per_block);
@@ -1132,8 +1433,12 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
         for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
           const int32_t src_off = tu::GetTiledOffset2D(
               int32_t(offset_x + bx), int32_t(offset_y + by), pitch_blocks, bpb_log2);
-          tc::CopySwapBlock(xe_endian, dst_row + size_t(bx) * bytes_per_block, src + src_off,
-                            bytes_per_block);
+          uint8_t* d = dst_row + size_t(bx) * bytes_per_block;
+          if (PaintThisBlock(uint32_t(src_off))) {
+            PaintMarkerBlock(d, bytes_per_block);
+          } else {
+            tc::CopySwapBlock(xe_endian, d, src + src_off, bytes_per_block);
+          }
         }
       }
     }
@@ -1143,6 +1448,14 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
     const uint32_t row_copy = blocks_wide * bytes_per_block;
     const size_t src_origin = size_t(offset_y) * src_row_bytes + size_t(offset_x) * bytes_per_block;
     for (uint32_t by = 0; by < blocks_high; ++by) {
+      // Linear rows are copied whole, so paint per row when that row's page is flagged.
+      if (PaintThisBlock(uint32_t(src_origin + size_t(by) * src_row_bytes))) {
+        for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
+          PaintMarkerBlock(dst + size_t(by) * dst_row_bytes + size_t(bx) * bytes_per_block,
+                           bytes_per_block);
+        }
+        continue;
+      }
       tc::CopySwapBlock(xe_endian, dst + size_t(by) * dst_row_bytes,
                         src + src_origin + size_t(by) * src_row_bytes, row_copy);
     }
@@ -1152,13 +1465,24 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
 /// Untile one 3D mip slice-by-slice into `dst`, which is laid out as `depth` slices of
 /// `slice_bytes`, each `row_bytes` per block-row. Xenos tiles 3D textures in 32x32x4 blocks,
 /// so a slice is not simply a 2D mip -- GetTiledOffset3D walks it.
+/// `rows_blocks` is the SLICE STRIDE in block rows -- the tile-padded height, not the visible one.
+/// The two differ and it matters only on the linear path: the XDK requires the memory dimensions of
+/// a linear texture to be whole tiles ("The dimensions of linear textures in memory must be in
+/// terms of tiles", tile 32x32x4 for 3D), so consecutive slices are `pitch * PADDED_height` apart.
+/// Stepping by the visible height instead walks every slice after z=0 progressively short, which is
+/// wrong for any volume whose block height is not already a multiple of 32.
+///
+/// The TILED path is unaffected: GetTiledOffset3D aligns height internally (as XGAddress3DTiledOffset
+/// does with `AlignedHeight = (Height + 31) & ~31`), so padded and visible land on the same value --
+/// which is why passing the visible height went unnoticed.
 void DetileMip3D(uint8_t* dst, uint32_t row_bytes, uint32_t slice_bytes, const uint8_t* src,
                  uint32_t blocks_wide, uint32_t blocks_high, uint32_t depth, uint32_t pitch_blocks,
-                 uint32_t bytes_per_block, uint32_t endian, bool tiled) {
+                 uint32_t rows_blocks, uint32_t bytes_per_block, uint32_t endian, bool tiled) {
   namespace tu = rex::graphics::texture_util;
   namespace tc = rex::graphics::texture_conversion;
   const auto xe_endian = static_cast<rex::graphics::xenos::Endian>(endian);
   const uint32_t bpb_log2 = Log2Exact(bytes_per_block);
+  const uint32_t slice_rows = rows_blocks ? rows_blocks : blocks_high;
 
   for (uint32_t z = 0; z < depth; ++z) {
     uint8_t* slice = dst + size_t(z) * slice_bytes;
@@ -1168,7 +1492,7 @@ void DetileMip3D(uint8_t* dst, uint32_t row_bytes, uint32_t slice_bytes, const u
         const size_t src_off =
             tiled ? size_t(tu::GetTiledOffset3D(int32_t(bx), int32_t(by), int32_t(z), pitch_blocks,
                                                 blocks_high, bpb_log2))
-                  : ((size_t(z) * blocks_high + by) * pitch_blocks + bx) * bytes_per_block;
+                  : ((size_t(z) * slice_rows + by) * pitch_blocks + bx) * bytes_per_block;
         tc::CopySwapBlock(xe_endian, row + size_t(bx) * bytes_per_block, src + src_off,
                           bytes_per_block);
       }
@@ -1176,12 +1500,24 @@ void DetileMip3D(uint8_t* dst, uint32_t row_bytes, uint32_t slice_bytes, const u
   }
 }
 
-/// Decode linear 4x4 single-channel BC-alpha blocks (DXT3A explicit 4-bit, or
-/// DXT5A interpolated 3-bit) into an A8R8G8B8 destination, replicating the decoded
-/// value into R=G=B=A. `src` is tightly packed blocks (8 bytes each) at
-/// `blocks_wide` per row; `width`/`height` bound the visible texels written.
+/// Decode linear 4x4 single-channel BC-alpha blocks (DXT3A explicit 4-bit, or DXT5A interpolated
+/// 3-bit) into an A8R8G8B8 destination, HONOURING the fetch constant's channel swizzle.
+///
+/// This used to replicate the decoded value into R=G=B=A, i.e. it assumed swizzle RRRR (0x000).
+/// The census says NOT ONE of this title's BC-alpha textures uses that:
+///   DXT3A 0xA00 and DXT5A 0xA00 -> RGB <- X, **A <- constant 1**  (we were writing the mask
+///     into alpha, so a texture the guest declares fully opaque came back variably transparent)
+///   DXT5A 0x16D               -> **RGB <- constant 1**, A <- X    (a pure alpha mask, whose RGB
+///     should be WHITE -- we were feeding the mask value into colour, darkening every surface
+///     that multiplies by it exactly where the mask is low)
+/// Single-channel source, so every component index resolves to the same decoded value; only the
+/// CONSTANT selectors (4 = 0, 5 = 1) actually change anything -- but as measured, those are the
+/// only selectors these textures use.
 void DecodeBCAlphaToArgb(uint8_t* dst, uint32_t dst_pitch, const uint8_t* src, uint32_t blocks_wide,
-                         uint32_t blocks_high, uint32_t width, uint32_t height, bool interpolated) {
+                         uint32_t blocks_high, uint32_t width, uint32_t height, bool interpolated,
+                         uint32_t swizzle) {
+  const uint8_t sel[4] = {uint8_t(swizzle & 7), uint8_t((swizzle >> 3) & 7),
+                          uint8_t((swizzle >> 6) & 7), uint8_t((swizzle >> 9) & 7)};
   for (uint32_t by = 0; by < blocks_high; ++by) {
     for (uint32_t bx = 0; bx < blocks_wide; ++bx) {
       const uint8_t* blk = src + (size_t(by) * blocks_wide + bx) * 8;
@@ -1217,11 +1553,15 @@ void DecodeBCAlphaToArgb(uint8_t* dst, uint32_t dst_pitch, const uint8_t* src, u
           const uint32_t px = bx * 4 + tx;
           if (px >= width) break;
           const uint8_t v = a[ty * 4 + tx];
+          // Component indices 0-3 all resolve to `v` (single channel); 4 = constant 0, 5 = 1.
+          const auto pick = [v](uint8_t s) -> uint8_t {
+            return s == 4 ? 0x00 : (s == 5 ? 0xFF : v);
+          };
           uint8_t* p = row + size_t(px) * 4;
-          p[0] = v;  // B
-          p[1] = v;  // G
-          p[2] = v;  // R
-          p[3] = v;  // A
+          p[0] = pick(sel[2]);  // B <- swizzle.z
+          p[1] = pick(sel[1]);  // G <- swizzle.y
+          p[2] = pick(sel[0]);  // R <- swizzle.x
+          p[3] = pick(sel[3]);  // A <- swizzle.w
         }
       }
     }
@@ -1429,12 +1769,16 @@ void DecodeBcColorSwizzledToArgb(uint8_t* dst, uint32_t dst_pitch, const uint8_t
           const uint32_t px = bx * 4 + tx;
           if (px >= width) break;
           const Rgba8& c = tex[ty * 4 + tx];
-          const uint8_t comp[8] = {c.r, c.g, c.b, c.a, 0, 255, 0, 0};
+          // Indices 6 and 7 held 0 here, so GPUSWIZZLE_KEEP (7) forced the channel BLACK. KEEP is
+          // documented "Fetch instructions only" and has no meaning in a fetch constant, so the
+          // safe degradation is pass-through, not a dropped channel -- matching SwizzleSelect on
+          // the 32-bit path.
+          const uint8_t comp[8] = {c.r, c.g, c.b, c.a, 0, 255, c.r, c.r};
           uint8_t* p = row + size_t(px) * 4;
-          p[0] = comp[sel[2]];  // B <- swizzle.z
-          p[1] = comp[sel[1]];  // G <- swizzle.y
-          p[2] = comp[sel[0]];  // R <- swizzle.x
-          p[3] = comp[sel[3]];  // A <- swizzle.w
+          p[0] = sel[2] > 5 ? c.b : comp[sel[2]];  // B <- swizzle.z
+          p[1] = sel[1] > 5 ? c.g : comp[sel[1]];  // G <- swizzle.y
+          p[2] = sel[0] > 5 ? c.r : comp[sel[0]];  // R <- swizzle.x
+          p[3] = sel[3] > 5 ? c.a : comp[sel[3]];  // A <- swizzle.w
         }
       }
     }
@@ -1718,13 +2062,32 @@ Swizzle32 MakeSwizzle32(uint32_t swizzle) {
 }
 
 /// Apply `s` in place over a run of 32-bit texels.
+///
+/// Selector handling, per the XDK's GPUSWIZZLE: 0-3 pick a component, 4 is constant 0, 5 is
+/// constant 1. 7 is KEEP, which the header marks "Fetch instructions only" -- it means "leave this
+/// channel to the fetch INSTRUCTION", so it has no defined meaning in a fetch constant. It used to
+/// fall into the same bucket as constant-0 and force the channel to BLACK, which is the worst
+/// available guess: pass the component through instead, so an unexpected value degrades to
+/// identity rather than to a missing channel.
+inline uint8_t SwizzleSelect(uint8_t sel, const uint8_t in[4], uint32_t dst_index) {
+  if (sel < 4) {
+    return in[sel];
+  }
+  if (sel == 4) {
+    return 0x00;  // GPUSWIZZLE_0
+  }
+  if (sel == 5) {
+    return 0xFF;  // GPUSWIZZLE_1
+  }
+  return in[dst_index < 4 ? dst_index : 0];  // KEEP / reserved -> pass through
+}
+
 void SwizzleRow32(uint8_t* row, uint32_t texels, const Swizzle32& s) {
   for (uint32_t i = 0; i < texels; ++i) {
     uint8_t* p = row + size_t(i) * 4;
     const uint8_t in[4] = {p[0], p[1], p[2], p[3]};
     for (uint32_t d = 0; d < 4; ++d) {
-      const uint8_t c = s.src[d];
-      p[d] = c < 4 ? in[c] : (c == 5 ? 0xFF : 0x00);
+      p[d] = SwizzleSelect(s.src[d], in, d);
     }
   }
 }
@@ -1997,7 +2360,7 @@ const VertexLayout* ResourceTracker::GetVertexLayout(const uint8_t* base, uint32
       break;
     }
     HostFormat host_format;
-    if (!PickHostFormat(e.format, e.is_signed, e.is_normalized, &host_format)) {
+    if (!PickHostFormat(e.format, e.is_signed, e.is_normalized, e.swizzle, &host_format)) {
       if ((unsupported_formats_++ % 100) == 0) {
         REXGPU_WARN("nx1_d3d9: unsupported Xenos vertex format {} (signed={}, normalized={})",
                     e.format, e.is_signed, e.is_normalized);
@@ -2135,7 +2498,15 @@ const VertexLayout* ResourceTracker::GetShaderVertexLayout(const uint8_t* base, 
           Nx1RawVertexUsage(ordinal++, format, packed_count, texcoord_count, color_count);
 
       HostFormat host_format;
-      if (!PickHostFormat(format, is_signed, is_normalized, &host_format)) {
+      // The vfetch instruction carries its OWN swizzle (GPUVERTEX_FETCH_INSTRUCTION SwizzleX..W),
+      // spliced in from the declaration by PatchVertexShaderToMatchVertexDeclaration -- but the
+      // analyzer's attribute view does not surface it, so this path cannot tell D3DCOLOR from
+      // UBYTE4N. Passing ABGR keeps the previous behaviour rather than guessing; a D3DCOLOR
+      // element reaching a draw through the shader-derived layout (bound streams with no
+      // CVertexDeclaration) still gets R and B exchanged. Fixing it needs the swizzle threaded
+      // out of the fetch instruction.
+      if (!PickHostFormat(format, is_signed, is_normalized, nx1::d3d9::kGpuSwizzleAbgr,
+                          &host_format)) {
         if ((unsupported_formats_++ % 100) == 0) {
           REXGPU_WARN("nx1_d3d9: unsupported Xenos vfetch format {} (signed={}, normalized={})",
                       format, is_signed, is_normalized);
@@ -2469,6 +2840,10 @@ void ResourceTracker::LogCacheStats() {
                 tex_bytes / (1024 * 1024), vb_bytes / (1024 * 1024), vb_max / 1024, pending,
                 detile_scratch_.size() / 1024, (mirror_pages_valid * 4096) / (1024 * 1024));
   }
+  REXGPU_INFO("nx1_d3d9: BORDER {} decodes declare a border -- the XDK untiler takes the border "
+              "flag as a required argument and ours ignores it, so nonzero here is a real gap in "
+              "our layout model (zero means it is theoretical)",
+              border_decodes_);
   REXGPU_INFO("nx1_d3d9: packedmip enabled={} small_decodes={} packed_decodes={} offsets_applied={}"
               " ({})",
               REXCVAR_GET(nx1_d3d9_packed_mip_offset) ? 1 : 0, small_decodes_, packed_decodes_,
@@ -2585,22 +2960,89 @@ void ResourceTracker::InvalidateGuestRange(uint32_t phys, uint32_t bytes) {
 /// converge. This one finds the corrupt texture itself: the corrupt images show rectangular blocks
 /// of OTHER textures' content, and that is a checkable claim.
 void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
-                                     const TextureFetchConstant& t, uint32_t height) {
+                                     const TextureFetchConstant& t, uint32_t height,
+                                     uint32_t block_width, uint32_t block_height,
+                                     uint32_t block_pitch_h, uint32_t bpb) {
   if (!src || !REXCVAR_GET(nx1_d3d9_dbg_pageorigin) || guest_bytes < 4096) {
+    return;
+  }
+  // ONLY THE PAGES A FETCH ACTUALLY READS. The first version of this walked every page of the
+  // DECLARED extent and reported 22.7% of decodes as holding another texture's content -- which
+  // was true and meaningless, because the alignment gaps in a texture allocation are precisely
+  // the offsets no fetch references, and the XDK documents the guest as packing other data into
+  // them (XGAddress2DTiledExtent: "unused memory regions ... you might want to reclaim").
+  //
+  // The question that matters is narrower: of the bytes we ACTUALLY DECODE, does any come from
+  // another texture? Walk the real block addresses -- the same ones DetileMip2D reads -- and
+  // check only the pages they land in. Foreign content here is corruption, not packing.
+  std::vector<uint32_t> touched;
+  {
+    const uint32_t bw = block_width, bh = block_height;
+    if (!bw || !bh) {
+      return;
+    }
+    touched.reserve(64);
+    uint32_t last = UINT32_MAX;
+    auto note = [&](size_t off) {
+      const uint32_t pg = uint32_t(off >> 12);
+      if (pg != last) {  // cheap dedupe: consecutive blocks usually share a page
+        last = pg;
+        if (std::find(touched.begin(), touched.end(), pg) == touched.end()) touched.push_back(pg);
+      }
+    };
+    if (t.tiled) {
+      const uint32_t bpb_log2 = Log2Exact(bpb);
+      for (uint32_t by = 0; by < bh; ++by) {
+        for (uint32_t bx = 0; bx < bw; ++bx) {
+          note(size_t(uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+              int32_t(bx), int32_t(by), block_pitch_h, bpb_log2))));
+        }
+      }
+    } else {
+      const uint32_t src_row = block_pitch_h * bpb;
+      for (uint32_t by = 0; by < bh; ++by) {
+        const size_t row = size_t(by) * src_row;
+        for (size_t o = row; o < row + size_t(bw) * bpb; o += 4096) note(o);
+        note(row + size_t(bw) * bpb - 1);
+      }
+    }
+  }
+  if (touched.empty()) {
     return;
   }
   const uint32_t self = PhysicalAddress(t.base_address);
   uint32_t pages = 0, foreign = 0, named = 0;
   uint32_t from_addr[8] = {};
   uint32_t from_page[8] = {};
-  for (size_t off = 0; off + 4096 <= guest_bytes; off += 4096) {
+  std::vector<uint32_t> foreign_pages;
+  for (const uint32_t pg : touched) {
+    const size_t off = size_t(pg) << 12;
+    if (off + 4096 > guest_bytes) {
+      continue;
+    }
     // Strided hash: identifying a page's content does not need every byte, and hashing all of
     // them for every decode is real bandwidth.
     uint64_t h = 1469598103934665603ull;
+    uint64_t first = 0;
+    bool uniform = true;
     for (uint32_t i = 0; i < 4096; i += 64) {
       uint64_t v;
       std::memcpy(&v, src + off + i, sizeof(v));
+      if (i == 0) {
+        first = v;
+      } else if (v != first) {
+        uniform = false;
+      }
       h = (h ^ v) * 1099511628211ull;
+    }
+    // A UNIFORM PAGE PROVES NOTHING ABOUT PROVENANCE. Solid-black and fully-transparent regions
+    // are everywhere in this content, and two unrelated textures sharing one is coincidence, not
+    // theft -- the same trap that made the convergence detector report tiny shared dummy maps as
+    // corruption. The >3-address filter does not catch it either: a blank page present in exactly
+    // two textures passes. Excluded, and counted so the filter's own impact is visible.
+    if (uniform) {
+      ++pageorigin_uniform_skipped_;
+      continue;
     }
     ++pages;
     auto& po = page_origin_[h];
@@ -2612,6 +3054,7 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
       // A page reached by many addresses is legitimately shared (blank/uniform), not stolen.
       if (po.addr_count <= kPageOriginMaxAddrs) {
         ++foreign;
+        foreign_pages.push_back(pg);
         if (named < 8) {
           from_addr[named] = po.first_addr;
           from_page[named] = uint32_t(off >> 12);
@@ -2620,39 +3063,215 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
       }
     }
   }
-  if (pages && foreign * 100 / pages >= REXCVAR_GET(nx1_d3d9_dbg_pageorigin_pct)) {
+  // RELOCATION IS NOT CORRUPTION. The dominant pattern is ALL pages foreign from ONE donor, which
+  // is a texture the image cache MOVED between pool slots -- exactly what ImageCache_DmaCopy does.
+  // The content at the new address really is that image; it only looks foreign because we recorded
+  // its hash at the old address first. (The kPageOriginMaxAddrs filter misses this: a relocation
+  // touches exactly two addresses, so it passes.)
+  //
+  // A MIXTURE cannot be explained that way: some pages this texture's, some another's, or pages
+  // from several different donors. That is a slot holding parts of more than one image, which is
+  // the artifact. Count the two separately or the benign case buries the interesting one.
+  uint32_t distinct = 0;
+  for (uint32_t i = 0; i < named; ++i) {
+    bool seen = false;
+    for (uint32_t j = 0; j < i; ++j) seen |= from_addr[j] == from_addr[i];
+    if (!seen) ++distinct;
+  }
+  const bool whole_texture_move = foreign == pages && distinct <= 1;
+  if (whole_texture_move) {
+    ++pageorigin_relocated_;
+  }
+  if (pages && foreign && !whole_texture_move &&
+      foreign * 100 / pages >= REXCVAR_GET(nx1_d3d9_dbg_pageorigin_pct)) {
     ++pageorigin_flagged_;
     if (pageorigin_flagged_ <= 16) {
       std::string from;
       for (uint32_t i = 0; i < named; ++i) {
         from += fmt::format("p{}<-{:08X} ", from_page[i], from_addr[i]);
       }
-      // EXTENT OVERRUN, stated numerically. Every donor address observed so far equals this
-      // texture's base plus the offset of the foreign page -- i.e. a real texture BEGINS inside
-      // the range we computed for this one, which means our extent exceeds the guest's actual
-      // allocation and the decode reads its neighbours. Report the inputs that produce that
-      // extent (pitch, tiling) next to the minimum the image itself needs, so the padding rule
-      // responsible is visible rather than inferred.
-      uint64_t min_bytes = 0;
-      if (const auto* fi = rex::graphics::FormatInfo::Get(t.format)) {
-        const uint32_t bw = (t.width + fi->block_width - 1) / fi->block_width;
-        const uint32_t bh = (height + fi->block_height - 1) / fi->block_height;
-        min_bytes = uint64_t(bw) * bh * fi->bytes_per_block();
-      }
-      REXGPU_WARN("nx1_d3d9: PAGEORIGIN {:08X} {}x{} fmt={} tiled={} pitch_px={} -- {} of {} "
-                  "source pages hold content FIRST SEEN under another texture's address [{}]. We "
-                  "read {} bytes where the image itself needs {} ({}x). Donor == base+page_offset "
-                  "means a real texture BEGINS inside our extent",
+      // These are FETCHED offsets, computed with the same GetTiledOffset2D calls DetileMip2D
+      // makes -- not the declared extent. The alignment gaps, which the XDK says the guest packs
+      // other data into, are excluded by construction. So foreign content counted here is data
+      // reaching real texels, which is the artifact itself rather than a map of guest packing.
+      REXGPU_WARN("nx1_d3d9: PAGEORIGIN MIXED {:08X} {}x{} fmt={} tiled={} pitch_px={} -- {} of {} "
+                  "pages WE ACTUALLY READ come from {} other address(es) [{}]. Not a relocation "
+                  "(that moves ALL pages from ONE donor) and not an alignment gap: this slot holds "
+                  "parts of more than one image",
                   t.base_address, t.width, height, t.format, t.tiled ? 1 : 0, t.pitch_pixels,
-                  foreign, pages, from, guest_bytes, min_bytes,
-                  min_bytes ? guest_bytes / min_bytes : 0);
+                  foreign, pages, distinct, from);
+      // DID THE COPY THAT FILLED THIS SLOT COVER THE WHOLE TEXTURE? The masks show half the pages
+      // holding the previous occupant, which is what an UNDER-SIZED copy produces. The delayed
+      // path takes its size from the low half of a packed ImageAllocInfo; the high half is the
+      // other candidate, and the choice was verified against exactly one destination. If bytes <
+      // the texture's extent here -- and especially if `alt` matches that extent -- the size
+      // choice is wrong for this class of image and that is the whole bug.
+      // WERE THE FOREIGN PAGES EVER WRITTEN FOR THIS TEXTURE? page_writes_ counts everything we
+      // can see: guest CPU writes via the watch, plus our own mirrored copies. Comparing the
+      // foreign pages against this texture's OWN pages separates the two remaining explanations,
+      // which no other measurement here can tell apart:
+      //   foreign pages ~0 writes, own pages > 0  -> that part of the texture NEVER ARRIVED. The
+      //     slot still holds the previous occupant because nothing ever delivered the rest.
+      //   foreign pages written as much as own    -> the data DID arrive and is simply wrong,
+      //     which puts this back on identity rather than delivery.
+      uint64_t fw = 0, ow = 0;
+      uint32_t fn = 0, on = 0;
+      for (const uint32_t pg : touched) {
+        const uint32_t w = PageWriteCount(uint32_t(self + (size_t(pg) << 12)));
+        const bool bad =
+            std::find(foreign_pages.begin(), foreign_pages.end(), pg) != foreign_pages.end();
+        if (bad) { fw += w; ++fn; } else { ow += w; ++on; }
+      }
+      // NOT A COUNT -- a saturated flag. The write-watch fires on a page's FIRST write and then
+      // leaves the page writable, so every written page reports exactly 1 forever. Measured: these
+      // read `1 over 1`, `18 over 18`, `16 over 16` -- foreign and own alike, always equal. The
+      // earlier reading of this line ("foreign~0 with own>0 means that part NEVER ARRIVED") could
+      // therefore never have discriminated anything, and is retracted. Kept only as a
+      // has-this-page-ever-been-CPU-written bit, which is how the unexplained-content test below
+      // uses it.
+      REXGPU_WARN("nx1_d3d9:   ^ pages ever CPU-written (saturating flag, NOT a count): foreign "
+                  "{} of {}, own {} of {}",
+                  fw, fn, ow, on);
+      // PER-PAGE COVERAGE, asked of the FOREIGN pages themselves.
+      //
+      // This previously looked up the texture's BASE page and printed the answer as if it were
+      // about the foreign ones. For a texture whose foreign pages sit 12 pages in, that is simply a
+      // different question, and it is where "no mirrored copy recorded" -- 14 of the 16 sampled
+      // verdicts -- came from. Two other suspected defects were checked and cleared: the map's
+      // 400,000-entry cap cannot bind (the destination histogram spans 16 x 16 MB regions, so the
+      // map tops out near 65,536 pages, and it now warns if it ever does), and coverage being
+      // recorded before MirrorDmaCopy's size gate is latent only, since DMAGATE measures zero.
+      //
+      // The three outcomes are genuinely different diagnoses:
+      //   NEVER TARGETED -- no image-cache copy ever addressed this page. Expected and BENIGN for a
+      //     streamer-loaded texture (DB_ReadStreamFile writes texels straight into the pool with a
+      //     CPU copy; regions 06x/07x take zero DMA all run). Only meaningful for a moved image.
+      //   SPANNED, NEVER WRITTEN -- a copy covered this page and our per-page empty-source skip
+      //     declined it, leaving the previous occupant. That is a hole we create.
+      //   WRITTEN -- we did land bytes here and they are still another texture's, which moves the
+      //     fault upstream to what the SOURCE held.
+      uint32_t never = 0, spanned = 0, written = 0;
+      for (const uint32_t pg : foreign_pages) {
+        switch (DmaPageVerdictFor(uint32_t(self + (size_t(pg) << 12)))) {
+          case 0: ++never; break;
+          case 1: ++spanned; break;
+          default: ++written; break;
+        }
+      }
+      uint32_t own_written = 0, own_total = 0;
+      for (const uint32_t pg : touched) {
+        if (std::find(foreign_pages.begin(), foreign_pages.end(), pg) != foreign_pages.end()) {
+          continue;
+        }
+        ++own_total;
+        if (DmaPageVerdictFor(uint32_t(self + (size_t(pg) << 12))) == 2) ++own_written;
+      }
+      REXGPU_WARN("nx1_d3d9:   ^ FOREIGN pages by coverage: {} never targeted by any copy, {} "
+                  "spanned but SKIPPED (empty source), {} actually written. Control -- this "
+                  "texture's OWN pages: {} of {} written. Read the CONTROL first: own pages also "
+                  "0 means this texture is not DMA-delivered at all (the streamer wrote it), so "
+                  "'never targeted' is expected and benign",
+                  never, spanned, written, own_written, own_total);
+      // WHO WROTE THESE BYTES AT ALL? Three mechanisms can put content at a guest address on our
+      // side: the guest's own CPU write (the write-watch sees it), our DMA mirror (the coverage
+      // map's `wrote`), and a resolve we performed. A page that holds NON-ZERO content while none
+      // of the three touched it was filled by something outside our model -- which on hardware
+      // means the GPU, i.e. a render-to-texture we never observed. That is the one form of the
+      // EDRAM hypothesis this side can test without the reference CP running.
+      //
+      // KNOWN FALSE POSITIVE, do not read a small count as proof: the write-watch is armed per
+      // range, so a page the guest wrote BEFORE we armed it reads as never-written. Treat only a
+      // large, persistent count as signal, and confirm with RangeWrittenByGpu before believing it.
+      uint32_t unexplained = 0;
+      for (const uint32_t pg : foreign_pages) {
+        const uint32_t page_addr = uint32_t(self + (size_t(pg) << 12));
+        if (PageWriteCount(page_addr) || DmaPageVerdictFor(page_addr) == 2 ||
+            OverlapsResolveDest(page_addr, 4096)) {
+          continue;
+        }
+        const size_t off = size_t(pg) << 12;
+        if (off + 4096 > guest_bytes) {
+          continue;
+        }
+        bool nonzero = false;
+        for (uint32_t i = 0; i < 4096 && !nonzero; i += 8) {
+          nonzero = src[off + i] != 0;
+        }
+        if (nonzero) {
+          ++unexplained;
+        }
+      }
+      if (unexplained) {
+        REXGPU_WARN("nx1_d3d9:   ^ {} of {} foreign pages hold content NO KNOWN WRITER produced "
+                    "(not CPU-written, not DMA-written, not a resolve destination). Candidate for "
+                    "a render-to-texture we never observed -- but the write-watch arms late, so "
+                    "confirm against the reference's RangeWrittenByGpu before believing it",
+                    unexplained, foreign_pages.size());
+      }
     }
+    // THE SHAPE, not just the count. One pixel per block: red where that block's bytes came from
+    // another texture's page, green where they came from this texture's own. Compare the shape
+    // against the corruption on screen -- that is the step no amount of address arithmetic can
+    // substitute for, and it is what decides whether this 8.8% is the artifact.
+    if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_pageorigin_dump)) {
+      REXCVAR_SET(nx1_d3d9_dbg_pageorigin_dump, budget - 1);
+      const uint32_t bw = block_width, bh = block_height;
+      std::vector<Rgba8> mask(size_t(bw) * bh);
+      const uint32_t bpb_log2 = Log2Exact(bpb);
+      for (uint32_t by = 0; by < bh; ++by) {
+        for (uint32_t bx = 0; bx < bw; ++bx) {
+          size_t off;
+          if (t.tiled) {
+            off = size_t(uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+                int32_t(bx), int32_t(by), block_pitch_h, bpb_log2)));
+          } else {
+            off = size_t(by) * block_pitch_h * bpb + size_t(bx) * bpb;
+          }
+          const uint32_t pg = uint32_t(off >> 12);
+          const bool bad =
+              std::find(foreign_pages.begin(), foreign_pages.end(), pg) != foreign_pages.end();
+          mask[size_t(by) * bw + bx] =
+              bad ? Rgba8{255, 40, 40, 255} : Rgba8{40, 160, 40, 255};
+        }
+      }
+      char p[256];
+      std::snprintf(p, sizeof(p), "texdump/prov_%08X_f%llu.bmp", t.base_address,
+                    static_cast<unsigned long long>(frame_));
+      DumpRgbaBmp(p, mask, bw, bh);
+      REXGPU_WARN("nx1_d3d9: PAGEORIGIN dumped provenance mask -> {} ({}x{} blocks, red = read "
+                  "from another texture)",
+                  p, bw, bh);
+    }
+  }
+  // Hand the flagged pages to the detiler for this texture only. Whole-texture relocations are
+  // deliberately excluded: painting those would light up half the world in magenta and drown the
+  // case under test.
+  if (REXCVAR_GET(nx1_d3d9_dbg_paint_foreign) && !whole_texture_move && foreign) {
+    paint_pages_ = foreign_pages;
+    // Name the textures being painted, so "no magenta" can be checked against what was actually
+    // marked rather than guessed at -- a painted texture that is simply not on screen looks
+    // identical to a paint path that never ran.
+    if (g_painted_textures.fetch_add(1, std::memory_order_relaxed) < 12) {
+      REXGPU_WARN("nx1_d3d9: PAINT marking {:08X} {}x{} fmt={} -- {} of {} pages foreign; look for "
+                  "magenta on whatever surface uses this texture",
+                  t.base_address, t.width, height, t.format, foreign, pages);
+    }
+  } else {
+    paint_pages_.clear();
   }
   ++pageorigin_decodes_;
   if ((pageorigin_decodes_ % 2000) == 0) {
-    REXGPU_WARN("nx1_d3d9: PAGEORIGIN {} of {} decodes are built from another texture's pages -- "
-                "zero means guest memory is coherent and the fault is in the DECODE",
-                pageorigin_flagged_, pageorigin_decodes_);
+    REXGPU_WARN("nx1_d3d9: PAINT {} blocks marked across {} textures (enabled={}). Zero blocks "
+                "means the marker never reached a decode -- the instrument, not the theory. "
+                "Nonzero with no magenta on screen means those textures were not in view",
+                g_painted_blocks.load(), g_painted_textures.load(),
+                REXCVAR_GET(nx1_d3d9_dbg_paint_foreign) ? 1 : 0);
+    REXGPU_WARN("nx1_d3d9: PAGEORIGIN {} of {} decodes are MIXED (pages from several images at "
+                "fetched offsets) -- {} more are whole-texture RELOCATIONS, which are benign and "
+                "expected. Mixed==0 means every slot we decode holds exactly one image and the "
+                "fault lies downstream of the read ({} uniform pages excluded as unprovable)",
+                pageorigin_flagged_, pageorigin_decodes_, pageorigin_relocated_,
+                pageorigin_uniform_skipped_);
   }
 }
 
@@ -3425,6 +4044,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         break;  // fall through to the normal decode path
       }
       ++resolve_served_;
+      NoteResolveTextureCensus(PhysicalAddress(t.base_address), 0, true);
       if (dbg_track && t.base_address == dbg_track) {
         REXGPU_INFO("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={}", t.base_address,
                     frame_);
@@ -3888,7 +4508,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // it was aimed, real harm where it was not looked. If rebuild bursts ever do become the
   // problem, any budget needs a cold-start exemption: deferring a first sight means rendering
   // black, which is only tolerable when a stale texture already exists to show instead.
-  const size_t guest_bytes = size_t(extent.block_pitch_h) * extent.block_pitch_v * bpb;
+  // Sized by the TILED EXTENT, not the area -- for 1- and 2-byte blocks the tiled address reaches
+  // past pitch*rows*bpb and this buffer is what DetileMip2D reads through. See
+  // TiledSurfaceExtentBytes. Identical to the old value for every bpb >= 4, so BC and 32-bit
+  // textures are unaffected.
+  const size_t guest_bytes =
+      t.tiled ? TiledSurfaceExtentBytes(extent.block_pitch_h, extent.block_pitch_v, bpb)
+              : size_t(extent.block_pitch_h) * extent.block_pitch_v * bpb;
   // Decode from the CPU snapshot mirror, NOT live guest RAM. The mirror captured these bytes while
   // the texture was resident (early sweep / first touch) and holds them; live RAM would have the
   // streaming pool's transient fill by now, which is the confetti. entry.dirty (set by the write-
@@ -3966,7 +4592,29 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // or from live memory. It was originally written inside the mirror branch and therefore never
   // ran at all -- the config in use had nx1_d3d9_texture_mirror=false, so all 26,727 decodes of
   // that run took the else path and the detector reported nothing while appearing to work.
-  NotePageOrigin(src, guest_bytes, t, height);
+  // Walk the blocks that become VISIBLE TEXELS, not the padded block grid. extent.block_width is
+  // derived from the PITCH (round_up(pitch, fmt->block_width) / fmt->block_width), so for a 398
+  // wide texture with pitch 416 it spans 18 columns of padding per row -- memory that never
+  // reaches a texel and legitimately holds other data. Walking it is how the previous revision
+  // still counted padding after going to the trouble of excluding the alignment gaps.
+  const uint32_t img_bw = fmt ? std::min((t.width + fmt->block_width - 1) / fmt->block_width,
+                                         extent.block_width)
+                              : extent.block_width;
+  const uint32_t img_bh = fmt ? std::min((height + fmt->block_height - 1) / fmt->block_height,
+                                         extent.block_height)
+                              : extent.block_height;
+  NoteHwCensus(t);
+  // Reaching here means the resolve map did NOT serve this bind -- both serve paths return early.
+  // So if this texture's memory overlaps something the guest resolved into, we are untiling guest
+  // RAM where a rendered image belongs, which is the render-to-texture failure mode.
+  NoteResolveTextureCensus(PhysicalAddress(t.base_address), guest_bytes, false);
+  NotePageOrigin(src, guest_bytes, t, height, img_bw, img_bh, extent.block_pitch_h, bpb);
+  // Scoped so the list can never leak into the NEXT texture's decode -- painting the wrong
+  // texture would invalidate exactly the observation this test exists to make.
+  struct PaintScope {
+    ~PaintScope() { g_paint_pages = nullptr; }
+  } paint_scope;
+  g_paint_pages = paint_pages_.empty() ? nullptr : &paint_pages_;
   // ONLY the layout decides recreation. mip_source was added here too and had to come back out:
   // it is derived from state that can differ between binds of the same texture, so it turned
   // every such bind into a release + recreate (see the want_mips note above).
@@ -4045,6 +4693,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   if (t.width <= 16 || height <= 16) ++small_decodes_;
   if (t.packed_mips) ++packed_decodes_;
   if (packed_ox || packed_oy) ++packed_offsets_;
+  // Bordered textures are laid out WITH their border texels, and XGUntileTextureLevel takes the
+  // border flag as a required argument -- ours does not handle it at all. Count before building
+  // anything: if NX1 never sets this, the gap costs nothing and needs only a comment.
+  if (t.border) ++border_decodes_;
 
   /// Where the mip builder reads level 0 from. Defaults to the mapped surface, but the
   /// block-compressed path below redirects it to a normal-RAM copy -- see the comment there.
@@ -4080,7 +4732,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
       DecodeBCAlphaToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
                           extent.block_height, t.width, height,
-                          host.decode == TexDecode::kDXT5A);
+                          host.decode == TexDecode::kDXT5A, t.swizzle);
     } else if (build_mips) {
       // Detile into ordinary RAM and copy up, rather than writing straight into the mapped
       // surface. The mip chain below has to READ level 0 back, and `dst` is D3D9 staging
@@ -4824,7 +5476,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                     gm.ox, gm.oy);
         DecodeBCAlphaToArgb(mdst, uint32_t(mip.Pitch), scratch, gm.ext.block_width,
                             gm.ext.block_height, gm.lw, gm.lh,
-                            host.decode == TexDecode::kDXT5A);
+                            host.decode == TexDecode::kDXT5A, t.swizzle);
       } else {
         DetileMip2D(mdst, mrow, msrc, gm.ext, bpb, t.endian, t.tiled, gm.ox, gm.oy);
         if (host.swizzle32 && !mip_swz.identity) {
@@ -5276,8 +5928,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
     staging->Release();
     return nullptr;
   }
+  // block_pitch_v, not blocks_high: the slice stride is the tile-padded height. guest_bytes below
+  // already uses the padded value, so passing the visible one here made the two disagree.
   DetileMip3D(static_cast<uint8_t*>(box.pBits), uint32_t(box.RowPitch), uint32_t(box.SlicePitch),
-              src, blocks_wide, blocks_high, t.depth, extent.block_pitch_h, bpb, t.endian, t.tiled);
+              src, blocks_wide, blocks_high, t.depth, extent.block_pitch_h, extent.block_pitch_v,
+              bpb, t.endian, t.tiled);
   const Swizzle32 swz = MakeSwizzle32(t.swizzle);
   if (host.swizzle32 && !swz.identity) {
     for (uint32_t z = 0; z < t.depth; ++z) {
@@ -5496,6 +6151,9 @@ bool ResourceTracker::EnsureDepthBlit() {
 void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32_t height,
                                    IDirect3DTexture9* src_depth, const RECT& src_rect,
                                    const POINT& dest_point) {
+  // Recorded ahead of the guard for the same reason as ResolveColor: a dropped destination is
+  // still a destination the guest resolved into.
+  NoteResolveDestSeen(dest_address, uint64_t(width) * height * 4);
   if (!device_ || !resolves_ || !dest_address || !width || !height || !src_depth) {
     return;
   }
@@ -5950,6 +6608,10 @@ uint32_t ResourceTracker::DefaultPixelsAddress() {
 void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32_t height,
                                    const RECT& src_rect, const POINT& dest_point,
                                    const TextureFetchConstant& dest, bool writeback) {
+  // BEFORE the early-out, deliberately. A destination dropped here (no device yet, zero extent)
+  // is one the guest DID resolve into and we did not record -- exactly the case the render-to-
+  // texture census exists to catch, and it would be invisible if noted after the guard.
+  NoteResolveDestSeen(dest_address, uint64_t(width) * height * 4);
   if (!device_ || !resolves_ || !dest_address || !width || !height) {
     return;
   }
@@ -5998,9 +6660,20 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
     if (sr.right > sr.left && sr.bottom > sr.top) {
       RECT dr{dest_point.x, dest_point.y, dest_point.x + (sr.right - sr.left),
               dest_point.y + (sr.bottom - sr.top)};
-      dr.right = std::min<LONG>(dr.right, LONG(width));
-      dr.bottom = std::min<LONG>(dr.bottom, LONG(height));
-      if (dr.right > dr.left && dr.bottom > dr.top) {
+      // THE HARDWARE RESOLVE CANNOT STRETCH -- the XDK states it outright ("It cannot do any
+      // stretching"), and for a null source rect it defines the behaviour as copying the UPPER
+      // LEFT CORNER of the surface, not a downscale of the whole thing. Clamping the destination
+      // without shrinking the source in lockstep turned every oversized copy into a point-filtered
+      // downscale: a small destination (a bloom/luminance reduction step) received a squashed whole
+      // frame instead of the corner tile its shader expects, so the reduction converged on the
+      // wrong average. Shrink both edges together and the blit stays 1:1, as on hardware.
+      const LONG clamped_w = std::min<LONG>(dr.right, LONG(width)) - dr.left;
+      const LONG clamped_h = std::min<LONG>(dr.bottom, LONG(height)) - dr.top;
+      if (clamped_w > 0 && clamped_h > 0) {
+        sr.right = sr.left + clamped_w;
+        sr.bottom = sr.top + clamped_h;
+        dr.right = dr.left + clamped_w;
+        dr.bottom = dr.top + clamped_h;
         device_->StretchRect(src, &sr, dst, &dr, D3DTEXF_POINT);
       }
     }
