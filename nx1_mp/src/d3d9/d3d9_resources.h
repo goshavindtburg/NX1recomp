@@ -234,6 +234,12 @@ class ResourceTracker {
   /// pre-write contents forever. Landing the right bytes is only half the job.
   void InvalidateGuestRange(uint32_t phys, uint32_t bytes);
 
+  /// How many writes we have OBSERVED to the page containing this physical address (guest writes
+  /// via the write-watch, plus our own mirrored copies). Zero means nothing we can see has ever
+  /// written it -- which, for a DMA source that reads as empty, is the difference between "it was
+  /// written and then cleared" and "it is filled by a path we do not observe at all".
+  uint32_t PageWriteCount(uint32_t phys) const;
+
   static bool SetDefaultPixelsAddress(uint32_t addr);
   static uint32_t DefaultPixelsAddress();
 

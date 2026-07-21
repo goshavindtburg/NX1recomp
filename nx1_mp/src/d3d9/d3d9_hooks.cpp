@@ -30,6 +30,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -778,6 +779,11 @@ bool ClassifyDmaSource(const uint8_t* base, uint32_t src, uint32_t bytes) {
 ///   dst == src  -> verbatim move. The transform story is wrong; delete it. Fix the source's
 ///                  validity/timing instead.
 ///   dst != src  -> a real transform, and the pair is the ground truth to derive it from.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_dmachain, false, "GPU",
+                    "Trace where the image-cache copy chain breaks: for every copy handed an "
+                    "EMPTY source, report whether that source was itself a copy destination "
+                    "(break is upstream) or an origin nothing ever filled");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_dmaverify, false, "GPU",
                     "Compare each DMA destination against its source AFTER the blit retires, to "
                     "settle whether ImageCache_DmaCopy transforms the layout or moves bytes "
@@ -930,6 +936,66 @@ void VerifyPendingDma(const uint8_t* base) {
   }
 }
 
+/// WHERE DOES THE CHAIN BREAK? ~9.4% of image-cache copies are handed a source that is EMPTY in
+/// CPU-visible RAM, so the move cannot be mirrored and our view of the destination keeps its
+/// PREVIOUS occupant while the guest believes the new texture is there. That is the surviving
+/// explanation for the speckle: we decode the old occupant, faithfully, from memory that is
+/// written, complete and stable.
+///
+/// The sources are themselves destinations of earlier copies, so the interesting question is
+/// which link fails FIRST. Record every copy's destination; when a copy has an empty source, ask
+/// whether that source was ever a destination we saw:
+///   YES -> the break is upstream; that earlier copy was also unmirrorable, report its source.
+///   NO  -> this source is an ORIGIN. Nothing in the DMA path ever filled it, so its data comes
+///          from somewhere we do not observe at all (a resolve destination, or a load path that
+///          writes GPU-side memory). That address is the thing to chase.
+struct DmaOrigin {
+  uint32_t src;
+  uint32_t bytes;
+};
+std::mutex g_dma_chain_m;
+std::unordered_map<uint32_t, DmaOrigin> g_dma_chain;  // destination page -> what filled it
+
+void NoteDmaChain(uint32_t dst, uint32_t src, uint32_t bytes, bool src_empty) {
+  if (!REXCVAR_GET(nx1_d3d9_dbg_dmachain)) {
+    return;
+  }
+  const uint32_t dst_page = (dst & 0x1FFFFFFF) >> 12;
+  const uint32_t src_page = (src & 0x1FFFFFFF) >> 12;
+  std::lock_guard<std::mutex> lk(g_dma_chain_m);
+  if (src_empty) {
+    static std::atomic<uint64_t> upstream{0}, origin{0}, reported{0};
+    const auto it = g_dma_chain.find(src_page);
+    const bool known = it != g_dma_chain.end();
+    (known ? upstream : origin).fetch_add(1, std::memory_order_relaxed);
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 24) {
+      if (known) {
+        REXGPU_WARN("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY -- that source was itself "
+                    "filled by a copy from {:08X} ({} bytes), so the break is UPSTREAM",
+                    dst, src, it->second.src, it->second.bytes);
+      } else {
+        // Has ANYTHING we can see ever written this page? Separates "written then cleared"
+        // from "filled by a path outside our observation entirely".
+        const uint32_t w0 = nx1::d3d9::ResourceTracker::Get().PageWriteCount(src);
+        const uint32_t w1 = nx1::d3d9::ResourceTracker::Get().PageWriteCount(src + 4096);
+        REXGPU_WARN("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY and NEVER a DMA destination "
+                    "-- an ORIGIN. Observed writes to its first two pages: {} and {}. Zero means "
+                    "nothing we watch fills it, so its data arrives outside our observation",
+                    dst, src, w0, w1);
+      }
+    }
+    if ((reported.load() % 2000) == 0) {
+      REXGPU_WARN("nx1_d3d9: DMACHAIN totals: {} empty sources traced upstream, {} are ORIGINS "
+                  "never written by any copy we see",
+                  upstream.load(), origin.load());
+    }
+    return;
+  }
+  if (g_dma_chain.size() < 200000) {
+    g_dma_chain[dst_page] = {src, bytes};
+  }
+}
+
 void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // DOES ANY DMA ACTUALLY FILL THE TRACKED TEXTURE? A run tracking one permanently-77%-empty
   // texture logged only BIND and CACHED -- no writes, no copies -- which reads like "nothing ever
@@ -958,7 +1024,9 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   if (bytes < 32 || bytes > (16u << 20) || !dst || !src) {
     return;
   }
-  if (ClassifyDmaSource(base, src, bytes)) {
+  const bool src_empty = ClassifyDmaSource(base, src, bytes);
+  NoteDmaChain(dst, src, bytes, src_empty);
+  if (src_empty) {
     static std::atomic<uint64_t> skipped{0};
     const uint64_t k = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((k % 2000) == 0) {

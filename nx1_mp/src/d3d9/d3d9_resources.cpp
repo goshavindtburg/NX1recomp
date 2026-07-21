@@ -2465,6 +2465,11 @@ const uint8_t* ResourceTracker::PhysicalPointer(uint32_t phys_addr) const {
   return TranslatePhysical(phys_addr);
 }
 
+uint32_t ResourceTracker::PageWriteCount(uint32_t phys) const {
+  const size_t page = size_t(phys & 0x1FFFFFFF) >> 12;
+  return page < page_writes_.size() ? page_writes_[page] : 0;
+}
+
 void ResourceTracker::InvalidateGuestRange(uint32_t phys, uint32_t bytes) {
   if (!bytes) {
     return;
@@ -3437,6 +3442,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       const uint32_t bw_p = (t.width + fi_p->block_width - 1) / fi_p->block_width;
       const uint32_t bh_p = (height + fi_p->block_height - 1) / fi_p->block_height;
       probe_bytes = bw_p * bh_p * fi_p->bytes_per_block();
+    }
+    // BOUNDS. A texture's declared dimensions can imply more bytes than the mapped region
+    // actually holds, and ProbeGuestContent reads to the end of what it is given -- firing a
+    // weapon (muzzle-flash sprites) crashed the game on an out-of-bounds read here. Clamp to the
+    // same physical window every other reader in this file respects.
+    if (uint64_t(PhysicalAddress(t.base_address)) + probe_bytes > (uint64_t(kMirrorPages) << 12)) {
+      probe_bytes = 0;
     }
     if (probe_bytes) {
       const uint64_t now_hash = ProbeGuestContent(TranslatePhysical(t.base_address), probe_bytes);
@@ -4644,6 +4656,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       const uint32_t bw_d = (t.width + fi_d->block_width - 1) / fi_d->block_width;
       const uint32_t bh_d = (height + fi_d->block_height - 1) / fi_d->block_height;
       probe_bytes = bw_d * bh_d * fi_d->bytes_per_block();
+    }
+    if (uint64_t(PhysicalAddress(t.base_address)) + probe_bytes > (uint64_t(kMirrorPages) << 12)) {
+      probe_bytes = 0;  // same clamp as the bind-time probe
     }
     entry.probe_hash =
         probe_bytes ? ProbeGuestContent(TranslatePhysical(t.base_address), probe_bytes) : 0;
