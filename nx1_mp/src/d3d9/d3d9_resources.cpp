@@ -318,6 +318,14 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_pageorigin, false, "GPU",
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_paint_foreign, false, "GPU",
                     "Replace blocks read from another texture's page with a magenta marker. If "
                     "the corrupt areas turn magenta, the provenance finding is the artifact");
+/// Dump the DECODED IMAGE of textures the provenance detector flagged, paired with the mask of
+/// which blocks it flagged. The question every other instrument dances around -- is the decoded
+/// picture coherent, or a patchwork -- is answered by looking at it, and has never been asked for
+/// a single confirmed surface.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_mixed, 0, "GPU",
+                      "Dump the decoded image (MIXED_<addr>.bmp) plus its provenance mask "
+                      "(prov_<addr>.bmp) for this many PAGEORIGIN-flagged textures. A coherent "
+                      "image means the flag is benign page sharing, not corruption");
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pageorigin_dump, 0, "GPU",
                       "Write texdump/prov_<addr>_f<frame>.bmp for this many flagged textures: one "
                       "pixel per block, red = block read from another texture's page");
@@ -2976,19 +2984,37 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
   // another texture? Walk the real block addresses -- the same ones DetileMip2D reads -- and
   // check only the pages they land in. Foreign content here is corruption, not packing.
   std::vector<uint32_t> touched;
+  // HOW MUCH of each page we actually consume. A page can be shared between this texture's tail and
+  // whatever the guest packed into the surrounding tile padding -- the XDK documents that packing
+  // explicitly -- and hashing the WHOLE page then reports the neighbour's content as "foreign" even
+  // when every byte we read is ours. Without this the detector cannot tell a genuinely mixed slot
+  // from a page we barely touch, which is the same class of over-count its five previous revisions
+  // each removed.
+  std::vector<uint32_t> touched_blocks;
   {
     const uint32_t bw = block_width, bh = block_height;
     if (!bw || !bh) {
       return;
     }
     touched.reserve(64);
-    uint32_t last = UINT32_MAX;
+    touched_blocks.reserve(64);
+    uint32_t last = UINT32_MAX, last_idx = 0;
     auto note = [&](size_t off) {
       const uint32_t pg = uint32_t(off >> 12);
-      if (pg != last) {  // cheap dedupe: consecutive blocks usually share a page
-        last = pg;
-        if (std::find(touched.begin(), touched.end(), pg) == touched.end()) touched.push_back(pg);
+      if (pg == last) {  // fast path: consecutive blocks usually share a page
+        ++touched_blocks[last_idx];
+        return;
       }
+      const auto it = std::find(touched.begin(), touched.end(), pg);
+      if (it == touched.end()) {
+        touched.push_back(pg);
+        touched_blocks.push_back(1);
+        last_idx = uint32_t(touched.size() - 1);
+      } else {
+        last_idx = uint32_t(it - touched.begin());
+        ++touched_blocks[last_idx];
+      }
+      last = pg;
     };
     if (t.tiled) {
       const uint32_t bpb_log2 = Log2Exact(bpb);
@@ -3011,6 +3037,8 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
     return;
   }
   const uint32_t self = PhysicalAddress(t.base_address);
+  uint32_t blank_this_decode = 0, blank_this_decode_total = 0;
+  bool unwritten_this_decode = false;
   uint32_t pages = 0, foreign = 0, named = 0;
   uint32_t from_addr[8] = {};
   uint32_t from_page[8] = {};
@@ -3025,6 +3053,7 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
     uint64_t h = 1469598103934665603ull;
     uint64_t first = 0;
     bool uniform = true;
+    uint32_t zero_samples = 0, samples = 0;
     for (uint32_t i = 0; i < 4096; i += 64) {
       uint64_t v;
       std::memcpy(&v, src + off + i, sizeof(v));
@@ -3033,6 +3062,10 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
       } else if (v != first) {
         uniform = false;
       }
+      ++samples;
+      if (v == 0) {
+        ++zero_samples;
+      }
       h = (h ^ v) * 1099511628211ull;
     }
     // A UNIFORM PAGE PROVES NOTHING ABOUT PROVENANCE. Solid-black and fully-transparent regions
@@ -3040,6 +3073,38 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
     // theft -- the same trap that made the convergence detector report tiny shared dummy maps as
     // corruption. The >3-address filter does not catch it either: a blank page present in exactly
     // two textures passes. Excluded, and counted so the filter's own impact is visible.
+    // BLANK REGIONS. A uniform page whose value is ZERO is not "shared content we cannot
+    // attribute" -- it is a hole, and the image dumps show holes are the DOMINANT corruption
+    // (50-85% of several textures, against single-digit noise). The provenance filter below throws
+    // these away, which is precisely why MIXED never moved: it is blind to the main failure.
+    // Counted here, over pages a fetch actually reads, so tile padding cannot inflate it.
+    // MEASURED AT SAMPLE GRANULARITY, not whole pages. The first cut of this counted only pages
+    // that were ENTIRELY zero and reported 0.7% -- while the decoded-image dumps of the very same
+    // textures were 50-85% black. Both were "right": a page holding a few real blocks among mostly
+    // zeros is not uniform, so it did not count, yet its pixels are overwhelmingly black on screen.
+    // The page-level test simply cannot express what the artifact looks like. Counting zero SAMPLES
+    // (64 per page, the same ones the hash already reads) tracks the visible hole fraction.
+    blank_read_pages_ += samples;
+    blank_pages_ += zero_samples;
+    blank_this_decode += zero_samples;
+    blank_this_decode_total += samples;
+    // ZERO CONTENT IS NOT EVIDENCE OF A HOLE. This project has inferred residency from texture
+    // CONTENT and been wrong three times -- the entropy classifiers twice, then an all-zero-pages
+    // test that counted a UI logo on a transparent background as missing and rendered the NX1 title
+    // as a solid white box. Enormous amounts of legitimate art are zero: transparent atlas regions,
+    // alpha masks, decal borders. The rule that survived is JUDGE WRITE HISTORY, NEVER CONTENT.
+    //
+    // So the only defensible hole is a page that is zero AND that nothing has ever written.
+    // PageWriteCount includes our own mirror/DMA writes (InvalidateGuestRange records them, since
+    // host writes into guest RAM bypass page protection), so a page reading 0 here really was
+    // never filled by anyone.
+    if (zero_samples * 2 >= samples) {  // predominantly zero
+      ++unwritten_candidates_;
+      if (PageWriteCount(uint32_t(self + off)) == 0) {
+        ++unwritten_holes_;
+        unwritten_this_decode = true;
+      }
+    }
     if (uniform) {
       ++pageorigin_uniform_skipped_;
       continue;
@@ -3150,6 +3215,31 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
       //     declined it, leaving the previous occupant. That is a hole we create.
       //   WRITTEN -- we did land bytes here and they are still another texture's, which moves the
       //     fault upstream to what the SOURCE held.
+      // COVERAGE OF THE FOREIGN PAGES. `bpb * blocks_read / 4096` is the fraction of the page our
+      // decode actually consumes. A foreign verdict on a page we read 10% of is very weak evidence
+      // of a mixed slot and strong evidence of ordinary tile-padding packing; a foreign verdict on
+      // a page we read in full is the real thing. Reported as a distribution because the geometry
+      // predicts the difference: on 06FD0000 (300x152, 38 block rows) every foreign page sat in
+      // tile row 1, which spans block rows 32..63 and is therefore 82% padding.
+      uint32_t low_cov = 0, full_cov = 0, min_pct = 100, max_pct = 0;
+      for (const uint32_t pg : foreign_pages) {
+        const auto it = std::find(touched.begin(), touched.end(), pg);
+        if (it == touched.end()) {
+          continue;
+        }
+        const uint32_t blocks = touched_blocks[size_t(it - touched.begin())];
+        const uint32_t pct = std::min<uint32_t>(100, (blocks * bpb * 100) / 4096);
+        if (pct < 50) ++low_cov; else ++full_cov;
+        min_pct = std::min(min_pct, pct);
+        max_pct = std::max(max_pct, pct);
+      }
+      if (!foreign_pages.empty()) {
+        REXGPU_WARN("nx1_d3d9:   ^ foreign-page COVERAGE: {} of {} are pages we read LESS THAN HALF "
+                    "of ({}%..{}%). Low coverage means the page is shared with the guest's tile-"
+                    "padding packing and the bytes we actually consume may be entirely ours -- only "
+                    "the fully-read ones ({}) are evidence of a genuinely mixed slot",
+                    low_cov, foreign_pages.size(), min_pct, max_pct, full_cov);
+      }
       uint32_t never = 0, spanned = 0, written = 0;
       for (const uint32_t pg : foreign_pages) {
         switch (DmaPageVerdictFor(uint32_t(self + (size_t(pg) << 12)))) {
@@ -3213,8 +3303,17 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
     // another texture's page, green where they came from this texture's own. Compare the shape
     // against the corruption on screen -- that is the step no amount of address arithmetic can
     // substitute for, and it is what decides whether this 8.8% is the artifact.
-    if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_pageorigin_dump)) {
-      REXCVAR_SET(nx1_d3d9_dbg_pageorigin_dump, budget - 1);
+    // Arm the image dump for THIS decode, and force the mask out alongside it -- an image without
+    // its mask cannot be read block for block, and a mask without its image is what this
+    // investigation already has six revisions of.
+    if (REXCVAR_GET(nx1_d3d9_dbg_dump_mixed) > 0) {
+      pageorigin_dump_this_ = true;
+    }
+    if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_pageorigin_dump);
+        budget || pageorigin_dump_this_) {
+      if (budget) {  // guard: the mask is also forced when dump_mixed armed it, and budget is 0 then
+        REXCVAR_SET(nx1_d3d9_dbg_pageorigin_dump, budget - 1);
+      }
       const uint32_t bw = block_width, bh = block_height;
       std::vector<Rgba8> mask(size_t(bw) * bh);
       const uint32_t bpb_log2 = Log2Exact(bpb);
@@ -3259,8 +3358,43 @@ void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
   } else {
     paint_pages_.clear();
   }
+  // Per-decode blank tally. `touched` is the set of pages a fetch really reads, so this fraction is
+  // "how much of the image we are about to decode is a hole" -- the number the screen actually
+  // shows, and the one MIXED cannot express.
+  ++blank_decodes_total_;
+  if (blank_this_decode_total && blank_this_decode * 4 >= blank_this_decode_total) {
+    ++blank_decodes_;  // at least a quarter of the bytes we read are zero
+  }
+  if (unwritten_this_decode) {
+    ++unwritten_decodes_;
+  }
   ++pageorigin_decodes_;
   if ((pageorigin_decodes_ % 2000) == 0) {
+    // THE METRIC THAT SHOULD TRACK THE ARTIFACT. Read this one, not MIXED: the decoded-image dumps
+    // showed holes are the dominant corruption and MIXED is structurally blind to them. Unlike
+    // MIXED -- pinned at 7-10% through every intervention -- this should MOVE when the underlying
+    // delivery changes. If it does not move either, the fault is not in what reaches guest RAM.
+    REXGPU_WARN("nx1_d3d9: BLANK {} of {} sampled bytes a fetch actually reads are ZERO ({:.1f}%), "
+                "and {} of {} decodes are at least a QUARTER zero ({:.1f}%). "
+                "These are holes in guest memory -- verified against LIVE RAM with the mirror off, "
+                "so not a snapshot artifact",
+                blank_pages_, blank_read_pages_,
+                blank_read_pages_ ? 100.0 * double(blank_pages_) / double(blank_read_pages_) : 0.0,
+                blank_decodes_, blank_decodes_total_,
+                blank_decodes_total_ ? 100.0 * double(blank_decodes_) / double(blank_decodes_total_)
+                                     : 0.0);
+    // THE ONE TO ACT ON. The line above is CONTENT, and content has been wrong three times here --
+    // transparent art reads identically to a hole. This crosses it with write history: of the pages
+    // that are predominantly zero, how many did NOTHING ever write? Only those are undelivered.
+    // If holes ~= 0 while candidates is large, the zeros are legitimate art and delivery is fine.
+    REXGPU_WARN("nx1_d3d9: UNWRITTEN {} of {} predominantly-zero pages were NEVER WRITTEN by "
+                "anything ({:.1f}%), across {} decodes. Holes ~0 with many candidates means the "
+                "zeros are legitimate transparent/dark art and delivery is NOT the problem",
+                unwritten_holes_, unwritten_candidates_,
+                unwritten_candidates_
+                    ? 100.0 * double(unwritten_holes_) / double(unwritten_candidates_)
+                    : 0.0,
+                unwritten_decodes_);
     REXGPU_WARN("nx1_d3d9: PAINT {} blocks marked across {} textures (enabled={}). Zero blocks "
                 "means the marker never reached a decode -- the instrument, not the theory. "
                 "Nonzero with no magenta on screen means those textures were not in view",
@@ -5045,9 +5179,28 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           ? dump_draw_
           : ((!dump_maxdim || (t.width <= dump_maxdim && height <= dump_maxdim)) &&
              (!dump_fmt1 || t.format == dump_fmt1 - 1));
+  // DUMP THE TEXTURES THE PROVENANCE DETECTOR ACTUALLY FLAGGED.
+  //
+  // Every instrument in this investigation measures memory PROVENANCE -- an indirect proxy for
+  // "is this the right image". Six revisions of that detector later, MIXED still sits at 7-10% in
+  // every run under every intervention, while the visible speckle varies run to run. A metric that
+  // never moves while the artifact does is behaving like a background constant, and the benign
+  // mechanism that would produce exactly that is two textures legitimately SHARING identical pages.
+  //
+  // The only thing that separates those is LOOKING at the decoded image:
+  //   a coherent picture  -> the flag is benign page sharing, MIXED is not the speckle, and the
+  //                          paint test's causality was correlation with a third variable
+  //   a visible patchwork -> the slot really does hold parts of several images
+  // Paired with the provenance mask (dbg_pageorigin_dump), which marks WHICH blocks were flagged,
+  // so the two can be compared block for block instead of impressionistically.
+  const bool dump_flagged = pageorigin_dump_this_ && REXCVAR_GET(nx1_d3d9_dbg_dump_mixed) > 0;
+  if (dump_flagged) {
+    REXCVAR_SET(nx1_d3d9_dbg_dump_mixed, REXCVAR_GET(nx1_d3d9_dbg_dump_mixed) - 1);
+  }
+  pageorigin_dump_this_ = false;
   if (const uint32_t tex_dump_left = REXCVAR_GET(nx1_d3d9_dbg_texdump);
-      dst && ((tex_dump_left && dump_size_ok) || hash_dump_match)) {
-    if (tex_dump_left && !hash_dump_match) {
+      dst && ((tex_dump_left && dump_size_ok) || hash_dump_match || dump_flagged)) {
+    if (tex_dump_left && !hash_dump_match && !dump_flagged) {
       REXCVAR_SET(nx1_d3d9_dbg_texdump, tex_dump_left - 1);
     }
     // The raw guest bytes first: all-zero says the data never arrived, anything else says it
@@ -5087,8 +5240,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     }
     if (!img.empty()) {
       char path[256];
-      std::snprintf(path, sizeof(path), "texdump/tex_%08X_%ux%u_f%u.bmp", t.base_address, t.width,
-                    height, t.format);
+      // Flagged dumps get their own prefix so the pairing is unambiguous on disk: every
+      // MIXED_<addr> image has a prov_<addr> mask from the same decode.
+      std::snprintf(path, sizeof(path), "texdump/%s_%08X_%ux%u_f%u.bmp",
+                    dump_flagged ? "MIXED" : "tex", t.base_address, t.width, height, t.format);
       DumpRgbaBmp(path, img, t.width, height);
     }
 

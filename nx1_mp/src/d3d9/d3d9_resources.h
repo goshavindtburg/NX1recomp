@@ -606,9 +606,36 @@ class ResourceTracker {
   /// that is what ImageCache_DmaCopy does -- but counted so it cannot be mistaken for the
   /// mixed case, which is the artifact.
   uint64_t pageorigin_relocated_ = 0;
+  /// Set by NotePageOrigin when THIS decode was flagged MIXED, so the upload path can dump the
+  /// resulting image. The decode happens immediately after the detector runs in the same
+  /// GetTexture call, so a plain flag is sufficient and avoids threading the verdict through.
+  bool pageorigin_dump_this_ = false;
   /// Uniform (solid/blank) pages excluded from the provenance test: identical blank pages
   /// in two unrelated textures are coincidence, not shared data.
   uint64_t pageorigin_uniform_skipped_ = 0;
+  /// BLANK-REGION METRIC -- the one that actually tracks the artifact.
+  ///
+  /// Dumping the decoded images of flagged textures showed the dominant corruption is not foreign
+  /// content at all but PURE ZEROS: 50-85% of several textures, against a noise component in the
+  /// single digits. The provenance detector cannot see any of it, because its uniform-page filter
+  /// deliberately excludes all-zero pages -- which is exactly why MIXED sat at 7-10% in every run
+  /// under every intervention while the visible speckle varied run to run. It was measuring the
+  /// minor component and was blind to the dominant one.
+  ///
+  /// Counted only over pages a FETCH ACTUALLY READS, so tile padding and alignment gaps -- which
+  /// are legitimately blank and never sampled -- cannot inflate it. Verified against live guest RAM
+  /// with the mirror OFF, so these zeros are in guest memory, not a snapshot artifact.
+  uint64_t blank_pages_ = 0;       ///< all-zero pages among those actually read
+  uint64_t blank_read_pages_ = 0;  ///< total pages actually read (the denominator)
+  uint64_t blank_decodes_ = 0;     ///< decodes where >=25% of read pages are blank
+  uint64_t blank_decodes_total_ = 0;
+  /// Zero content CROSSED WITH write history -- the only defensible definition of a hole, per the
+  /// rule this project learned three times over: judge write history, never content. A page that is
+  /// predominantly zero AND that PageWriteCount says nothing ever wrote is genuinely undelivered;
+  /// one that is zero but WAS written is just dark or transparent art.
+  uint64_t unwritten_candidates_ = 0;  ///< pages predominantly zero (content only -- unreliable)
+  uint64_t unwritten_holes_ = 0;       ///< ...of which nothing ever wrote (the real signal)
+  uint64_t unwritten_decodes_ = 0;
   /// Foreign pages of the texture currently being decoded, handed to the detiler when
   /// nx1_d3d9_dbg_paint_foreign is on so those blocks render as a marker.
   std::vector<uint32_t> paint_pages_;
