@@ -1158,10 +1158,38 @@ bool SourceHasAnyData(const uint8_t* base, uint32_t src, uint32_t bytes) {
   return false;
 }
 
-/// Copy only the source pages that actually carry data. Shared by the immediate mirror and the
-/// retry, so both obey the same rule: an empty source page carries nothing, and copying it can
-/// only erase a destination that may hold live texels.
+/// PARTIAL COPIES MAKE LATTICES. A DmaCopy means "make dst equal src over these bytes", and the
+/// blit is verbatim (5ac1465). Landing only the pages that carry data leaves the rest holding the
+/// PREVIOUS occupant, and in a tiled BC texture a 4 KB page is a rectangular block region -- so a
+/// page-granular mixture renders as a regular grid of foreign tiles over otherwise-correct
+/// texture. It also never heals: a rebuild faithfully decodes the mixture. That artifact was
+/// observed directly (a lattice of squares across a wall that would not clear on approach) after
+/// the 4 KB gate fix pushed ~35k more copies per run down this path.
+///
+/// The skip existed to avoid "erasing live texels" with an empty source, a worry from when sources
+/// were believed to be routinely unfilled. They are not (PARTIALSRC 0%), and copying a genuinely
+/// zero page writes zeros, which is CORRECT for a legitimately transparent region. So copy the
+/// whole range, exactly as the GPU blit does.
+/// DEFAULTED OFF AFTER IT CRASHED THE GAME. Verbatim copying removed the lattice but did NOT fix
+/// the speckle, and it made `InvalidateGuestRange` fire for every page rather than only non-empty
+/// ones -- roughly 8x the call rate. That function takes NO LOCK while it iterates the texture map
+/// and can reallocate page_writes_, and it runs on the guest DMA thread while the render/worker
+/// thread inserts into that same map. Concurrent iterate-plus-insert on an unordered_map is
+/// undefined, and the game died inside ImageCache_DmaCopyDelayed with a near-null read
+/// (guest lr=824D3504, read fault 0x1B25) -- a crash signature seen in no other run.
+///
+/// The race is pre-existing and still needs fixing; this only stops feeding it. Note also that the
+/// XDK documents the guest as packing data into the alignment gaps of texture allocations
+/// (XGAddress2DTiledExtent), so a full-range copy can overwrite whatever the guest put there --
+/// the correct model is to mirror only the REFERENCED regions (XGGetTextureLayout returns them as
+/// a region list), not the whole declared extent.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_verbatim, false, "GPU",
+                    "Mirror an image-cache copy over its FULL range, as the GPU blit does. On = "
+                    "also writes the allocation's alignment gaps, which the guest packs other "
+                    "data into, and multiplies InvalidateGuestRange traffic into a known race");
+
 uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
+  const bool verbatim = REXCVAR_GET(nx1_d3d9_dma_verbatim);
   uint32_t copied = 0;
   for (uint32_t off = 0; off < bytes; off += 4096) {
     const uint32_t chunk = std::min(4096u, bytes - off);
@@ -1170,12 +1198,14 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
     if (!d || !s) {
       break;
     }
-    bool any = false;
-    for (uint32_t i = 0; i < chunk && !any; ++i) {
-      any = s[i] != 0;
-    }
-    if (!any) {
-      continue;
+    if (!verbatim) {
+      bool any = false;
+      for (uint32_t i = 0; i < chunk && !any; ++i) {
+        any = s[i] != 0;
+      }
+      if (!any) {
+        continue;
+      }
     }
     std::memcpy(d, s, chunk);
     nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange((dst + off) & 0x1FFFFFFF, chunk);
@@ -1285,10 +1315,10 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // in the pages behind it. Commit 305240b fixed the mirror image of this (opening page full,
   // later pages empty) and noted the 4 KB sampling without following it the other way.
   ClassifyDmaSource(base, src, bytes);
-  // The exact test instead of the heuristic: copy every page that carries data, and treat the
-  // copy as empty only when NO page did.
-  const uint32_t copied_now = CopyLiveSourcePages(base, dst, src, bytes);
-  const bool src_empty = copied_now == 0;
+  // The exact test instead of the heuristic, and decided SEPARATELY from the copy: a source is
+  // empty only when NO page anywhere in it carries data. Anything else is copied over its full
+  // range -- landing part of a copy is what produces the lattice.
+  const bool src_empty = !SourceHasAnyData(base, src, bytes);
   NoteDmaChain(dst, src, bytes, src_empty);
   if (src_empty) {
     static std::atomic<uint64_t> skipped{0};
@@ -1343,7 +1373,7 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // held back.
   static std::atomic<uint64_t> pages_copied{0}, pages_skipped{0};
   const uint32_t total_pages = (bytes + 4095) / 4096;
-  const uint32_t copied = copied_now;  // the copy already happened, above the emptiness decision
+  const uint32_t copied = CopyLiveSourcePages(base, dst, src, bytes);
   // Approximate: the helper also stops early on an untranslatable page, which counts here as
   // skipped. Both are "we did not land these bytes", which is what the counter is for.
   const uint32_t not_copied = total_pages - std::min(copied, total_pages);

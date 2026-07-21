@@ -234,6 +234,11 @@ class ResourceTracker {
   /// pre-write contents forever. Landing the right bytes is only half the job.
   void InvalidateGuestRange(uint32_t phys, uint32_t bytes);
 
+  /// Drop the decode snapshot for a range WITHOUT recording a write. Use when we have observed
+  /// that memory CHANGED but did not write it ourselves -- claiming a write here would corrupt
+  /// the write-history predicate the partial-source test depends on.
+  void InvalidateMirrorPages(uint32_t phys, uint32_t bytes);
+
   /// How many writes we have OBSERVED to the page containing this physical address (guest writes
   /// via the write-watch, plus our own mirrored copies). Zero means nothing we can see has ever
   /// written it -- which, for a DMA source that reads as empty, is the difference between "it was
@@ -585,6 +590,28 @@ class ResourceTracker {
   /// resolves would cost a GetRenderTargetData sync every frame for memory nobody reads, so
   /// each destination gets a few writebacks and then stops. Counts on the guest thread under
   /// render_mutex_; staging surface reused across writebacks of the same size.
+  /// Page-provenance index (nx1_d3d9_dbg_pageorigin): content hash of a source page -> the first
+  /// texture address it appeared under. A page reaching more than kPageOriginMaxAddrs addresses is
+  /// legitimately shared (blank/uniform regions recur across many textures for real reasons) and
+  /// stops counting as foreign -- without that cutoff, shared blank pages drown the signal, the
+  /// same way they did for the convergence detector.
+  static constexpr uint8_t kPageOriginMaxAddrs = 3;
+  struct PageOrigin {
+    uint32_t first_addr = 0;
+    uint8_t addr_count = 0;
+  };
+  std::unordered_map<uint64_t, PageOrigin> page_origin_;
+  uint64_t pageorigin_decodes_ = 0, pageorigin_flagged_ = 0;
+  /// Call AFTER the decode source is chosen, outside the mirror/live branch -- the question is the
+  /// same either way, and putting it inside one branch is how it silently never ran.
+  void NotePageOrigin(const uint8_t* src, size_t guest_bytes, const TextureFetchConstant& t,
+                      uint32_t height);
+
+  /// Snapshot-staleness census (nx1_d3d9_dbg_mirrorstale): how often the bytes a decode is about
+  /// to read differ from what guest memory holds at that instant.
+  uint64_t mirrorstale_decodes_ = 0, mirrorstale_stale_decodes_ = 0;
+  uint64_t mirrorstale_pages_ = 0, mirrorstale_stale_pages_ = 0;
+
   std::unordered_map<uint32_t, uint32_t> writeback_counts_;
 
   /// Per-PAGE record of what writeback decided, keyed by physical page. Keyed by page rather

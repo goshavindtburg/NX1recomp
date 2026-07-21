@@ -138,12 +138,54 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 /// slot whose occupant was REPLACED (a different image entirely) while costing ~512 bytes of
 /// reads per texture per frame. It will not catch a subtle in-place edit, and is not meant to --
 /// the write-watch covers those.
+/// COVERAGE IS THE WHOLE POINT, and 64 samples was not enough where it mattered.
+///
+/// The original took 64 eight-byte reads -- 512 bytes total, at fixed stride boundaries. For the
+/// texture class that actually speckles (128x128 DXT1 diffuse, 8 KB, *largely zeros*) that is
+/// 6.25% coverage at fixed offsets, and if those offsets land in regions that are zero in BOTH the
+/// previous and the new occupant the hash is IDENTICAL and no rebuild fires. The probe was blind
+/// precisely where the bug lives: a sparse texture replaced by another sparse texture is the
+/// easiest possible collision.
+///
+/// So: hash EVERYTHING for small textures -- 64 KB covers the entire affected class at trivial
+/// cost -- and fall back to dense sampling above that, where a full hash of every bound texture
+/// every frame would be real bandwidth. Sampling remains a compromise for large textures; if the
+/// speckle turns out to live there too, raise the threshold rather than widening the stride.
+/// MEASURED NEGATIVE, so it does not get to cost frames. Full-coverage hashing of every texture
+/// <=64 KB every frame did NOT raise detections (CONTENTPROBE per decode went 0.236 -> 0.199,
+/// i.e. down, across two uncontrolled sessions) and coincided with 60 -> 41 FPS. The sparse-
+/// collision theory is unsupported. Default to cheap sampling -- still 8x the original 64, which
+/// costs ~4 KB per texture per frame -- and leave the full path available for a deliberate test.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_probe_full_bytes, 0, "GPU",
+                      "Textures up to this many guest bytes are content-probed in FULL; larger "
+                      "ones fall back to sampling. 0 = always sample (default: full hashing was "
+                      "measured to add cost without adding detections)");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_probe_samples, 512, "GPU",
+                      "Eight-byte samples taken when a texture is not probed in full (the "
+                      "original 64 was thin enough to collide for sparse textures)");
+
 uint64_t ProbeGuestContent(const uint8_t* p, uint32_t bytes) {
   if (!p || bytes < 8) {
     return 0;
   }
   uint64_t h = 1469598103934665603ull;
-  const uint32_t samples = 64;
+  if (bytes <= REXCVAR_GET(nx1_d3d9_probe_full_bytes)) {
+    // Full coverage: every eight-byte word, so ANY difference in the slot's contents changes the
+    // hash. No collision class left to reason about.
+    uint32_t off = 0;
+    for (; off + 8 <= bytes; off += 8) {
+      uint64_t v;
+      std::memcpy(&v, p + off, sizeof(v));
+      h = (h ^ v) * 1099511628211ull;
+    }
+    if (off < bytes) {  // ragged tail
+      uint64_t v = 0;
+      std::memcpy(&v, p + off, bytes - off);
+      h = (h ^ v) * 1099511628211ull;
+    }
+    return h ? h : 1;
+  }
+  const uint32_t samples = std::max(64u, REXCVAR_GET(nx1_d3d9_probe_samples));
   const uint32_t stride = bytes / samples < 8 ? 8 : bytes / samples;
   for (uint32_t off = 0; off + 8 <= bytes; off += stride) {
     uint64_t v;
@@ -232,6 +274,33 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_packed_mip_offset, false, "GPU",
 /// The reference backend reads live guest memory at draw time and renders all of this content
 /// correctly, which means the data IS reachable and the snapshot is what loses it. Turn this
 /// off to read live like the reference does.
+/// The decode reads the snapshot mirror; every census in this investigation read LIVE guest
+/// memory. A divergence between the two is the one thing none of them could see, and it is the
+/// mechanical explanation for why the content probe forced 2,457 rebuilds, drove SLOTREUSE to
+/// zero, and left the speckle completely unmoved: the rebuild re-read the same stale snapshot.
+/// WHOSE BYTES ARE THESE? An automatic detector for the artifact, built because the bug is NOT
+/// reproducible per surface -- the wall that speckles this run will not speckle next run, so
+/// hunting a nominated surface with the picker cannot work.
+///
+/// The corrupt images show rectangular blocks of OTHER textures' content. That is a checkable
+/// claim: index every decoded source page by a hash of its contents, and when a page's content was
+/// FIRST seen under a different texture's address, this texture is holding that texture's bytes.
+/// Report any decode where enough pages trace elsewhere. Whatever surface happens to be corrupt
+/// that run gets flagged, with the addresses its foreign blocks came from.
+///
+/// Legitimately shared pages must be excluded or they drown it: all-zero and uniform pages recur
+/// across many textures for real reasons (transparent regions, flat maps), which is the same trap
+/// the convergence detector hit -- there, tiny solid-black images reached 8+ addresses each. So a
+/// page seen at more than kPageOriginMaxAddrs addresses is treated as legitimately shared.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_pageorigin, false, "GPU",
+                    "Flag decodes whose source pages were first seen under a DIFFERENT texture's "
+                    "address -- automatic detection of a texture holding foreign blocks");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pageorigin_pct, 10, "GPU",
+                      "Report a decode when at least this percent of its pages trace to another "
+                      "texture's address");
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_mirrorstale, false, "GPU",
+                    "Debug: at every decode, compare the snapshot the decode is about to use "
+                    "against live guest memory and report how often it is stale");
 REXCVAR_DEFINE_BOOL(nx1_d3d9_texture_mirror, true, "GPU",
                     "Decode textures from the CPU mirror snapshot (off = read live guest "
                     "memory, as the reference backend does)");
@@ -2300,8 +2369,9 @@ void ResourceTracker::LogCacheStats() {
       frame_, textures, vbs, ibs, resolves, tex_uploads_, tex_rebuilds_, tex_evicted_,
       tex_failures_, unsupported_texture_formats_,
       device_->GetAvailableTextureMem() / (1024 * 1024));
-  REXGPU_INFO("nx1_d3d9: DMAINVALIDATE {} cached textures re-decoded after a mirrored GPU copy "
-              "(zero here means the mirror was landing bytes nobody ever re-read)",
+  REXGPU_INFO("nx1_d3d9: DMAINVALIDATE {} mirrored-copy ranges queued for invalidation; "
+              "DrainMemoryWrites applies them on the render thread and dirties the textures they "
+              "overlap (zero here means the mirror landed no bytes at all)",
               dma_invalidations_);
   REXGPU_INFO("nx1_d3d9: TORNPAGES {} of {} page copies changed while being read -- non-zero "
               "means texture decodes are reading half-written guest memory",
@@ -2470,40 +2540,132 @@ uint32_t ResourceTracker::PageWriteCount(uint32_t phys) const {
   return page < page_writes_.size() ? page_writes_[page] : 0;
 }
 
+/// Record that WE wrote guest memory (mirroring an image-cache copy), so the affected textures
+/// re-decode. Host writes bypass guest page protection, so the write-watch never fires for them.
+///
+/// QUEUE ONLY -- this runs on the guest DMA thread. It used to invalidate the mirror and walk the
+/// texture map inline, which is exactly what the write-watch callback is documented never to do:
+/// "it must NOT touch the texture cache -- it only queues the written range, which
+/// DrainMemoryWrites() applies from AdvanceFrame on the render thread." Iterating an
+/// unordered_map while the render/worker thread inserts into it is undefined behaviour, and it
+/// killed the game inside ImageCache_DmaCopyDelayed (guest lr=824D3504, read fault 0x1B25) once
+/// nx1_d3d9_dma_verbatim raised the call rate ~8x. The race was latent long before that.
+///
+/// Routing through writes_pending_ also picks up work this function never did: DrainMemoryWrites
+/// dirties entries by their MIP watch range as well as the base range.
 void ResourceTracker::InvalidateGuestRange(uint32_t phys, uint32_t bytes) {
   if (!bytes) {
     return;
   }
-  const uint32_t a0 = phys;
-  const uint32_t a1 = phys + bytes;
-  // Mirror pages first, so a re-decode re-reads from live memory rather than the snapshot.
-  if (mirror_ && !mirror_valid_.empty()) {
-    const uint32_t p0 = a0 >> 12;
-    const uint32_t p1 = (a1 - 1) >> 12;
-    // These pages WERE written -- by us, mirroring an image-cache copy. Record it: page
-    // protection never fired for them, so without this they read as "never written", and the
-    // partial-source test below would call legitimately-delivered data missing.
-    if (page_writes_.size() != size_t(kMirrorPages)) page_writes_.assign(kMirrorPages, 0);
-    for (uint32_t p = p0; p <= p1 && (p >> 6) < mirror_valid_.size(); ++p) {
-      mirror_valid_[p >> 6] &= ~(uint64_t(1) << (p & 63));
-      if ((p >> 6) < watch_armed_.size()) {
-        watch_armed_[p >> 6] &= ~(uint64_t(1) << (p & 63));
+  std::lock_guard<std::mutex> lk(dirty_mu_);
+  writes_pending_.emplace_back(phys, bytes);
+  // Counts RANGES QUEUED now, not entries dirtied -- the dirtying moved into DrainMemoryWrites,
+  // which cannot separate a DMA-origin write from a write-watch one. Renamed in the log to match;
+  // leaving it reading "textures re-decoded" would have made it report zero forever while
+  // claiming that meant the mirror landed bytes nobody read.
+  ++dma_invalidations_;
+}
+
+/// Drop the snapshot for a range WITHOUT claiming anyone wrote it.
+///
+/// InvalidateGuestRange also bumps page_writes_, which is right for our own mirrored copies (we
+/// really did write those bytes) and WRONG here: the content probe only observed that a slot's
+/// contents differ from what we decoded, and recording that as a write would corrupt the
+/// write-history predicate that the partial-source test depends on -- the same class of error as
+/// marking pages written for a copy whose source was empty.
+///
+/// This exists because the probe (which reads LIVE memory) forced a rebuild, while the rebuild
+/// reads MirrorSnapshot -- so a slot whose occupant changed was re-decoded from the stale snapshot
+/// and produced the same old image. 2,457 forced rebuilds in one run, every one a no-op in content
+/// terms, which is why driving SLOTREUSE to zero never moved the speckle.
+/// WHOSE BYTES ARE THESE? Trace each source page to the address it was first seen under.
+///
+/// Built because the bug is NOT reproducible per surface -- the wall that speckles this run will
+/// not speckle next run -- so any instrument requiring the user to nominate a target cannot
+/// converge. This one finds the corrupt texture itself: the corrupt images show rectangular blocks
+/// of OTHER textures' content, and that is a checkable claim.
+void ResourceTracker::NotePageOrigin(const uint8_t* src, size_t guest_bytes,
+                                     const TextureFetchConstant& t, uint32_t height) {
+  if (!src || !REXCVAR_GET(nx1_d3d9_dbg_pageorigin) || guest_bytes < 4096) {
+    return;
+  }
+  const uint32_t self = PhysicalAddress(t.base_address);
+  uint32_t pages = 0, foreign = 0, named = 0;
+  uint32_t from_addr[8] = {};
+  uint32_t from_page[8] = {};
+  for (size_t off = 0; off + 4096 <= guest_bytes; off += 4096) {
+    // Strided hash: identifying a page's content does not need every byte, and hashing all of
+    // them for every decode is real bandwidth.
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 4096; i += 64) {
+      uint64_t v;
+      std::memcpy(&v, src + off + i, sizeof(v));
+      h = (h ^ v) * 1099511628211ull;
+    }
+    ++pages;
+    auto& po = page_origin_[h];
+    if (!po.first_addr) {
+      po.first_addr = self;
+      po.addr_count = 1;
+    } else if (po.first_addr != self) {
+      if (po.addr_count < 255) ++po.addr_count;
+      // A page reached by many addresses is legitimately shared (blank/uniform), not stolen.
+      if (po.addr_count <= kPageOriginMaxAddrs) {
+        ++foreign;
+        if (named < 8) {
+          from_addr[named] = po.first_addr;
+          from_page[named] = uint32_t(off >> 12);
+          ++named;
+        }
       }
-      if (p < page_writes_.size() && page_writes_[p] < 255) ++page_writes_[p];
     }
   }
-  if (auto* textures = static_cast<TextureMap*>(textures_)) {
-    for (auto [key, entry] : *textures) {
-      if (!entry.watch_size) {
-        continue;
+  if (pages && foreign * 100 / pages >= REXCVAR_GET(nx1_d3d9_dbg_pageorigin_pct)) {
+    ++pageorigin_flagged_;
+    if (pageorigin_flagged_ <= 16) {
+      std::string from;
+      for (uint32_t i = 0; i < named; ++i) {
+        from += fmt::format("p{}<-{:08X} ", from_page[i], from_addr[i]);
       }
-      const uint32_t e0 = entry.watch_addr;
-      const uint32_t e1 = entry.watch_addr + entry.watch_size;
-      if (a0 < e1 && e0 < a1) {
-        entry.dirty = true;
-        entry.retry_frame = 0;
-        ++dma_invalidations_;
+      // EXTENT OVERRUN, stated numerically. Every donor address observed so far equals this
+      // texture's base plus the offset of the foreign page -- i.e. a real texture BEGINS inside
+      // the range we computed for this one, which means our extent exceeds the guest's actual
+      // allocation and the decode reads its neighbours. Report the inputs that produce that
+      // extent (pitch, tiling) next to the minimum the image itself needs, so the padding rule
+      // responsible is visible rather than inferred.
+      uint64_t min_bytes = 0;
+      if (const auto* fi = rex::graphics::FormatInfo::Get(t.format)) {
+        const uint32_t bw = (t.width + fi->block_width - 1) / fi->block_width;
+        const uint32_t bh = (height + fi->block_height - 1) / fi->block_height;
+        min_bytes = uint64_t(bw) * bh * fi->bytes_per_block();
       }
+      REXGPU_WARN("nx1_d3d9: PAGEORIGIN {:08X} {}x{} fmt={} tiled={} pitch_px={} -- {} of {} "
+                  "source pages hold content FIRST SEEN under another texture's address [{}]. We "
+                  "read {} bytes where the image itself needs {} ({}x). Donor == base+page_offset "
+                  "means a real texture BEGINS inside our extent",
+                  t.base_address, t.width, height, t.format, t.tiled ? 1 : 0, t.pitch_pixels,
+                  foreign, pages, from, guest_bytes, min_bytes,
+                  min_bytes ? guest_bytes / min_bytes : 0);
+    }
+  }
+  ++pageorigin_decodes_;
+  if ((pageorigin_decodes_ % 2000) == 0) {
+    REXGPU_WARN("nx1_d3d9: PAGEORIGIN {} of {} decodes are built from another texture's pages -- "
+                "zero means guest memory is coherent and the fault is in the DECODE",
+                pageorigin_flagged_, pageorigin_decodes_);
+  }
+}
+
+void ResourceTracker::InvalidateMirrorPages(uint32_t phys, uint32_t bytes) {
+  if (!bytes || !mirror_ || mirror_valid_.empty()) {
+    return;
+  }
+  const uint32_t p0 = phys >> 12;
+  const uint32_t p1 = (phys + bytes - 1) >> 12;
+  for (uint32_t p = p0; p <= p1 && (p >> 6) < mirror_valid_.size(); ++p) {
+    mirror_valid_[p >> 6] &= ~(uint64_t(1) << (p & 63));
+    if ((p >> 6) < watch_armed_.size()) {
+      watch_armed_[p >> 6] &= ~(uint64_t(1) << (p & 63));
     }
   }
 }
@@ -3320,10 +3482,24 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // nothing about the host texture -- folding it into the key only forced a re-decode every time
   // the pool moved, and re-reading base_address mid-stream is what dissolved the surface into
   // rainbow static. base_address (also the cache-map key) already identifies the texel data.
+  // PITCH AND ENDIAN BELONG IN THIS KEY. DecodeViewKey -- the other "what makes a decode
+  // different" key in this file -- includes both, and its comment records the evening lost to
+  // treating a view difference as noise. This key omitted them, and they are not cosmetic:
+  //
+  //   pitch_pixels feeds TextureExtent::Calculate -> block_pitch_h -> GetTiledOffset2D(x, y,
+  //   PITCH, bpb). A different pitch means completely different tiled addressing over the same
+  //   bytes, so the cache would serve a decode built with the previous binding's stride --
+  //   scattering blocks and reaching into the neighbouring allocations that the XDK documents
+  //   the guest as packing data into (XGAddress2DTiledExtent: alignment gaps "you might want to
+  //   reclaim for other purposes"). That reads as rectangular foreign blocks over a
+  //   partly-correct surface, varying run to run with whichever binding cached first.
+  //
+  //   endian feeds CopySwapBlock inside DetileMip2D, so it changes the texel values outright.
   const uint64_t layout_key = MixKey(
-      MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
-             MixKey((uint64_t(height) << 1) | (t.tiled ? 1 : 0), t.swizzle)),
-      (uint64_t(t.mip_max_level) << 1) | (t.packed_mips ? 1 : 0));
+      MixKey(MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
+                    MixKey((uint64_t(height) << 1) | (t.tiled ? 1 : 0), t.swizzle)),
+             (uint64_t(t.mip_max_level) << 1) | (t.packed_mips ? 1 : 0)),
+      (uint64_t(t.pitch_pixels) << 8) | t.endian);
 
   const uint64_t key = MixKey(t.base_address, sampler);
   auto* map = static_cast<TextureMap*>(textures_);
@@ -3464,6 +3640,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         entry.dirty = true;
         entry.retry_frame = 0;
         ++probe_rebuilds_;
+        // THE REBUILD MUST RE-READ THE SLOT. The probe reads LIVE memory; the rebuild reads
+        // MirrorSnapshot, which serves a cached page until something drops its validity bit.
+        // Without this the forced rebuild re-decoded the SAME STALE BYTES and produced the same
+        // image -- which is exactly why the probe took SLOTREUSE 156 -> 0 while the speckle was
+        // completely unmoved.
+        InvalidateMirrorPages(PhysicalAddress(t.base_address), probe_bytes);
       }
     }
   }
@@ -3736,6 +3918,42 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   const uint8_t* src;
   if (REXCVAR_GET(nx1_d3d9_texture_mirror)) {
     src = MirrorSnapshot(t.base_address, uint32_t(guest_bytes));
+    // IS THE SNAPSHOT STALE? Every census this investigation has run reads LIVE guest memory,
+    // while the decode reads the mirror -- so a divergence between the two is precisely the blind
+    // spot none of them could report. Compare what we are about to decode against what guest RAM
+    // holds right now. Page-granular, because the corruption is: part of a texture correct, part
+    // foreign, split on 4 KB boundaries.
+    if (REXCVAR_GET(nx1_d3d9_dbg_mirrorstale) && guest_bytes) {
+      if (const uint8_t* live = TranslatePhysical(t.base_address)) {
+        uint32_t pages = 0, diff = 0;
+        for (size_t off = 0; off < guest_bytes; off += 4096) {
+          const size_t len = std::min<size_t>(4096, guest_bytes - off);
+          ++pages;
+          if (std::memcmp(src + off, live + off, len) != 0) {
+            ++diff;
+          }
+        }
+        ++mirrorstale_decodes_;
+        mirrorstale_pages_ += pages;
+        if (diff) {
+          ++mirrorstale_stale_decodes_;
+          mirrorstale_stale_pages_ += diff;
+          if (mirrorstale_stale_decodes_ <= 12) {
+            REXGPU_WARN("nx1_d3d9: MIRRORSTALE {:08X} {}x{} fmt={} -- {} of {} snapshot pages "
+                        "DIFFER from live guest memory, so this decode is about to use bytes the "
+                        "slot no longer holds",
+                        t.base_address, t.width, height, t.format, diff, pages);
+          }
+        }
+        if ((mirrorstale_decodes_ % 2000) == 0) {
+          REXGPU_WARN("nx1_d3d9: MIRRORSTALE {} of {} decodes read a STALE snapshot ({} of {} "
+                      "pages differed from live memory). Nonzero means the DECODE SOURCE, not "
+                      "guest memory, is what holds the wrong texture",
+                      mirrorstale_stale_decodes_, mirrorstale_decodes_, mirrorstale_stale_pages_,
+                      mirrorstale_pages_);
+        }
+      }
+    }
   } else {
     // Live read, but still watch the pages: the watch used to be armed only as a side effect
     // of snapshotting, so reading live left every texture unwatched and a decode taken before
@@ -3743,6 +3961,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ArmWriteWatch(t.base_address, uint32_t(guest_bytes));
     src = TranslatePhysical(t.base_address);
   }
+  // AFTER the source is chosen, and deliberately outside the branch above: this census asks whose
+  // bytes we are about to decode, which is the same question whether they came from the snapshot
+  // or from live memory. It was originally written inside the mirror branch and therefore never
+  // ran at all -- the config in use had nx1_d3d9_texture_mirror=false, so all 26,727 decodes of
+  // that run took the else path and the detector reported nothing while appearing to work.
+  NotePageOrigin(src, guest_bytes, t, height);
   // ONLY the layout decides recreation. mip_source was added here too and had to come back out:
   // it is derived from state that can differ between binds of the same texture, so it turned
   // every such bind into a release + recreate (see the want_mips note above).
@@ -5004,9 +5228,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetVolumeTexture(const TextureFetchConst
   const uint32_t blocks_wide = (t.width + fmt->block_width - 1) / fmt->block_width;
   const uint32_t blocks_high = (t.height + fmt->block_height - 1) / fmt->block_height;
 
-  const uint64_t layout_key =
+  // pitch/endian included for the same reason as the 2D path: both change the decode, and a key
+  // that ignores them serves the previous binding's image.
+  const uint64_t layout_key = MixKey(
       MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
-             MixKey((uint64_t(t.height) << 16) | t.depth, (uint64_t(t.swizzle) << 1) | t.tiled));
+             MixKey((uint64_t(t.height) << 16) | t.depth, (uint64_t(t.swizzle) << 1) | t.tiled)),
+      (uint64_t(t.pitch_pixels) << 8) | t.endian);
   const uint64_t key = MixKey(t.base_address, sampler | 0x8000u);  // distinct from the 2D key
   auto* map = static_cast<TextureMap*>(textures_);
   auto& entry = (*map)[key];
@@ -5110,9 +5337,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetCubeTexture(const TextureFetchConstan
   const uint32_t face_bytes = extent.block_pitch_h * extent.block_pitch_v * bpb;
   const uint32_t face_stride = (face_bytes + align - 1) & ~(align - 1);
 
-  const uint64_t layout_key =
+  // pitch/endian included for the same reason as the 2D path.
+  const uint64_t layout_key = MixKey(
       MixKey(MixKey(t.base_address, (uint64_t(t.format) << 32) | t.width),
-             MixKey((uint64_t(t.height) << 1) | (t.tiled ? 1 : 0), t.swizzle));
+             MixKey((uint64_t(t.height) << 1) | (t.tiled ? 1 : 0), t.swizzle)),
+      (uint64_t(t.pitch_pixels) << 8) | t.endian);
   const uint64_t key = MixKey(t.base_address, sampler | 0x4000u);  // distinct from 2D and 3D
   auto* map = static_cast<TextureMap*>(textures_);
   auto& entry = (*map)[key];
