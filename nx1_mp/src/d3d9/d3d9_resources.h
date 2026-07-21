@@ -617,6 +617,7 @@ class ResourceTracker {
   uint64_t mips_guest_ = 0;            ///< chain decoded from the guest's mip_address
   uint64_t mips_basemap_ = 0;          ///< kBaseMap: level 0 only, no chain wanted at all
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
+  uint64_t probe_rebuilds_ = 0;        ///< rebuilds forced by the content probe
   uint64_t forced_rechecks_ = 0;       ///< re-decodes forced by nx1_d3d9_redecode_delay
   /// Autotrack hand-off. Decodes run on the async worker and MUST NOT write cvars from there --
   /// doing so crashed the game with a near-null read fault inside the cvar machinery. The decode

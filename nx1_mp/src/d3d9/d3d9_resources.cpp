@@ -131,6 +131,34 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 /// Hashes reached by many addresses are EXCLUDED: small shared dummy and flat maps legitimately
 /// converge (measured: 16x16, 32x32, 64x64 solid-black images at 8+ addresses each), and counting
 /// those as reuse is the false positive that makes this test useless.
+/// Sample the guest source cheaply enough to run on every texture once per frame.
+///
+/// Full hashing per bind is exactly what the write-watch exists to avoid: the cache early-out
+/// runs ~80k times a frame. This reads 64 widely-spaced 8-byte samples instead, which catches a
+/// slot whose occupant was REPLACED (a different image entirely) while costing ~512 bytes of
+/// reads per texture per frame. It will not catch a subtle in-place edit, and is not meant to --
+/// the write-watch covers those.
+uint64_t ProbeGuestContent(const uint8_t* p, uint32_t bytes) {
+  if (!p || bytes < 8) {
+    return 0;
+  }
+  uint64_t h = 1469598103934665603ull;
+  const uint32_t samples = 64;
+  const uint32_t stride = bytes / samples < 8 ? 8 : bytes / samples;
+  for (uint32_t off = 0; off + 8 <= bytes; off += stride) {
+    uint64_t v;
+    std::memcpy(&v, p + off, sizeof(v));
+    h = (h ^ v) * 1099511628211ull;
+  }
+  return h ? h : 1;
+}
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_content_probe, true, "GPU",
+                    "Re-check a cached texture's guest content once per frame and rebuild it if "
+                    "the slot's occupant changed. Without this the pool can move a different "
+                    "image of the same size and format into a cached address and we keep serving "
+                    "the previous texture -- the surface renders another texture's bytes");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_slotreuse, false, "GPU",
                     "When a texture's decoded content changes, report whether the new content was "
                     "previously decoded at a DIFFERENT address -- i.e. the pool reused the slot");
@@ -871,6 +899,12 @@ struct TextureEntry {
   /// exactly that -- source went 0 -> 8121/8192 nonzero AFTER the entry committed, and it then
   /// reported dirty=0 committed=1 on every subsequent frame and never re-decoded.
   bool decoded_from_partial = false;
+  /// Cheap content fingerprint of the guest source, taken at decode and re-checked once per
+  /// frame on bind. layout_key cannot distinguish two textures when the pool moves a different
+  /// image of the SAME dimensions and format into this address -- measured 156 times in one run
+  /// -- so cache identity must depend on what the slot HOLDS, not only where it is.
+  uint64_t probe_hash = 0;
+  uint64_t probe_frame = 0;
   bool committed = false;
   /// Consecutive fully-transparent decodes of a broadcast-swizzle sprite, and the frame before
   /// which not to bother trying again. A sprite whose texel pool never streams in (this build has
@@ -2276,6 +2310,9 @@ void ResourceTracker::LogCacheStats() {
               "with the DECODECHANGE count: rechecks that found DIFFERENT bytes are decodes that "
               "had been taken before the data landed",
               forced_rechecks_, REXCVAR_GET(nx1_d3d9_redecode_delay));
+  REXGPU_INFO("nx1_d3d9: CONTENTPROBE {} rebuilds forced by a changed slot occupant -- each one "
+              "is a surface that would otherwise have rendered another texture's bytes",
+              probe_rebuilds_);
   REXGPU_INFO("nx1_d3d9: PARTIALSRC {} of {} decodes had an incomplete source ({}%) | {} of {} "
               "source pages were still empty ({}%) -- the objective speckle baseline",
               partial_decodes_, decodes_total_,
@@ -3384,6 +3421,30 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     } else {
       entry.recheck_frame = 0;
       entry.ladder_done = true;  // four rechecks is the whole test; do not re-arm
+    }
+  }
+  // SLOT-OCCUPANT CHECK. Once per frame per texture, confirm the guest memory still holds what
+  // we decoded. The pool relocates images between same-sized slots, so an address alone is not an
+  // identity: measured 156 cases in one run where a cached address came to hold a DIFFERENT
+  // texture of identical dimensions and format, and we served the old decode to the new binder.
+  // Bounded to one probe per texture per frame -- the early-out below runs ~80k times a frame and
+  // must stay cheap.
+  if (entry.tex && entry.probe_hash && entry.probe_frame != frame_ &&
+      REXCVAR_GET(nx1_d3d9_content_probe)) {
+    entry.probe_frame = frame_;
+    uint32_t probe_bytes = 0;
+    if (const auto* fi_p = rex::graphics::FormatInfo::Get(t.format)) {
+      const uint32_t bw_p = (t.width + fi_p->block_width - 1) / fi_p->block_width;
+      const uint32_t bh_p = (height + fi_p->block_height - 1) / fi_p->block_height;
+      probe_bytes = bw_p * bh_p * fi_p->bytes_per_block();
+    }
+    if (probe_bytes) {
+      const uint64_t now_hash = ProbeGuestContent(TranslatePhysical(t.base_address), probe_bytes);
+      if (now_hash && now_hash != entry.probe_hash) {
+        entry.dirty = true;
+        entry.retry_frame = 0;
+        ++probe_rebuilds_;
+      }
     }
   }
   if (entry.tex && entry.layout_key == layout_key && (!entry.dirty || frame_ < entry.retry_frame)) {
@@ -4577,6 +4638,17 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       uint32_t(size_t(dst_row_bytes) * extent.block_height * (levels > 1 ? 4 : 3) / 3);
   entry.layout_key = layout_key;
   entry.dirty = false;
+  {
+    uint32_t probe_bytes = 0;
+    if (const auto* fi_d = rex::graphics::FormatInfo::Get(t.format)) {
+      const uint32_t bw_d = (t.width + fi_d->block_width - 1) / fi_d->block_width;
+      const uint32_t bh_d = (height + fi_d->block_height - 1) / fi_d->block_height;
+      probe_bytes = bw_d * bh_d * fi_d->bytes_per_block();
+    }
+    entry.probe_hash =
+        probe_bytes ? ProbeGuestContent(TranslatePhysical(t.base_address), probe_bytes) : 0;
+    entry.probe_frame = frame_;
+  }
   // Arm the premature-decode ladder HERE, at the actual end of a decode. It was first placed at
   // the `committed = true` further up, which sits above the cache lookup and never runs on this
   // path -- the run reported "forced=0" with the cvar plainly set, i.e. the instrument measured
