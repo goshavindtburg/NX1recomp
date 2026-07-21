@@ -1302,23 +1302,39 @@ bool SourceHasAnyData(const uint8_t* base, uint32_t src, uint32_t bytes) {
 /// were believed to be routinely unfilled. They are not (PARTIALSRC 0%), and copying a genuinely
 /// zero page writes zeros, which is CORRECT for a legitimately transparent region. So copy the
 /// whole range, exactly as the GPU blit does.
-/// DEFAULTED OFF AFTER IT CRASHED THE GAME. Verbatim copying removed the lattice but did NOT fix
-/// the speckle, and it made `InvalidateGuestRange` fire for every page rather than only non-empty
-/// ones -- roughly 8x the call rate. That function takes NO LOCK while it iterates the texture map
-/// and can reallocate page_writes_, and it runs on the guest DMA thread while the render/worker
-/// thread inserts into that same map. Concurrent iterate-plus-insert on an unordered_map is
-/// undefined, and the game died inside ImageCache_DmaCopyDelayed with a near-null read
-/// (guest lr=824D3504, read fault 0x1B25) -- a crash signature seen in no other run.
+/// DEFAULTED ON 2026-07-21. It was previously off because it CRASHED THE GAME, and that reason is
+/// now stale -- read this before turning it back off.
 ///
-/// The race is pre-existing and still needs fixing; this only stops feeding it. Note also that the
-/// XDK documents the guest as packing data into the alignment gaps of texture allocations
-/// (XGAddress2DTiledExtent), so a full-range copy can overwrite whatever the guest put there --
-/// the correct model is to mirror only the REFERENCED regions (XGGetTextureLayout returns them as
-/// a region list), not the whole declared extent.
-REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_verbatim, false, "GPU",
-                    "Mirror an image-cache copy over its FULL range, as the GPU blit does. On = "
-                    "also writes the allocation's alignment gaps, which the guest packs other "
-                    "data into, and multiplies InvalidateGuestRange traffic into a known race");
+/// The crash: verbatim made `InvalidateGuestRange` fire for every page rather than only non-empty
+/// ones, ~8x the call rate, and that function then took NO LOCK while iterating the texture map and
+/// could reallocate page_writes_ from the guest DMA thread while the render thread inserted into
+/// the same map. The game died inside ImageCache_DmaCopyDelayed with a near-null read
+/// (guest lr=824D3504, read fault 0x1B25). **That race was fixed in c661463**: InvalidateGuestRange
+/// now only takes dirty_mu_ and pushes onto writes_pending_, with the dirtying moved to
+/// DrainMemoryWrites on the render thread. 8x the traffic is now 8x a locked vector push, which is
+/// cheap and safe. The crash rationale no longer applies.
+///
+/// WHY IT IS ON: the skip is self-amplifying. A MOVE's source is pool memory written by an EARLIER
+/// copy, so skipping that earlier copy leaves the region empty and every later move reading it is
+/// skipped too. Measured before the mechanism was understood: 357 of 1400 empty sources trace to an
+/// earlier copy, and 350 of those 357 to a copy WE SKIPPED. Turning this on collapsed deferrals
+/// from 500 landed / 1521 abandoned to 0 / 9, and removed the page-duplication, the one-page
+/// displacement and the two-textures-reading-identical-fill signatures outright.
+///
+/// RESIDUAL CONCERN, judged acceptable rather than dismissed: the XDK documents the guest packing
+/// data into the alignment gaps of texture allocations (XGAddress2DTiledExtent), so writing zeros
+/// across a copy's whole range can clobber whatever the guest put in the gaps. The console's own
+/// blit is a verbatim byte move over that same range, so the guest cannot be relying on anything
+/// surviving inside it -- hardware would destroy it too. The sharper model is still to mirror only
+/// the REFERENCED regions (XGGetTextureLayout returns them as a region list) rather than the
+/// declared extent; that remains worth doing and is orthogonal to this flag.
+///
+/// NOTE the old help text was also wrong: this does not widen the copy's RANGE. The range is the
+/// `bytes` argument either way; verbatim only stops SKIPPING all-zero source pages within it.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_verbatim, true, "GPU",
+                    "Copy every page of an image-cache copy, including all-zero source pages, as "
+                    "the GPU blit does. Off skips empty source pages, which leaves the previous "
+                    "occupant in place and starves later moves that read those pages");
 
 /// `seq` is the destination stamp from StampDmaDest, so a page deferred here can be dropped if a
 /// newer copy claims the same destination. Pass 0 from the retry drain itself (no re-deferral).
