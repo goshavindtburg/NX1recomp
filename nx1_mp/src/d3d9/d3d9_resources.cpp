@@ -99,6 +99,32 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 /// noise on screen. So substitute rather than display: a flat neutral texel is what a
 /// not-yet-resident image is supposed to look like, and it is strictly closer to the reference
 /// than garbage is. The real decode replaces it the moment the source completes.
+/// Dump the decoded image whose content hash matches this (low 32 bits), once.
+///
+/// 34 DISTINCT texture addresses were measured converging on ONE identical content hash, and
+/// several other hashes were reached by a dozen addresses each. Many slots holding the same
+/// image is not corruption -- it is one image being written over many textures, which is exactly
+/// what the image cache's default-pixel placeholder would look like from here. Identifying that
+/// image by eye settles what the speckle actually IS, rather than inferring it from byte
+/// statistics (which has misled this project three times).
+/// Dump the image that MANY DISTINCT textures converge on, detected live.
+///
+/// Targeting a hash copied out of an earlier log does not work: content hashes do not survive a
+/// session, because the streaming pool loads different images at different addresses each run.
+/// Detect the convergence itself instead -- when N distinct texture addresses decode to the
+/// SAME content, that image is being written over many slots, and identifying it settles whether
+/// the speckle is the image cache's not-resident placeholder rather than damaged data.
+/// Measured: 34 distinct addresses reached one hash in a single run, with several more hashes
+/// reached by a dozen addresses each.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_convergence_n, 0, "GPU",
+                      "Dump a decoded image once this many DISTINCT texture addresses have "
+                      "produced identical content (0 = off, 8 is a good start)");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_hash_lo32, 0, "GPU",
+                      "Dump the decoded image whose FNV content hash has these low 32 bits, to "
+                      "texdump/hashdump_<lo32>_<addr>.bmp -- identifies what many textures are "
+                      "all turning into");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_hide_partial, false, "GPU",
                     "Bind a flat placeholder instead of a texture decoded from a source with "
                     "empty pages, until its data actually arrives");
@@ -3819,6 +3845,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // the transitions: an address whose hash changes tells us exactly when it went bad, and how
   // many writes had landed by then. Silence means each texture decodes the same way forever and
   // the "we re-read stale memory" model is wrong too.
+  bool hash_dump_match = false;  ///< set when this decode matches nx1_d3d9_dbg_dump_hash_lo32
   if (src && dst) {
     uint64_t h = 1469598103934665603ull;
     const size_t hashed = size_t(dst_row_bytes) * extent.block_height;
@@ -3835,6 +3862,42 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                   "{:016X} | page writes {} -> {}",
                   t.base_address, t.width, height, t.format, prev.frame, frame_, prev.hash, h,
                   prev.writes, wsum);
+    }
+    // Live convergence detector: how many DISTINCT addresses have produced this exact content?
+    if (const uint32_t conv_n = REXCVAR_GET(nx1_d3d9_dbg_convergence_n); conv_n > 1) {
+      static std::mutex cm;
+      static std::unordered_map<uint64_t, std::vector<uint32_t>> conv;
+      static std::vector<uint64_t> conv_dumped;
+      std::lock_guard<std::mutex> lk(cm);
+      if (conv.size() < 4096) {
+        auto& addrs = conv[h];
+        if (std::find(addrs.begin(), addrs.end(), t.base_address) == addrs.end()) {
+          addrs.push_back(t.base_address);
+          if (addrs.size() >= conv_n && conv_dumped.size() < 4 &&
+              std::find(conv_dumped.begin(), conv_dumped.end(), h) == conv_dumped.end()) {
+            conv_dumped.push_back(h);
+            hash_dump_match = true;
+            REXGPU_WARN("nx1_d3d9: CONVERGENCE hash {:016X} reached by {} DISTINCT addresses "
+                        "(this one {:08X} {}x{} fmt={}) -- one image written over many slots; "
+                        "dumping it",
+                        h, addrs.size(), t.base_address, t.width, height, t.format);
+          }
+        }
+      }
+    }
+    // Identify the image that many textures converge on.
+    if (const uint32_t want = REXCVAR_GET(nx1_d3d9_dbg_dump_hash_lo32);
+        want && uint32_t(h & 0xFFFFFFFFu) == want) {
+      static std::mutex hm;
+      static std::vector<uint32_t> dumped;
+      std::lock_guard<std::mutex> lk(hm);
+      if (std::find(dumped.begin(), dumped.end(), t.base_address) == dumped.end() &&
+          dumped.size() < 4) {
+        dumped.push_back(t.base_address);
+        hash_dump_match = true;  // the existing dump path below handles BC and A8R8G8B8 alike
+        REXGPU_WARN("nx1_d3d9: HASHDUMP {:08X} {}x{} fmt={} hash {:016X} -- dumping this decode",
+                    t.base_address, t.width, height, t.format, h);
+      }
     }
     if (!prev.decodes) {
       prev.first_hash = h;
@@ -3979,8 +4042,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           : ((!dump_maxdim || (t.width <= dump_maxdim && height <= dump_maxdim)) &&
              (!dump_fmt1 || t.format == dump_fmt1 - 1));
   if (const uint32_t tex_dump_left = REXCVAR_GET(nx1_d3d9_dbg_texdump);
-      tex_dump_left && dst && dump_size_ok) {
-    REXCVAR_SET(nx1_d3d9_dbg_texdump, tex_dump_left - 1);
+      dst && ((tex_dump_left && dump_size_ok) || hash_dump_match)) {
+    if (tex_dump_left && !hash_dump_match) {
+      REXCVAR_SET(nx1_d3d9_dbg_texdump, tex_dump_left - 1);
+    }
     // The raw guest bytes first: all-zero says the data never arrived, anything else says it
     // is present and we are decoding it wrong. That single distinction is what separates a
     // content gap from a renderer bug, and it cannot be read off the screen.

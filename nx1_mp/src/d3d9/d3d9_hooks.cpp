@@ -1019,11 +1019,17 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
     }
     pages_copied.fetch_add(1, std::memory_order_relaxed);
     std::memcpy(d, s, chunk);
+    // Invalidate (and mark written) ONLY the page we actually wrote. The blanket call that used
+    // to follow this loop covered skipped pages too, so a copy whose source was entirely empty
+    // still marked its destination "written" without writing anything -- which let a
+    // never-written page pass the partial test and be rendered as solid black instead of held
+    // back. Measured: several small textures converged on an all-black image reached by 8+
+    // distinct addresses each.
+    nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange((dst + off) & 0x1FFFFFFF, chunk);
   }
-  // The write above bypassed guest page protection, so nothing was invalidated by it. Tell the
-  // tracker explicitly, or every texture cached over this range keeps serving its pre-copy
-  // contents -- landing the bytes is only half the job.
-  nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange(dst & 0x1FFFFFFF, bytes);
+  // NOTE: invalidation now happens per COPIED page inside the loop above, not for the whole
+  // range here. Landing the bytes is only half the job -- but claiming to have landed bytes we
+  // skipped is worse than not claiming at all.
 }
 
 }  // namespace
