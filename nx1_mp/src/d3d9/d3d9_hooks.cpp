@@ -952,47 +952,300 @@ void VerifyPendingDma(const uint8_t* base) {
 struct DmaOrigin {
   uint32_t src;
   uint32_t bytes;
+  bool mirrored;  ///< false if THIS copy was itself skipped for an empty source
 };
 std::mutex g_dma_chain_m;
 std::unordered_map<uint32_t, DmaOrigin> g_dma_chain;  // destination page -> what filled it
+
+/// Record EVERY page a copy's destination covers, whether or not we could mirror it.
+///
+/// Two defects in the original made "zero upstream cases" unfalsifiable, and both bit exactly
+/// the case the census exists to find:
+///
+///   1. A copy with an EMPTY source returned before recording its own destination. So when a
+///      later copy read from that destination, the lookup missed and it was reported an ORIGIN
+///      -- "nothing we see ever filled it". A PROPAGATING CHAIN BREAK, the single most likely
+///      shape of this bug, was the one shape structurally invisible.
+///   2. Only the destination's FIRST page was recorded, though a copy spans `bytes`. A source
+///      pointing into the middle of an earlier destination missed. Live in the data: dst
+///      ACD10000 against src ACD3A000 is 168 KB into that destination.
+///
+/// Recording the full span, with a flag for whether the fill actually happened, separates three
+/// outcomes that the old census collapsed into "ORIGIN".
+void RecordDmaDest(uint32_t dst, uint32_t src, uint32_t bytes, bool mirrored) {
+  if (g_dma_chain.size() > 400000) {  // ~512 MB pool / 4 KB, so this is a runaway guard only
+    return;
+  }
+  const uint32_t first = (dst & 0x1FFFFFFF) >> 12;
+  const uint32_t last = ((dst & 0x1FFFFFFF) + (bytes ? bytes - 1 : 0)) >> 12;
+  for (uint32_t p = first; p <= last && p - first < 4096; ++p) {
+    g_dma_chain[p] = {src, bytes, mirrored};
+  }
+}
 
 void NoteDmaChain(uint32_t dst, uint32_t src, uint32_t bytes, bool src_empty) {
   if (!REXCVAR_GET(nx1_d3d9_dbg_dmachain)) {
     return;
   }
-  const uint32_t dst_page = (dst & 0x1FFFFFFF) >> 12;
   const uint32_t src_page = (src & 0x1FFFFFFF) >> 12;
   std::lock_guard<std::mutex> lk(g_dma_chain_m);
   if (src_empty) {
-    static std::atomic<uint64_t> upstream{0}, origin{0}, reported{0};
+    static std::atomic<uint64_t> upstream{0}, origin{0}, reported{0}, up_skipped{0}, up_mirrored{0};
     const auto it = g_dma_chain.find(src_page);
     const bool known = it != g_dma_chain.end();
     (known ? upstream : origin).fetch_add(1, std::memory_order_relaxed);
+    if (known) {
+      // The decisive split. An upstream copy we SKIPPED means the break propagates through a
+      // path we already observe -- fixable in the DMA path. An upstream copy we MIRRORED that
+      // still reads empty means our own write did not land, which is a different bug entirely.
+      (it->second.mirrored ? up_mirrored : up_skipped).fetch_add(1, std::memory_order_relaxed);
+    }
+    // Verdict census over EVERY empty source, not just the 24 detailed below: the detail lines
+    // are the first ones to occur, which is a poor sample of a pattern that may only appear
+    // once the streamer is busy.
+    static std::atomic<uint64_t> v_never{0}, v_wrote{0}, v_notimage{0}, v_badfmt{0}, v_budget{0};
+    {
+      using WV = nx1::d3d9::ResourceTracker::WritebackVerdict;
+      switch (nx1::d3d9::ResourceTracker::Get().ResolveDestVerdict(src & 0x1FFFFFFF, nullptr)) {
+        case WV::kWrote: v_wrote.fetch_add(1, std::memory_order_relaxed); break;
+        case WV::kNotImage: v_notimage.fetch_add(1, std::memory_order_relaxed); break;
+        case WV::kBadFormat: v_badfmt.fetch_add(1, std::memory_order_relaxed); break;
+        case WV::kOverBudget: v_budget.fetch_add(1, std::memory_order_relaxed); break;
+        case WV::kNever: v_never.fetch_add(1, std::memory_order_relaxed); break;
+      }
+    }
     if (reported.fetch_add(1, std::memory_order_relaxed) < 24) {
       if (known) {
         REXGPU_WARN("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY -- that source was itself "
-                    "filled by a copy from {:08X} ({} bytes), so the break is UPSTREAM",
-                    dst, src, it->second.src, it->second.bytes);
+                    "the destination of a copy from {:08X} ({} bytes) which we {}, so the break "
+                    "is UPSTREAM",
+                    dst, src, it->second.src, it->second.bytes,
+                    it->second.mirrored ? "DID mirror (yet it reads empty -- our write did not "
+                                          "land where this copy reads)"
+                                        : "SKIPPED for an empty source (the break propagates)");
       } else {
         // Has ANYTHING we can see ever written this page? Separates "written then cleared"
         // from "filled by a path outside our observation entirely".
         const uint32_t w0 = nx1::d3d9::ResourceTracker::Get().PageWriteCount(src);
         const uint32_t w1 = nx1::d3d9::ResourceTracker::Get().PageWriteCount(src + 4096);
+        // Is this "origin" actually a resolve destination we DECLINED to write back? That is
+        // the difference between a mechanism we do not observe and one we observe and skip --
+        // and only the second is already fixable with code that exists.
+        using WV = nx1::d3d9::ResourceTracker::WritebackVerdict;
+        uint32_t rfmt = 0;
+        const WV wv = nx1::d3d9::ResourceTracker::Get().ResolveDestVerdict(src & 0x1FFFFFFF, &rfmt);
+        const char* why = "never a resolve destination either -- filled outside our observation";
+        char buf[128];
+        switch (wv) {
+          case WV::kWrote:
+            why = "a resolve destination we DID write back -- yet it reads empty, so the "
+                  "writeback is not landing where the copy reads";
+            break;
+          case WV::kNotImage:
+            why = "a resolve destination REJECTED as not-a-2D-image -- we declined to fill it";
+            break;
+          case WV::kBadFormat:
+            std::snprintf(buf, sizeof(buf),
+                          "a resolve destination REJECTED for unsupported format %u -- we "
+                          "declined to fill it, and supporting that format would",
+                          rfmt);
+            why = buf;
+            break;
+          case WV::kOverBudget:
+            why = "a resolve destination skipped as OVER BUDGET -- raise nx1_d3d9_writeback_max";
+            break;
+          case WV::kNever:
+            break;
+        }
         REXGPU_WARN("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY and NEVER a DMA destination "
-                    "-- an ORIGIN. Observed writes to its first two pages: {} and {}. Zero means "
-                    "nothing we watch fills it, so its data arrives outside our observation",
-                    dst, src, w0, w1);
+                    "-- an ORIGIN. Observed writes to its first two pages: {} and {}. It is {}",
+                    dst, src, w0, w1, why);
       }
     }
-    if ((reported.load() % 2000) == 0) {
-      REXGPU_WARN("nx1_d3d9: DMACHAIN totals: {} empty sources traced upstream, {} are ORIGINS "
-                  "never written by any copy we see",
-                  upstream.load(), origin.load());
+    // Record this copy's destination EVEN THOUGH we could not fill it. Omitting it is what made
+    // a propagating chain break look like a field of unrelated origins.
+    RecordDmaDest(dst, src, bytes, /*mirrored=*/false);
+    // Every 200, not 2000: the previous run produced FEWER empty sources than the old threshold,
+    // so the totals line -- the only unbiased view -- never printed at all and the conclusion had
+    // to be drawn from the first 24 occurrences.
+    if ((reported.load() % 200) == 0) {
+      REXGPU_WARN("nx1_d3d9: DMACHAIN totals: {} empty sources traced UPSTREAM ({} to a copy we "
+                  "skipped -- break propagates; {} to one we DID mirror -- our write missed), {} "
+                  "are ORIGINS never written by any copy we see. As resolve destinations those "
+                  "empty sources are: {} never resolved, {} written back (yet still empty), {} "
+                  "rejected not-an-image, {} rejected bad format, {} over budget",
+                  upstream.load(), up_skipped.load(), up_mirrored.load(), origin.load(),
+                  v_never.load(), v_wrote.load(), v_notimage.load(), v_badfmt.load(),
+                  v_budget.load());
     }
     return;
   }
-  if (g_dma_chain.size() < 200000) {
-    g_dma_chain[dst_page] = {src, bytes};
+  RecordDmaDest(dst, src, bytes, /*mirrored=*/true);
+}
+
+/// THE SOURCE MAY SIMPLY NOT BE FILLED YET.
+///
+/// Every ORIGIN reported by the chain census reads `first two pages: 1 and 1` -- uniformly ONE
+/// observed write per page, never zero. The write-watch fires on a page's first write and then
+/// leaves it writable, so "1" means "we saw it written once, then went blind". A page that was
+/// written and still reads as zeros at copy time is consistent with exactly one thing: the write
+/// we saw was the allocation's zero-fill, and the REAL fill has not happened yet.
+///
+/// That reframes the whole problem. The guest's DmaCopy only QUEUES a GPU blit; the blit executes
+/// later, after whatever fills the staging buffer has run. Our mirror, by contrast, copies
+/// IMMEDIATELY at hook time. So for a copy whose staging is still being filled we read zeros, skip
+/// (correctly -- copying would blank the destination), and the destination keeps its previous
+/// occupant. We then decode that previous occupant. Which is the speckle, exactly as described.
+///
+/// The test and the fix are the same code: queue the skipped copies and retry them later. If the
+/// sources fill in, the timing theory is proven AND the data lands.
+///
+/// STALENESS GUARD. Writing a destination late is the hazard that has bitten this project before
+/// (the forced re-decode ladder re-read recycled slots). Every copy stamps its destination pages
+/// with a sequence number; a retry is abandoned if any newer copy has targeted the same pages,
+/// so we can never land bytes over a fresher occupant.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_retry, true, "GPU",
+                    "Retry image-cache copies whose source was not yet filled at call time, "
+                    "instead of dropping them. Off = the old drop-on-empty behaviour");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dma_retry_ms, 400, "GPU",
+                      "How long a deferred image-cache copy keeps retrying before it is "
+                      "abandoned as genuinely empty");
+
+struct DmaRetry {
+  uint32_t dst, src, bytes, seq;
+  std::chrono::steady_clock::time_point at;
+};
+std::mutex g_dma_retry_m;
+std::deque<DmaRetry> g_dma_retry;
+std::unordered_map<uint32_t, uint32_t> g_dma_dest_seq;  // destination page -> latest copy seq
+std::atomic<uint32_t> g_dma_seq{1};
+
+/// Stamp every destination page this copy covers, so a later retry can tell whether it would be
+/// writing over a fresher occupant. Independent of the debug census: correctness depends on it.
+uint32_t StampDmaDest(uint32_t dst, uint32_t bytes) {
+  const uint32_t seq = g_dma_seq.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t first = (dst & 0x1FFFFFFF) >> 12;
+  const uint32_t last = ((dst & 0x1FFFFFFF) + (bytes ? bytes - 1 : 0)) >> 12;
+  std::lock_guard<std::mutex> lk(g_dma_retry_m);
+  if (g_dma_dest_seq.size() < 400000) {
+    for (uint32_t p = first; p <= last && p - first < 4096; ++p) {
+      g_dma_dest_seq[p] = seq;
+    }
+  }
+  return seq;
+}
+
+/// Does ANY page of this source carry data? Bounded probe, used to decide whether a deferred copy
+/// is ready. Deliberately NOT ClassifyDmaSource: that samples only the first 4 KB and calls the
+/// source empty at >=95% zeros, which is a heuristic about the OPENING PAGE, not a fact about the
+/// buffer.
+bool SourceHasAnyData(const uint8_t* base, uint32_t src, uint32_t bytes) {
+  const uint32_t pages = (bytes + 4095) / 4096;
+  const uint32_t step = pages > 32 ? pages / 32 : 1;  // spread the probe over the whole buffer
+  for (uint32_t p = 0; p < pages; p += step) {
+    const uint32_t off = p * 4096;
+    const uint32_t chunk = std::min(4096u, bytes - off);
+    const uint8_t* s = nx1::d3d9::GuestPointer(base, src + off);
+    if (!s) {
+      return false;
+    }
+    for (uint32_t i = 0; i < chunk; ++i) {
+      if (s[i]) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// Copy only the source pages that actually carry data. Shared by the immediate mirror and the
+/// retry, so both obey the same rule: an empty source page carries nothing, and copying it can
+/// only erase a destination that may hold live texels.
+uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
+  uint32_t copied = 0;
+  for (uint32_t off = 0; off < bytes; off += 4096) {
+    const uint32_t chunk = std::min(4096u, bytes - off);
+    uint8_t* d = const_cast<uint8_t*>(nx1::d3d9::GuestPointer(base, dst + off));
+    const uint8_t* s = nx1::d3d9::GuestPointer(base, src + off);
+    if (!d || !s) {
+      break;
+    }
+    bool any = false;
+    for (uint32_t i = 0; i < chunk && !any; ++i) {
+      any = s[i] != 0;
+    }
+    if (!any) {
+      continue;
+    }
+    std::memcpy(d, s, chunk);
+    nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange((dst + off) & 0x1FFFFFFF, chunk);
+    ++copied;
+  }
+  return copied;
+}
+
+/// Re-attempt deferred copies whose source has since filled in. Called from the DMA hook itself:
+/// copies are frequent (~67k a run), so this paces naturally without a new thread or timer.
+void DrainDmaRetries(uint8_t* base) {
+  if (!REXCVAR_GET(nx1_d3d9_dma_retry)) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const auto max_age = std::chrono::milliseconds(REXCVAR_GET(nx1_d3d9_dma_retry_ms));
+  static std::atomic<uint64_t> filled{0}, abandoned{0}, stale{0}, latency_us{0}, drains{0};
+  // BOUNDED SCAN, not head-of-line. Taking only the front meant one entry whose source never
+  // fills blocked every entry behind it for the whole expiry window, throttling the retry to
+  // roughly one copy per expiry -- which is indistinguishable, in the log, from a retry that
+  // does not work at all.
+  std::vector<DmaRetry> ready;
+  {
+    std::lock_guard<std::mutex> lk(g_dma_retry_m);
+    size_t i = 0, examined = 0;
+    while (i < g_dma_retry.size() && examined < 128) {
+      const DmaRetry& e = g_dma_retry[i];
+      ++examined;
+      // A newer copy targeting the same destination means our bytes are obsolete: drop them
+      // rather than overwrite a fresher occupant.
+      const auto it = g_dma_dest_seq.find((e.dst & 0x1FFFFFFF) >> 12);
+      if (it != g_dma_dest_seq.end() && it->second != e.seq) {
+        stale.fetch_add(1, std::memory_order_relaxed);
+        g_dma_retry.erase(g_dma_retry.begin() + i);
+        continue;
+      }
+      if (SourceHasAnyData(base, e.src, e.bytes)) {
+        ready.push_back(e);
+        g_dma_retry.erase(g_dma_retry.begin() + i);
+        continue;
+      }
+      if (now - e.at > max_age) {
+        abandoned.fetch_add(1, std::memory_order_relaxed);
+        g_dma_retry.erase(g_dma_retry.begin() + i);
+        continue;
+      }
+      ++i;  // not ready yet, keep waiting
+    }
+  }
+  for (const DmaRetry& e : ready) {
+    if (CopyLiveSourcePages(base, e.dst, e.src, e.bytes)) {
+      filled.fetch_add(1, std::memory_order_relaxed);
+      latency_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - e.at).count()),
+          std::memory_order_relaxed);
+    }
+  }
+  // Report on a fixed cadence regardless of how many landed. The previous every-500-landings
+  // rule printed NOTHING when few or none landed, which is exactly the outcome worth seeing.
+  if ((drains.fetch_add(1, std::memory_order_relaxed) % 20000) == 0) {
+    const uint64_t k = filled.load();
+    size_t queued = 0;
+    {
+      std::lock_guard<std::mutex> lk(g_dma_retry_m);
+      queued = g_dma_retry.size();
+    }
+    REXGPU_WARN("nx1_d3d9: DMARETRY {} deferred copies LANDED (mean {} us late), {} abandoned "
+                "still-empty, {} dropped as stale, {} still queued. Landed>0 means the source "
+                "was simply NOT YET FILLED at call time and we now recover it",
+                k, k ? latency_us.load() / k : 0, abandoned.load(), stale.load(), queued);
   }
 }
 
@@ -1024,7 +1277,18 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   if (bytes < 32 || bytes > (16u << 20) || !dst || !src) {
     return;
   }
-  const bool src_empty = ClassifyDmaSource(base, src, bytes);
+  DrainDmaRetries(base);
+  const uint32_t seq = StampDmaDest(dst, bytes);
+  // Kept for its DMASRC census only. It must NOT gate the copy: it samples the first 4 KB and
+  // declares the source empty at >=95% zeros, so a buffer whose OPENING page is sparse -- a
+  // transparent border, a sparse atlas -- had its ENTIRE copy dropped, however much real data sat
+  // in the pages behind it. Commit 305240b fixed the mirror image of this (opening page full,
+  // later pages empty) and noted the 4 KB sampling without following it the other way.
+  ClassifyDmaSource(base, src, bytes);
+  // The exact test instead of the heuristic: copy every page that carries data, and treat the
+  // copy as empty only when NO page did.
+  const uint32_t copied_now = CopyLiveSourcePages(base, dst, src, bytes);
+  const bool src_empty = copied_now == 0;
   NoteDmaChain(dst, src, bytes, src_empty);
   if (src_empty) {
     static std::atomic<uint64_t> skipped{0};
@@ -1033,6 +1297,13 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
       REXGPU_WARN("nx1_d3d9: DMASKIP {} mirrors skipped -- empty source, so the copy would only "
                   "have blanked a destination that may hold good texels",
                   k);
+    }
+    // Defer rather than discard: the source is very likely still being filled.
+    if (REXCVAR_GET(nx1_d3d9_dma_retry)) {
+      std::lock_guard<std::mutex> lk(g_dma_retry_m);
+      if (g_dma_retry.size() < 4096) {
+        g_dma_retry.push_back({dst, src, bytes, seq, std::chrono::steady_clock::now()});
+      }
     }
     return;
   }
@@ -1064,36 +1335,24 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // a genuine zero-fill, which costs nothing, while the alternative demonstrably wipes live
   // texels. Counted so "the mirror is landing bytes" can be distinguished from "the mirror is
   // landing NOTHING because every page it was handed was blank".
+  //
+  // Invalidation happens per COPIED page inside the helper, never for the whole range: the
+  // blanket call that used to follow this loop covered skipped pages too, so a copy whose source
+  // was entirely empty still marked its destination "written" without writing anything -- which
+  // let a never-written page pass the partial test and render as solid black instead of being
+  // held back.
   static std::atomic<uint64_t> pages_copied{0}, pages_skipped{0};
-  for (uint32_t off = 0; off < bytes; off += 4096) {
-    const uint32_t chunk = std::min(4096u, bytes - off);
-    uint8_t* d = const_cast<uint8_t*>(nx1::d3d9::GuestPointer(base, dst + off));
-    const uint8_t* s = nx1::d3d9::GuestPointer(base, src + off);
-    if (!d || !s) {
-      return;
-    }
-    bool any = false;
-    for (uint32_t i = 0; i < chunk && !any; ++i) {
-      any = s[i] != 0;
-    }
-    if (!any) {
-      const uint64_t k = pages_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
-      if ((k % 20000) == 0) {
-        REXGPU_WARN("nx1_d3d9: DMAPAGESKIP {} empty source pages not copied ({} copied) -- each "
-                    "would have blanked a destination page that may hold live texels",
-                    k, pages_copied.load());
-      }
-      continue;
-    }
-    pages_copied.fetch_add(1, std::memory_order_relaxed);
-    std::memcpy(d, s, chunk);
-    // Invalidate (and mark written) ONLY the page we actually wrote. The blanket call that used
-    // to follow this loop covered skipped pages too, so a copy whose source was entirely empty
-    // still marked its destination "written" without writing anything -- which let a
-    // never-written page pass the partial test and be rendered as solid black instead of held
-    // back. Measured: several small textures converged on an all-black image reached by 8+
-    // distinct addresses each.
-    nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange((dst + off) & 0x1FFFFFFF, chunk);
+  const uint32_t total_pages = (bytes + 4095) / 4096;
+  const uint32_t copied = copied_now;  // the copy already happened, above the emptiness decision
+  // Approximate: the helper also stops early on an untranslatable page, which counts here as
+  // skipped. Both are "we did not land these bytes", which is what the counter is for.
+  const uint32_t not_copied = total_pages - std::min(copied, total_pages);
+  pages_copied.fetch_add(copied, std::memory_order_relaxed);
+  const uint64_t before = pages_skipped.fetch_add(not_copied, std::memory_order_relaxed);
+  if (not_copied && (before / 20000) != ((before + not_copied) / 20000)) {
+    REXGPU_WARN("nx1_d3d9: DMAPAGESKIP {} empty source pages not copied ({} copied) -- each would "
+                "have blanked a destination page that may hold live texels",
+                before + not_copied, pages_copied.load());
   }
   // NOTE: invalidation now happens per COPIED page inside the loop above, not for the whole
   // range here. Landing the bytes is only half the job -- but claiming to have landed bytes we

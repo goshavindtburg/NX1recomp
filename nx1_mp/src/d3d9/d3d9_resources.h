@@ -250,6 +250,21 @@ class ResourceTracker {
   /// writeback budget when it says yes. Guest thread only, under render_mutex_.
   bool WantResolveWriteback(const TextureFetchConstant& dest);
 
+  /// Why writeback did or did not run for a resolve destination. Every reject in
+  /// WantResolveWriteback used to be invisible past its one-shot warning, so a destination we
+  /// declined could not be distinguished from one that never resolved at all.
+  enum class WritebackVerdict : uint8_t {
+    kNever,       ///< never seen as a resolve destination
+    kWrote,       ///< accepted, pixels landed in guest RAM
+    kNotImage,    ///< rejected: no base/extent, or dimension != 2D
+    kBadFormat,   ///< rejected: destination format unsupported by the writeback
+    kOverBudget,  ///< rejected: per-destination writeback budget exhausted
+  };
+  /// What happened to resolves landing on the page containing this physical address, and for
+  /// kBadFormat the offending format. Answers the question the DMA-origin census cannot ask on
+  /// its own: is an unfillable staging buffer a resolve destination we declined to write back?
+  WritebackVerdict ResolveDestVerdict(uint32_t phys, uint32_t* out_format = nullptr) const;
+
   //--- Render targets --------------------------------------------------------
   //
   // The guest does not render to one surface: it draws the world into a 1024x600
@@ -571,6 +586,17 @@ class ResourceTracker {
   /// each destination gets a few writebacks and then stops. Counts on the guest thread under
   /// render_mutex_; staging surface reused across writebacks of the same size.
   std::unordered_map<uint32_t, uint32_t> writeback_counts_;
+
+  /// Per-PAGE record of what writeback decided, keyed by physical page. Keyed by page rather
+  /// than by base address because the census asks about a DMA source address that need not be
+  /// the destination's base -- a staging buffer is read back from wherever the copy starts.
+  struct WritebackMark {
+    WritebackVerdict verdict = WritebackVerdict::kNever;
+    uint32_t format = 0;
+  };
+  std::unordered_map<uint32_t, WritebackMark> writeback_marks_;
+  mutable std::mutex writeback_marks_m_;
+  void MarkResolveDest(const TextureFetchConstant& dest, WritebackVerdict verdict);
   IDirect3DSurface9* writeback_staging_ = nullptr;
   uint32_t writeback_staging_w_ = 0, writeback_staging_h_ = 0;
   uint64_t writebacks_done_ = 0, writeback_bytes_ = 0;

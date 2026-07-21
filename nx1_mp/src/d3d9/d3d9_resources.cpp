@@ -5424,6 +5424,59 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_writeback_all, false, "GPU",
                     "Debug: ignore the per-destination budget and write back EVERY resolve. "
                     "Costs a GPU sync per resolve; correctness reference, not a mode to play");
 
+/// Record what writeback decided for every page this resolve destination covers.
+///
+/// The DMA-origin census can see that a staging buffer is empty in CPU RAM but not WHY. If the
+/// buffer is a resolve destination we declined -- an unsupported format, a non-2D dimension --
+/// then the "GPU-filled origin" is not outside our observation at all: it is a writeback we
+/// chose not to perform, and the fix is to perform it rather than to hunt a new mechanism.
+void ResourceTracker::MarkResolveDest(const TextureFetchConstant& dest, WritebackVerdict verdict) {
+  if (!dest.base_address) {
+    return;
+  }
+  // Conservative extent: the real tiled extent when the format is known, else a plain 32bpp
+  // estimate. Over-marking a page or two only widens the census's reach; under-marking would
+  // make a destination look like it was never resolved.
+  uint64_t bytes = uint64_t(dest.width ? dest.width : 1) * (dest.height ? dest.height : 1) * 4;
+  if (const auto* fmt = rex::graphics::FormatInfo::Get(dest.format)) {
+    const uint32_t pitch_px = dest.pitch_pixels ? dest.pitch_pixels : dest.width;
+    if (pitch_px && dest.height) {
+      const rex::graphics::TextureExtent ex = rex::graphics::TextureExtent::Calculate(
+          fmt, pitch_px, dest.height, /*depth=*/1, dest.tiled, /*is_guest=*/true);
+      bytes = uint64_t(ex.block_pitch_h) * ex.block_pitch_v * fmt->bytes_per_block();
+    }
+  }
+  bytes = std::min<uint64_t>(bytes, 64u << 20);
+  const uint32_t first = PhysicalAddress(dest.base_address) >> 12;
+  const uint32_t last = uint32_t((uint64_t(PhysicalAddress(dest.base_address)) + bytes - 1) >> 12);
+  std::lock_guard<std::mutex> lk(writeback_marks_m_);
+  if (writeback_marks_.size() > 400000) {
+    return;
+  }
+  for (uint32_t p = first; p <= last; ++p) {
+    // A page that was EVER written back is reported as written back: one declined resolve does
+    // not make the data absent if another landed it.
+    auto& m = writeback_marks_[p];
+    if (m.verdict != WritebackVerdict::kWrote) {
+      m.verdict = verdict;
+      m.format = dest.format;
+    }
+  }
+}
+
+ResourceTracker::WritebackVerdict ResourceTracker::ResolveDestVerdict(uint32_t phys,
+                                                                     uint32_t* out_format) const {
+  std::lock_guard<std::mutex> lk(writeback_marks_m_);
+  const auto it = writeback_marks_.find(phys >> 12);
+  if (it == writeback_marks_.end()) {
+    return WritebackVerdict::kNever;
+  }
+  if (out_format) {
+    *out_format = it->second.format;
+  }
+  return it->second.verdict;
+}
+
 bool ResourceTracker::WantResolveWriteback(const TextureFetchConstant& dest) {
   if (!REXCVAR_GET(nx1_d3d9_resolve_writeback)) {
     return false;
@@ -5442,6 +5495,7 @@ bool ResourceTracker::WantResolveWriteback(const TextureFetchConstant& dest) {
                   "image destination)",
                   dest.base_address, dest.width, dest.height, dest.dimension);
     }
+    MarkResolveDest(dest, WritebackVerdict::kNotImage);
     return false;
   }
   // Depth formats are published as sampleable host depth textures instead (ResolveDepth), and
@@ -5457,14 +5511,17 @@ bool ResourceTracker::WantResolveWriteback(const TextureFetchConstant& dest) {
                   "{:08X}) -- add if its content is CPU-read",
                   dest.format, dest.width, dest.height, dest.base_address);
     }
+    MarkResolveDest(dest, WritebackVerdict::kBadFormat);
     return false;
   }
   uint32_t& count = writeback_counts_[PhysicalAddress(dest.base_address)];
   if (!REXCVAR_GET(nx1_d3d9_dbg_writeback_all) &&
       count >= REXCVAR_GET(nx1_d3d9_writeback_max)) {
+    MarkResolveDest(dest, WritebackVerdict::kOverBudget);
     return false;
   }
   ++count;
+  MarkResolveDest(dest, WritebackVerdict::kWrote);
   return true;
 }
 
