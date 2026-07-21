@@ -53,6 +53,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
 
+  // NX1: see CommandProcessor::Nx1SharedMemory. Valid after SetupContext; null before it.
+  SharedMemory* Nx1SharedMemory() override { return shared_memory_.get(); }
+
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 

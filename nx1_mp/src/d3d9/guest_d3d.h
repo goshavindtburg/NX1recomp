@@ -339,6 +339,14 @@ inline SamplerClampModes ReadSamplerClampModes(const uint8_t* base, uint32_t dev
 /// `SetTexture(sampler N)` into the 6-dword fetch constant at slot N; the shader
 /// samples through it, so it is the durable description of a bound texture.
 struct TextureFetchConstant {
+  /// The six raw guest dwords this was decoded from, host-endian.
+  ///
+  /// Kept so a capture can be re-derived by hand against the XDK's GPUTEXTURE_FETCH_CONSTANT
+  /// instead of being taken on trust. A texture was proved corrupt because its binding declared
+  /// 256x256 over a guest allocation holding a valid 128x256 image -- and separating "the guest
+  /// asked for 256x256" from "we misread the size field" is impossible without the source dwords.
+  /// Cheap: this struct is decoded per draw per sampler, never stored in bulk.
+  uint32_t raw[6];
   bool valid;             ///< type field == kTexture (2)
   uint32_t base_address;  ///< guest physical byte address (dword1.base_address << 12)
   uint32_t format;        ///< xenos::TextureFormat
@@ -427,6 +435,8 @@ inline TextureFetchConstant DecodeTextureFetchConstant(const uint8_t* p) {
   const uint32_t d5 = *reinterpret_cast<const rex::be<uint32_t>*>(p + 20);
 
   TextureFetchConstant t{};
+  t.raw[0] = d0; t.raw[1] = d1; t.raw[2] = d2;
+  t.raw[3] = d3; t.raw[4] = d4; t.raw[5] = d5;
   t.valid = (d0 & 0x3) == 2;  // FetchConstantType::kTexture
   // TextureSign::kGamma (3) on the RGB channels: the hardware linearizes the sample on
   // fetch. NX1 flags its colour maps and every resolve of a k_8_8_8_8_GAMMA target this

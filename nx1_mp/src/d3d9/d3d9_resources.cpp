@@ -7,6 +7,9 @@
 // rex/thread.h declares Sleep(std::chrono::milliseconds), which the Win32
 // Sleep macro otherwise mangles.
 #include <rex/cvar.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/graphics_system.h>
+#include <rex/graphics/shared_memory.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -163,6 +166,42 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_probe_full_bytes, 0, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_probe_samples, 512, "GPU",
                       "Eight-byte samples taken when a texture is not probed in full (the "
                       "original 64 was thin enough to collide for sparse textures)");
+
+/// Hash a texture's REFERENCED blocks, at their tiled addresses.
+///
+/// Two wrong versions preceded this and each failed differently, so the constraint is narrow:
+///   - hashing ceil(w/bw)*ceil(h/bh)*bpb bytes LINEARLY from the base reads the right AMOUNT at
+///     the wrong PLACES: the data is tiled, so that range is a scattered subset of tiles and
+///     misses most of the image (2 KB of a 64x64 DXT1's 8 KB footprint).
+///   - hashing block_pitch_h*block_pitch_v*bpb covers the whole footprint but includes the tile
+///     and pitch PADDING, which the XDK documents the guest as packing other allocations into.
+///     That padding churns constantly, so the probe fired on every texture every frame:
+///     CONTENTPROBE went 3,513 -> 1,211,952 rebuilds (~224/frame) and the frame rate collapsed.
+///
+/// So walk the VISIBLE blocks only, at the same GetTiledOffset2D addresses DetileMip2D uses, and
+/// sample a bounded number of them spread across the image.
+uint64_t ProbeTiledContent(const uint8_t* base, const rex::graphics::TextureExtent& ex,
+                           uint32_t bpb, bool tiled, uint32_t max_samples) {
+  if (!base || !ex.block_width || !ex.block_height) {
+    return 0;
+  }
+  namespace tu = rex::graphics::texture_util;
+  const uint32_t bpb_log2 = bpb ? uint32_t(__builtin_ctz(bpb)) : 0;  // Log2Exact is declared below
+  const uint64_t total = uint64_t(ex.block_width) * ex.block_height;
+  const uint32_t step = uint32_t(std::max<uint64_t>(1, total / std::max(1u, max_samples)));
+  uint64_t h = 1469598103934665603ull;
+  for (uint64_t i = 0; i < total; i += step) {
+    const uint32_t bx = uint32_t(i % ex.block_width);
+    const uint32_t by = uint32_t(i / ex.block_width);
+    const size_t off = tiled ? size_t(tu::GetTiledOffset2D(int32_t(bx), int32_t(by),
+                                                           ex.block_pitch_h, bpb_log2))
+                             : (size_t(by) * ex.block_pitch_h + bx) * bpb;
+    uint64_t v = 0;
+    std::memcpy(&v, base + off, std::min<size_t>(sizeof(v), bpb));
+    h = (h ^ v) * 1099511628211ull;
+  }
+  return h;
+}
 
 uint64_t ProbeGuestContent(const uint8_t* p, uint32_t bytes) {
   if (!p || bytes < 8) {
@@ -335,9 +374,145 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pageorigin_pct, 10, "GPU",
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_mirrorstale, false, "GPU",
                     "Debug: at every decode, compare the snapshot the decode is about to use "
                     "against live guest memory and report how often it is stale");
+/// ON matches the reference. The old help text claimed the opposite -- that reading LIVE guest
+/// memory is "as the reference backend does" -- and that is simply false, which is probably how
+/// the shipped config came to have it off.
+///
+/// The reference never reads guest RAM at bind time. `SharedMemory::RequestRanges` consults a
+/// per-4 KB VALID bitmask, uploads only the invalid pages (`UploadRanges` memcpy's from
+/// TranslatePhysical into a 512 MB GPU buffer), and the texture load shader then reads THAT
+/// BUFFER. A page is captured once and HELD until something explicitly invalidates it -- a CPU
+/// write via page protection, or a GPU write via RangeWrittenByGpu.
+///
+/// That difference matters exactly here: if a page holds the right bytes when the reference first
+/// uploads it and the streaming pool recycles that memory afterwards, the reference still has the
+/// good copy while a live read gets the recycled bytes.
+///
+/// An earlier A/B "exonerated" this -- but it was judged by the MIXED provenance rate, which has
+/// since been refuted against the dumped images (it flags perfectly clean textures). It was never
+/// judged by looking at the screen.
 REXCVAR_DEFINE_BOOL(nx1_d3d9_texture_mirror, true, "GPU",
-                    "Decode textures from the CPU mirror snapshot (off = read live guest "
-                    "memory, as the reference backend does)");
+                    "Decode textures from the CPU mirror snapshot, capturing each page once and "
+                    "holding it until invalidated -- which is what the reference backend does. "
+                    "Off = re-read live guest memory at every decode");
+
+/// THE GPU-WRITE WATCH. Host page protection sees CPU stores only, and this title streams its
+/// textures with a GPU memexport blit, so our texture cache never hears about the writes that
+/// deliver them: 3036 of 3047 DECODECHANGE lines report "page writes 0 -> 0" -- content changed
+/// completely while neither a CPU write nor any of our 379,158 mirrored DMA copies touched the
+/// page. Subscribing to the reference's SharedMemory global watch is how the correct renderer
+/// learns about them (SharedMemory::RangeWrittenByGpu is the announced chokepoint).
+///
+/// Off = the previous behaviour, for a clean A/B against the speckle.
+/// CLAMP A DECODE TO THE MEMORY THE POOL ACTUALLY ALLOCATED FOR IT.
+///
+/// The guest's fetch constant is not always consistent with its own allocator. Measured over 193
+/// captured textures, 22 (11%, a lower bound -- an overlap is only visible when the neighbour was
+/// captured too) declare more bytes than the distance to the next live texture's base, and three
+/// were proved byte-for-byte: the tail of our read IS the neighbouring texture, 100.00% identical
+/// to that texture's own capture. The implied size is always a clean one (256x256 declared where
+/// 256x128 fits), i.e. the pool allocated for a SMALLER image than the descriptor describes,
+/// because the slot was reassigned and a stale descriptor is still bound.
+///
+/// Our fetch parse is NOT at fault -- every geometry field re-derives exactly from the raw dwords
+/// across all 193 captures. We read what the guest asked for; the guest asked for too much.
+///
+/// So decode only as far as the next live base and zero the rest, rather than rendering another
+/// asset's bytes as texels. Only bases seen in the last few frames count: a stale entry sitting
+/// inside our range would clamp a perfectly good texture.
+/// Give every distinct texture DESCRIPTOR its own cache entry, as the reference does.
+///
+/// Off = the old behaviour, one entry per (base address, sampler), so several descriptors sharing
+/// an address evict each other and each re-decode pairs one descriptor's geometry with another
+/// texture's bytes. See the key computation for the measurements behind this.
+///
+/// Costs cache entries -- an address bound under three descriptors now holds three decodes -- but
+/// eviction already reclaims anything unbound for ~600 frames.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_key_by_layout, true, "GPU",
+                    "Key the texture cache on the full descriptor (address + sampler + layout) "
+                    "instead of address + sampler, so two textures sharing an address stop "
+                    "overwriting each other's decode");
+
+/// DEFAULT OFF -- MEASURED HARMFUL. It fires at scale (445 decodes, 22.7 MB withheld in one run)
+/// and the speckle is completely unchanged, so the over-read is real but not the artifact. Worse,
+/// it truncates legitimate textures to black: ground surfaces went black in a run with it on,
+/// because the "next live base" is sometimes a stale descriptor rather than a real allocation
+/// boundary. Kept as a cvar for measurement only; do not ship it on.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_clamp_alloc, false, "GPU",
+                    "Stop a texture decode at the next live texture's base address instead of "
+                    "reading into it. Off = previous behaviour, for an A/B against the speckle");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_texset, false, "GPU",
+                    "Log each distinct texture this renderer decodes once (D9TEX), in the same "
+                    "form as the reference's REFTEX, so the two SETS can be diffed without any "
+                    "per-draw synchronisation");
+
+/// Operator-aimed capture: dump every distinct block-compressed texture bound over the next N
+/// frames (full guest source + our decode + parameters), capped at 64 textures.
+///
+/// Deliberately has NO corruption heuristic. Its predecessor scored decoded images and captured
+/// eight "22-99% corrupt" textures that were all perfect -- decal atlases on transparency read as
+/// corrupt to any content-based test. The operator can see the speckle; aiming at it by hand is
+/// the only selector in this investigation that has never returned a false positive.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_frame, 0, "GPU",
+                      "Dump full guest bytes + decode + params for every distinct BC texture bound "
+                      "over the next N frames, while the game scene is rendering. Point at the "
+                      "artifact, then arm this");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_frame_max, 256, "GPU",
+                      "Cap on distinct textures a frame capture will dump. A gameplay frame binds "
+                      "~1500, so this bounds the disk cost; raise it if the artifact is missed");
+
+/// DMA COVERAGE CENSUS over EVERY decode, not just provenance-flagged ones.
+///
+/// The existing coverage cross-reference only runs on pages the provenance detector flags, and
+/// that detector is now refuted: measured against the dumped images it flags perfectly clean
+/// textures at 12.5-75% and misses most genuinely corrupt blocks, so anything selected by it
+/// inherits a bias of unknown sign. This asks the same question of everything we decode.
+///
+/// What it tests, specifically: `ImageCache_MoveImage`/`DmaCopyDelayed` take the copy size from
+/// the LOW half of the packed 8-byte ImageAllocInfo, a choice the hook's own comment records as
+/// verified against EXACTLY ONE destination (dst ACAF8000 moves +3000, lo=3000 where hi=5000). If
+/// `lo` is the base-level size where the image needs more, we mirror a PREFIX and leave the
+/// remainder holding the previous occupant -- which is the shape the decoded images actually show
+/// (15196000: first 64 KB = one full tile row clean, then tile-granular garbage).
+///
+/// UNDERCOPIED > 0 with `alt would fit` tracking it = the size half is wrong, and it is a
+/// one-line change. UNDERCOPIED ~0 = the copies do span the textures and the prefix pattern comes
+/// from somewhere else; believe that only if COVERED is large (if NOCOPY dominates, the census
+/// is simply not seeing the delivery path and decides nothing).
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_dmacover, false, "GPU",
+                    "Per-decode DMA coverage census: for every texture, did a mirrored copy span "
+                    "the bytes we decode, and would the other ImageAllocInfo half have fit");
+
+/// Re-arm the guest write-watch on every decode instead of trusting our own `watch_armed_` bit.
+///
+/// We share the page protection with the reference's SharedMemory, which arms and unprotects the
+/// same pages on its own schedule. A cached "armed" bit that disagrees with the OS makes us
+/// permanently blind to that page, because the re-arm is gated on the very signal we stop
+/// receiving. Diagnostic first: watch whether the DECODECHANGE no-write-delta fraction (64.5%
+/// measured) collapses. Costs one call per 4 KB page per decode.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_rearm_watch, false, "GPU",
+                    "Re-arm the page write-watch on every decode rather than trusting our cached "
+                    "armed bit, which the reference's SharedMemory can invalidate behind us");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_gpu_write_watch, true, "GPU",
+                    "Dirty textures when the reference reports the GPU wrote their guest memory. "
+                    "Host page protection cannot see those writes, so without this a texture "
+                    "streamed in by memexport keeps whatever we decoded first");
+
+/// Ceiling on a single GPU-write range, in MB.
+///
+/// This exists because the invalidation is NOT always precise: when a memexporting draw's
+/// destinations cannot be determined, the reference falls back to
+/// `RangeWrittenByGpu(0, kBufferSize)` (d3d12/command_processor.cpp:4614) -- a 512 MB blast that
+/// means "something, somewhere". Honouring it would dirty every texture in the cache on every
+/// such draw and re-decode the world. Ranges wider than this are counted as blasts and dropped,
+/// so the watch acts only on the precise ranges. Raise it to find out what the blasts were
+/// hiding; 0 disables the ceiling entirely (expect a rebuild storm).
+REXCVAR_DEFINE_UINT32(nx1_d3d9_gpu_write_watch_max_mb, 16, "GPU",
+                      "Drop GPU-write invalidations wider than this many MB (0 = no limit). The "
+                      "reference blasts the whole 512 MB buffer when a memexport draw's "
+                      "destination is unknown, and acting on that rebuilds every texture");
 
 /// Commit-and-freeze. A texture drawn cleanly for kCommitFrames stops honouring guest writes,
 /// so the streaming pool recycling its slot cannot re-poison a good decode. The risk is the
@@ -1378,9 +1553,17 @@ uint32_t TiledSurfaceExtentBytes(uint32_t pitch_blocks, uint32_t rows_blocks, ui
   return max_end;
 }
 
+/// `src_limit` bounds how far into `src` a block may be read, in bytes (SIZE_MAX = unbounded).
+///
+/// The guest's fetch constant can declare a texture LARGER than the pool actually allocated for
+/// it -- measured on 22 of 193 captured textures, three of them proved byte-identical to the
+/// neighbouring texture that starts partway through our read. Blocks past the limit are the NEXT
+/// allocation's bytes; decoding them produces the rainbow-noise speckle. They are zero-filled
+/// instead, which is both honest (we have no data for them) and obvious on screen.
 void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
                  const rex::graphics::TextureExtent& extent, uint32_t bytes_per_block,
-                 uint32_t endian, bool tiled, uint32_t offset_x = 0, uint32_t offset_y = 0) {
+                 uint32_t endian, bool tiled, uint32_t offset_x = 0, uint32_t offset_y = 0,
+                 size_t src_limit = SIZE_MAX) {
   namespace tu = rex::graphics::texture_util;
   namespace tc = rex::graphics::texture_conversion;
   const auto xe_endian = static_cast<rex::graphics::xenos::Endian>(endian);
@@ -1426,6 +1609,10 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
           const uint32_t x = offset_x + bx;
           const uint32_t src_off = uint32_t(row_tab[x & 31]) + (x >> 5) * macro_stride + row_macro;
           uint8_t* d = dst_row + size_t(bx) * bytes_per_block;
+          if (size_t(src_off) + bytes_per_block > src_limit) {
+            std::memset(d, 0, bytes_per_block);  // past the allocation: not our data
+            continue;
+          }
           if (PaintThisBlock(src_off)) {
             PaintMarkerBlock(d, bytes_per_block);
           } else if (swap) {
@@ -1442,6 +1629,10 @@ void DetileMip2D(uint8_t* dst, uint32_t dst_row_bytes, const uint8_t* src,
           const int32_t src_off = tu::GetTiledOffset2D(
               int32_t(offset_x + bx), int32_t(offset_y + by), pitch_blocks, bpb_log2);
           uint8_t* d = dst_row + size_t(bx) * bytes_per_block;
+          if (size_t(src_off) + bytes_per_block > src_limit) {
+            std::memset(d, 0, bytes_per_block);
+            continue;
+          }
           if (PaintThisBlock(uint32_t(src_off))) {
             PaintMarkerBlock(d, bytes_per_block);
           } else {
@@ -2200,9 +2391,85 @@ void ResourceTracker::Initialize(IDirect3DDevice9Ex* device) {
     mirror_valid_.assign((kMirrorPages + 63) / 64, 0);
     mirror_sweep_page_ = 0;
   }
-  REXGPU_INFO("nx1_d3d9: texture write-watch {}, mirror {}",
+  // Register the GPU-write watch. The physical-memory callback above traps CPU stores; this one
+  // is the only way we hear about memexport and resolve writes, which is how textures actually
+  // arrive. Registering is deliberately unconditional -- the cvar is checked in the callback --
+  // so it can be toggled at runtime for an A/B without a relaunch.
+  //
+  // May legitimately fail here: the reference's SharedMemory is created in SetupContext, and the
+  // command processor may not have reached it yet. RegisterGpuWriteWatch is therefore idempotent
+  // and retried from AdvanceFrame until it takes.
+  RegisterGpuWriteWatch();
+  REXGPU_INFO("nx1_d3d9: texture write-watch {}, GPU-write watch {}, mirror {}",
               mem_watch_handle_ ? "registered" : "FAILED",
+              gpu_watch_handle_ ? "registered" : "deferred (reference not up yet)",
               (mirror_ && phys_base_) ? "allocated" : "FAILED");
+}
+
+void ResourceTracker::RegisterGpuWriteWatch() {
+  if (gpu_watch_handle_) {
+    return;
+  }
+  auto* gs = rex::graphics::GraphicsSystem::Nx1Current();
+  auto* cp = gs ? gs->command_processor() : nullptr;
+  auto* sm = cp ? cp->Nx1SharedMemory() : nullptr;
+  if (!sm) {
+    return;
+  }
+  gpu_watch_handle_ = sm->RegisterGlobalWatch(&GpuWriteWatchThunk, this);
+  REXGPU_INFO("nx1_d3d9: GPU-write watch registered on the reference SharedMemory -- texture "
+              "invalidation now covers memexport/resolve writes, which host page protection "
+              "cannot trap");
+}
+
+/// Fires on the reference's GPU worker thread, INSIDE SharedMemory's global critical region.
+///
+/// Same discipline as MemWatchThunk and for the same reason: it may only queue. Touching the
+/// texture map here would iterate an unordered_map while the render thread inserts into it, which
+/// is exactly the UB that killed the game inside ImageCache_DmaCopyDelayed once the DMA call rate
+/// rose. InvalidateGuestRange takes dirty_mu_ and appends; DrainMemoryWrites applies it on the
+/// render thread at the frame boundary.
+///
+/// Lock order is safe: we take dirty_mu_ while holding the reference's global lock, and nothing
+/// on our side ever calls into SharedMemory while holding dirty_mu_.
+void ResourceTracker::GpuWriteWatchThunk(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                         void* ctx, uint32_t address_first, uint32_t address_last,
+                                         bool invalidated_by_gpu) {
+  (void)global_lock;
+  // CPU-side invalidations arrive here too, but we already have those from our own physical-memory
+  // watch, which reports them with tighter ranges. Taking both would double the queue for no new
+  // information -- the whole point of this subscription is the GPU writes we CANNOT otherwise see.
+  if (!invalidated_by_gpu) {
+    return;
+  }
+  if (auto* self = static_cast<ResourceTracker*>(ctx)) {
+    self->OnGpuWrite(address_first, address_last);
+  }
+}
+
+void ResourceTracker::OnGpuWrite(uint32_t address_first, uint32_t address_last) {
+  if (!REXCVAR_GET(nx1_d3d9_gpu_write_watch) || address_last < address_first) {
+    return;
+  }
+  const uint64_t len = uint64_t(address_last) - address_first + 1;
+  // The whole-buffer blast (destination unknown) is not information we can act on -- see the
+  // cvar's comment. Counted separately so a run where blasts dominate is visible as such rather
+  // than looking like the watch simply found nothing.
+  if (const uint64_t max_mb = REXCVAR_GET(nx1_d3d9_gpu_write_watch_max_mb);
+      max_mb && len > (max_mb << 20)) {
+    if (len >= (uint64_t(kMirrorPages) << 12)) {
+      ++gpu_write_blasts_;
+    } else {
+      ++gpu_write_dropped_;
+    }
+    return;
+  }
+  if (uint64_t(address_first) + len > (uint64_t(kMirrorPages) << 12)) {
+    return;  // outside the window every other reader in this file respects
+  }
+  ++gpu_write_ranges_;
+  gpu_write_pages_ += (address_last >> 12) - (address_first >> 12) + 1;
+  InvalidateGuestRange(address_first, uint32_t(len));
 }
 
 void ResourceTracker::Shutdown() {
@@ -2211,6 +2478,17 @@ void ResourceTracker::Shutdown() {
       mem->UnregisterPhysicalMemoryInvalidationCallback(mem_watch_handle_);
     }
     mem_watch_handle_ = nullptr;
+  }
+  // Before writes_pending_ is cleared below, and while the reference is still alive: the watch
+  // list holds a raw `this`, so leaving it registered past our destruction is a use-after-free on
+  // the next memexport draw.
+  if (gpu_watch_handle_) {
+    auto* gs = rex::graphics::GraphicsSystem::Nx1Current();
+    auto* cp = gs ? gs->command_processor() : nullptr;
+    if (auto* sm = cp ? cp->Nx1SharedMemory() : nullptr) {
+      sm->UnregisterGlobalWatch(gpu_watch_handle_);
+    }
+    gpu_watch_handle_ = nullptr;
   }
   {
     std::lock_guard<std::mutex> lk(dirty_mu_);
@@ -2755,6 +3033,50 @@ void ResourceTracker::LogCacheStats() {
   REXGPU_INFO("nx1_d3d9: TORNPAGES {} of {} page copies changed while being read -- non-zero "
               "means texture decodes are reading half-written guest memory",
               torn_pages_, torn_checked_);
+  // Read this against DECODECHANGE's "page writes 0 -> 0". Every range counted here is a write to
+  // guest texture memory that host page protection could not trap, so before this watch existed
+  // the cache never heard about it. GPUWATCH ranges=0 while the watch is registered means the
+  // reference is not reporting GPU writes at all in this configuration (check that memexport
+  // draws still execute -- nx1_skip_reference_raster exempts them, but only while the reference
+  // command processor is running); blasts dominating means the destinations are unknown and the
+  // precise-range path is not where the texture traffic is.
+  REXGPU_INFO("nx1_d3d9: GPUWATCH {} ({}) | {} ranges, {} pages queued | {} whole-buffer blasts "
+              "dropped, {} over-wide dropped",
+              gpu_watch_handle_ ? "registered" : "NOT REGISTERED",
+              REXCVAR_GET(nx1_d3d9_gpu_write_watch) ? "on" : "off", gpu_write_ranges_,
+              gpu_write_pages_, gpu_write_blasts_, gpu_write_dropped_);
+  if (REXCVAR_GET(nx1_d3d9_dbg_dmacover)) {
+    const uint64_t d = dmacover_decodes_ ? dmacover_decodes_ : 1;
+    const uint64_t pg = dmacover_pg_never_ + dmacover_pg_skipped_ + dmacover_pg_written_;
+    REXGPU_WARN("nx1_d3d9: DMACOVER {} decodes | UNDERCOPIED {} ({:.1f}%, other half would fit in "
+                "{}) | covered {} ({:.1f}%) | no copy recorded {} ({:.1f}%)",
+                dmacover_decodes_, dmacover_under_, 100.0 * double(dmacover_under_) / double(d),
+                dmacover_alt_fits_, dmacover_covered_,
+                100.0 * double(dmacover_covered_) / double(d), dmacover_nocopy_,
+                100.0 * double(dmacover_nocopy_) / double(d));
+    // READ THE PAGE LINE AGAINST THE DECODE LINE. "covered" only means a copy's SPAN reached the
+    // page; the per-page skip still leaves empty-source pages holding the previous occupant, and
+    // that shows up here as `spanned but skipped` while the decode line says covered.
+    REXGPU_WARN("nx1_d3d9: DMACOVER pages {} | never targeted {} ({:.1f}%) | spanned but SKIPPED "
+                "{} ({:.1f}%) | actually written {} ({:.1f}%)",
+                pg, dmacover_pg_never_, 100.0 * double(dmacover_pg_never_) / double(pg ? pg : 1),
+                dmacover_pg_skipped_,
+                100.0 * double(dmacover_pg_skipped_) / double(pg ? pg : 1), dmacover_pg_written_,
+                100.0 * double(dmacover_pg_written_) / double(pg ? pg : 1));
+  }
+  if (framecap_count_) {
+    REXGPU_WARN("nx1_d3d9: FRAMECAP {} distinct textures captured to texdump/cap*", framecap_count_);
+  }
+  // CLAMP hits=0 with the cvar on means no decode ever overlapped a live neighbour, so the
+  // over-read is not happening in this scene -- read that before concluding anything from the
+  // picture. Non-zero says how much foreign memory we STOPPED decoding as texels.
+  REXGPU_WARN("nx1_d3d9: CLAMP {} | {} decodes clamped to the next live texture base, {} KiB of "
+              "the next allocation not decoded",
+              REXCVAR_GET(nx1_d3d9_clamp_alloc) ? "on" : "off", clamp_hits_, clamp_bytes_ >> 10);
+  REXGPU_INFO("nx1_d3d9: REARM {} ({} pages re-armed) -- pair with the DECODECHANGE no-write-delta "
+              "fraction: if forcing the re-arm collapses it, our cached armed bit had gone stale "
+              "against the protection the reference also manages",
+              REXCVAR_GET(nx1_d3d9_rearm_watch) ? "on" : "off", rearm_calls_);
   REXGPU_INFO("nx1_d3d9: REDECODE forced={} rechecks (nx1_d3d9_redecode_delay={}) -- pair this "
               "with the DECODECHANGE count: rechecks that found DIFFERENT bytes are decodes that "
               "had been taken before the data landed",
@@ -2846,8 +3168,19 @@ void ResourceTracker::LogCacheStats() {
                 "(largest vb {} KiB) | writes_pending={} detile_scratch={} KiB mirror_valid={} MiB",
                 pmc.PrivateUsage / (1024 * 1024), pmc.WorkingSetSize / (1024 * 1024),
                 tex_bytes / (1024 * 1024), vb_bytes / (1024 * 1024), vb_max / 1024, pending,
-                detile_scratch_.size() / 1024, (mirror_pages_valid * 4096) / (1024 * 1024));
+                // The detile scratch is per-thread now (see DetileScratch) and no longer a single
+                // member this thread can measure for all of them; report this thread's own.
+                DetileScratchBytes() / 1024, (mirror_pages_valid * 4096) / (1024 * 1024));
   }
+  // Was the shared detile buffer ever actually contended? threads>1 with overlap_max>1 is the
+  // race observed directly rather than inferred from log thread ids. overlap_max==1 means the
+  // buffer was never concurrently held and the thread_local change fixed nothing real.
+  REXGPU_WARN("nx1_d3d9: DETILESCRATCH {} threads used it, max {} held it at once ({})",
+              DetileScratchThreads().load(std::memory_order_relaxed),
+              DetileScratchOverlapMax().load(std::memory_order_relaxed),
+              DetileScratchOverlapMax().load(std::memory_order_relaxed) > 1
+                  ? "RACE CONFIRMED -- concurrent decodes shared one buffer before this fix"
+                  : "no overlap seen; the shared buffer was not actually contended");
   REXGPU_INFO("nx1_d3d9: BORDER {} decodes declare a border -- the XDK untiler takes the border "
               "flag as a required argument and ours ignores it, so nonzero here is a real gap in "
               "our layout model (zero means it is theoretical)",
@@ -3441,13 +3774,30 @@ void ResourceTracker::ArmWriteWatch(uint32_t phys_addr, uint32_t len) {
   if (!mem) {
     return;
   }
+  // WE ARE NOT THE ONLY OWNER OF THIS PAGE PROTECTION. The reference's SharedMemory arms the same
+  // physical pages (shared_memory.cpp:412) and its own invalidation callback can unprotect them,
+  // with bookkeeping entirely separate from watch_armed_. Our bit therefore records "we asked for
+  // this page once", not "the OS is currently trapping writes to it" -- and when those diverge the
+  // early-out below makes the divergence PERMANENT: we skip re-arming because we believe we are
+  // armed, so no write is ever seen, so DrainMemoryWrites never clears the bit to make us re-arm.
+  //
+  // That deadlock is the shape of the measurement: with the counter finally fixed, 64.5% of
+  // texture content changes show no write to their pages, 57.5% of those more than 60 frames
+  // apart (so not frame-boundary lag) -- while the same pages carry nonzero cumulative counts,
+  // i.e. they WERE trapped early on and then stopped being.
+  //
+  // Re-arming unconditionally costs a call per 4 KB page per decode (1024 for a 4 MB texture),
+  // which is why it is a cvar rather than the default. If the blind fraction collapses with this
+  // on, the stale-armed-bit deadlock is the mechanism.
+  const bool force = REXCVAR_GET(nx1_d3d9_rearm_watch);
   const uint32_t p0 = phys_addr >> 12;
   const uint32_t p1 = (phys_addr + len - 1) >> 12;
   for (uint32_t p = p0; p <= p1; ++p) {
     const uint64_t bit = uint64_t(1) << (p & 63);
-    if (!(watch_armed_[p >> 6] & bit)) {
+    if (force || !(watch_armed_[p >> 6] & bit)) {
       watch_armed_[p >> 6] |= bit;
       mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
+      rearm_calls_ += force ? 1 : 0;
     }
   }
 }
@@ -3657,7 +4007,79 @@ void ResourceTracker::LearnTextureBaseline(uint32_t frames) {
               frames);
 }
 
+/// Re-read every watched address from LIVE guest memory and write out each new distinct version.
+/// See AddrWatch: this answers whether the right bytes are EVER at that address.
+void ResourceTracker::PollAddrWatch() {
+  if (!addr_watch_frames_ || addr_watch_.empty()) {
+    return;
+  }
+  --addr_watch_frames_;
+  for (auto& w : addr_watch_) {
+    if (uint64_t(PhysicalAddress(w.addr)) + w.bytes > (uint64_t(kMirrorPages) << 12)) {
+      continue;
+    }
+    const uint8_t* live = TranslatePhysical(w.addr);
+    if (!live) {
+      continue;
+    }
+    const uint64_t h = XXH3_64bits(live, w.bytes);
+    if (h == w.last_hash) {
+      continue;
+    }
+    w.last_hash = h;
+    if (w.versions >= 12) {
+      continue;  // bounded: 12 distinct versions is plenty to find a clean one
+    }
+    char path[256];
+    std::snprintf(path, sizeof(path), "texdump/watch_%08X_%ux%u_f%u_v%02u.bin", w.addr, w.w, w.h,
+                  w.fmt, w.versions);
+    if (FILE* f = std::fopen(path, "wb")) {
+      std::fwrite(live, 1, w.bytes, f);
+      std::fclose(f);
+    }
+    REXGPU_WARN("nx1_d3d9: ADDRWATCH {:08X} {}x{} fmt={} version {} written (content changed at "
+                "this address)",
+                w.addr, w.w, w.h, w.fmt, w.versions);
+    ++w.versions;
+  }
+}
+
+void ResourceTracker::ArmFrameCapture(uint32_t frames) {
+  ++framecap_batch_;
+  framecap_count_ = 0;
+  framecap_seen_.clear();
+  // Watch the same textures this capture is about to record, for far longer than the capture
+  // itself, so their whole content history is on disk beside the one decode we took.
+  //
+  // DELIBERATELY NOT CLEARED on a re-arm. The intended workflow is: capture a surface while it is
+  // speckled at distance, then WALK UP until it resolves and capture again. Clearing here would
+  // drop the far-away texture's watch at exactly the moment its address is most interesting --
+  // whether that address ever receives clean content is the whole question. Entries accumulate,
+  // deduplicated by address, and every arm restarts the countdown so a long approach stays covered.
+  addr_watch_frames_ = 3000;  // ~60 s at 50 fps: enough to cross a map on foot
+  REXCVAR_SET(nx1_d3d9_dbg_dump_frame, frames);
+  REXGPU_WARN("nx1_d3d9: FRAMECAP armed -- batch {}, capturing every distinct BC texture decoded "
+              "over the next {} frames to texdump/c{:02}_*",
+              framecap_batch_, frames, framecap_batch_);
+}
+
 void ResourceTracker::AdvanceFrame() {
+  // The reference's SharedMemory is built in SetupContext, which may not have run when we
+  // initialised. Cheap no-op once it has taken.
+  RegisterGpuWriteWatch();
+  PollAddrWatch();
+  // Frame-capture countdown. Reports on expiry so an armed capture that caught nothing is
+  // distinguishable from one that was never armed.
+  if (const uint32_t fl = REXCVAR_GET(nx1_d3d9_dbg_dump_frame); fl) {
+    REXCVAR_SET(nx1_d3d9_dbg_dump_frame, fl - 1);
+    if (fl == 1) {
+      // 0 here means every texture on screen was served from cache without re-decoding, which is
+      // what a settled scene does -- press again after moving, or raise kCaptureFrames.
+      REXGPU_WARN("nx1_d3d9: FRAMECAP batch {} finished -- {} distinct textures dumped to "
+                  "texdump/c{:02}_*, {} addresses under watch",
+                  framecap_batch_, framecap_count_, framecap_batch_, addr_watch_.size());
+    }
+  }
   // Apply any autotrack request posted by a decode. Main thread only -- see the member's note.
   if (const uint32_t req = autotrack_request_.exchange(0, std::memory_order_relaxed); req) {
     if (req == kAutotrackRelease) {
@@ -4255,7 +4677,27 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
              (uint64_t(t.mip_max_level) << 1) | (t.packed_mips ? 1 : 0)),
       (uint64_t(t.pitch_pixels) << 8) | t.endian);
 
-  const uint64_t key = MixKey(t.base_address, sampler);
+  // CACHE IDENTITY: ONE ENTRY PER DESCRIPTOR, WHICH IS WHAT THE REFERENCE DOES.
+  //
+  // The reference keys its texture cache on the whole descriptor -- TextureKey is base_page,
+  // mip_page, dimension, width, height, depth, tiled, packed_mips, pitch, mip_max_level, format
+  // and endianness (pipeline/texture/cache.h:134). Two descriptors that differ in any of those are
+  // two different textures with two independent lifetimes, each holding the decode made when its
+  // own bytes were resident.
+  //
+  // We keyed on (base_address, sampler) and used layout_key only to decide whether to REBUILD. So
+  // when one address carries more than one descriptor -- measured: 051F4000 was bound as 256x256
+  // f18, 512x128 f20 AND 256x256 f20 in a single session, and 11401000 alternated 256x256 /
+  // 128x256 on consecutive frames -- they all collide in one entry and evict each other. Every
+  // flip re-decodes, and a re-decode pairs THIS descriptor's geometry with whatever bytes are in
+  // that memory NOW, which is the other texture's. That is a wrong (geometry, bytes) pairing, and
+  // no amount of invalidation or re-reading can fix it: it is not stale data, it is mismatched
+  // data. It also explains why every timing-based intervention this session failed.
+  //
+  // Including layout_key in the key gives each descriptor its own entry, as in the reference.
+  const uint64_t key = REXCVAR_GET(nx1_d3d9_key_by_layout)
+                           ? MixKey(MixKey(t.base_address, sampler), layout_key)
+                           : MixKey(t.base_address, sampler);
   auto* map = static_cast<TextureMap*>(textures_);
   auto& entry = (*map)[key];
   if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
@@ -4367,11 +4809,36 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   if (entry.tex && entry.probe_hash && entry.probe_frame != frame_ &&
       REXCVAR_GET(nx1_d3d9_content_probe)) {
     entry.probe_frame = frame_;
-    uint32_t probe_bytes = 0;
+    // PROBE THE WHOLE GUEST FOOTPRINT, NOT THE VISIBLE RECTANGLE.
+    //
+    // This used to size itself as ceil(w/bw) * ceil(h/bh) * bpb -- the UNPADDED block count. The
+    // texture's actual guest extent is block_pitch_h * block_pitch_v * bpb, tile-aligned and
+    // derived from the PITCH, which is routinely much larger: a 64x64 DXT1 at pitch 128 occupies
+    // 8192 bytes while the old formula probed 2048. And because the probe reads linearly from the
+    // base while the data is TILED, that 2048 was a scattered subset of tiles rather than a
+    // quarter of the image -- so a change anywhere in the other 6 KB was invisible.
+    //
+    // That is why the probe fires constantly (3513 rebuilds in one run) and still never corrects
+    // these surfaces: ADDRWATCH proves the content at the address really does change from garbage
+    // to correct, and the probe simply was not looking at most of it.
+    //
+    // Uses the same Calculate() call the decode itself uses further down, so the probe and the
+    // decode cover exactly the same bytes.
+    uint32_t probe_bytes = 0;          // bounds check only; the hash walks tiled offsets
+    rex::graphics::TextureExtent ex_p{};
+    uint32_t bpb_p = 0;
     if (const auto* fi_p = rex::graphics::FormatInfo::Get(t.format)) {
-      const uint32_t bw_p = (t.width + fi_p->block_width - 1) / fi_p->block_width;
-      const uint32_t bh_p = (height + fi_p->block_height - 1) / fi_p->block_height;
-      probe_bytes = bw_p * bh_p * fi_p->bytes_per_block();
+      const uint32_t pitch_p = t.pitch_pixels ? t.pitch_pixels : t.width;
+      ex_p = rex::graphics::TextureExtent::Calculate(fi_p, pitch_p, height, /*depth=*/1, t.tiled,
+                                                     /*is_guest=*/true);
+      bpb_p = fi_p->bytes_per_block();
+      // Clamp the VISIBLE block grid to the created texture, exactly as the decode does -- a wider
+      // pitch stays in block_pitch_h for addressing only.
+      ex_p.block_width = std::min(ex_p.block_width,
+                                  (t.width + fi_p->block_width - 1) / fi_p->block_width);
+      ex_p.block_height = std::min(ex_p.block_height,
+                                   (height + fi_p->block_height - 1) / fi_p->block_height);
+      probe_bytes = ex_p.block_pitch_h * ex_p.block_pitch_v * bpb_p;
     }
     // BOUNDS. A texture's declared dimensions can imply more bytes than the mapped region
     // actually holds, and ProbeGuestContent reads to the end of what it is given -- firing a
@@ -4389,7 +4856,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       probe_bytes = 0;
     }
     if (probe_bytes) {
-      const uint64_t now_hash = ProbeGuestContent(TranslatePhysical(t.base_address), probe_bytes);
+      const uint64_t now_hash =
+          ProbeTiledContent(TranslatePhysical(t.base_address), ex_p, bpb_p, t.tiled,
+                            REXCVAR_GET(nx1_d3d9_probe_samples));
       if (now_hash && now_hash != entry.probe_hash) {
         entry.dirty = true;
         entry.retry_frame = 0;
@@ -4549,48 +5018,54 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // would show garbage.
   if (REXCVAR_GET(nx1_d3d9_guest_mips) && REXCVAR_GET(nx1_d3d9_mips) && t.mip_address &&
       t.mip_max_level > 0 && t.mip_filter != 2) {
-    const uint32_t wp2 = rex::next_pow2(t.width);
-    const uint32_t hp2 = rex::next_pow2(height);
-    const uint32_t size_max = rex::log2_floor(std::max(wp2, hp2));
-    const uint32_t guest_max = std::min(t.mip_max_level, size_max);
-    uint32_t offset = 0;
-    // Index of the first packed level; counts up while levels still get their own storage.
-    // Matches the reference's packed_mip_base walk in GetMipLocation.
-    uint32_t packed_base = 1;
-    bool packed_reached = false;
-    for (uint32_t m = 1; m <= guest_max; ++m) {
-      const uint32_t sw = std::max(wp2 >> m, 1u), sh = std::max(hp2 >> m, 1u);
+    // USE THE REFERENCE'S OWN LAYOUT FUNCTION, NOT A PARALLEL ONE.
+    //
+    // We had a hand-rolled walk here and it disagreed with the hardware in at least two ways --
+    // it missed the 4 KB per-level subresource alignment entirely, and after fixing that the scene
+    // was still corrupt, so there was more. Since the set comparison proved we load exactly the
+    // same textures from exactly the same addresses as the reference (0 divergences over 5834
+    // addresses), there is no reason to keep a second implementation of the layout: call the one
+    // that is known to render this game correctly.
+    //
+    // GetGuestTextureLayout returns per-level row pitch, z stride, extents and -- critically --
+    // mip_offsets_bytes[], which already includes the subresource alignment and the packed-tail
+    // rules that our version approximated.
+    namespace tu2 = rex::graphics::texture_util;
+    const auto gl = tu2::GetGuestTextureLayout(
+        rex::graphics::xenos::DataDimension::k2DOrStacked,
+        (t.pitch_pixels ? t.pitch_pixels : t.width) >> 5, t.width, height, /*depth*/ 1, t.tiled,
+        static_cast<rex::graphics::xenos::TextureFormat>(t.format), t.packed_mips,
+        /*has_base=*/true, t.mip_max_level);
+    const uint32_t packed_level = gl.packed_level;
+    const uint32_t last_stored = std::min(gl.max_level, packed_level);
+    for (uint32_t m = 1; m <= last_stored; ++m) {
       const uint32_t lw = std::max(t.width >> m, 1u), lh = std::max(height >> m, 1u);
       if (lw < 4 || lh < 4) {
         break;  // stop where BcMipLevels stops: a 4x4 tail level is already one flat block
       }
-      if (t.packed_mips && !packed_reached && std::min(sw, sh) <= 16) {
-        packed_reached = true;
-      }
+      const auto& lvl = gl.mips[m];
       GuestMip gm;
-      gm.offset = offset;
+      gm.offset = gl.mip_offsets_bytes[m];
       gm.ox = 0;
       gm.oy = 0;
       gm.lw = lw;
       gm.lh = lh;
-      gm.ext = rex::graphics::TextureExtent::Calculate(fmt, sw, sh, /*depth=*/1, t.tiled,
-                                                       /*is_guest=*/true);
-      if (packed_reached) {
-        rex::graphics::TextureInfo::GetPackedTileOffset(sw, sh, fmt, int(m - packed_base),
-                                                        &gm.ox, &gm.oy);
+      // Rebuild an extent whose block_pitch_h/v match the layout's strides, so the tiled address
+      // maths downstream uses the reference's pitch rather than one we re-derived.
+      gm.ext = rex::graphics::TextureExtent::Calculate(
+          fmt, std::max(rex::next_pow2(t.width) >> m, 1u),
+          std::max(rex::next_pow2(height) >> m, 1u), /*depth=*/1, t.tiled, /*is_guest=*/true);
+      gm.ext.block_pitch_h = lvl.row_pitch_bytes / bpb;
+      gm.ext.block_pitch_v = lvl.z_slice_stride_block_rows;
+      if (m == packed_level && t.packed_mips) {
+        rex::graphics::TextureInfo::GetPackedTileOffset(
+            std::max(rex::next_pow2(t.width) >> m, 1u),
+            std::max(rex::next_pow2(height) >> m, 1u), fmt, 0, &gm.ox, &gm.oy);
       }
-      const uint32_t level_bytes = gm.ext.block_pitch_h * gm.ext.block_pitch_v * bpb;
-      guest_mip_bytes = std::max(guest_mip_bytes, gm.offset + level_bytes);
-      // Cap the COPY to the visible blocks (the host level's real size); the full pow2 pitch
-      // stays in block_pitch_h/v for source addressing -- the same trick as level 0 above.
+      guest_mip_bytes = std::max(guest_mip_bytes, gm.offset + lvl.level_data_extent_bytes);
       gm.ext.block_width = (lw + fmt->block_width - 1) / fmt->block_width;
       gm.ext.block_height = (lh + fmt->block_height - 1) / fmt->block_height;
       guest_plan.push_back(gm);
-      if (!packed_reached) {
-        offset += level_bytes;
-        ++packed_base;
-      }
-      // Once packed, every remaining level shares the tile at the current offset.
     }
   }
   const bool guest_mips = !guest_plan.empty();
@@ -4721,6 +5196,28 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ArmWriteWatch(t.base_address, uint32_t(guest_bytes));
     src = TranslatePhysical(t.base_address);
   }
+  // HOW FAR MAY THIS DECODE READ? See nx1_d3d9_clamp_alloc. The fetch constant can declare more
+  // bytes than the pool allocated, in which case the tail of our read is the NEXT texture and
+  // decodes as rainbow noise. Stop at the next live base instead.
+  //
+  // "Live" is the whole point: the map accumulates every base ever bound, and an address the pool
+  // has since freed still sits in it. Clamping against a dead neighbour would truncate a texture
+  // that is perfectly fine, so only bases bound within the last few frames count.
+  size_t src_limit = SIZE_MAX;
+  live_bases_[t.base_address] = frame_;
+  if (REXCVAR_GET(nx1_d3d9_clamp_alloc) && guest_bytes) {
+    constexpr uint64_t kLiveFrames = 4;
+    for (auto it = live_bases_.upper_bound(t.base_address);
+         it != live_bases_.end() && uint64_t(it->first) < uint64_t(t.base_address) + guest_bytes;
+         ++it) {
+      if (frame_ - it->second <= kLiveFrames) {
+        src_limit = size_t(it->first - t.base_address);
+        ++clamp_hits_;
+        clamp_bytes_ += guest_bytes - src_limit;
+        break;
+      }
+    }
+  }
   // AFTER the source is chosen, and deliberately outside the branch above: this census asks whose
   // bytes we are about to decode, which is the same question whether they came from the snapshot
   // or from live memory. It was originally written inside the mirror branch and therefore never
@@ -4835,13 +5332,29 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   /// Where the mip builder reads level 0 from. Defaults to the mapped surface, but the
   /// block-compressed path below redirects it to a normal-RAM copy -- see the comment there.
   const uint8_t* mip_source = dst;
+  // THE CPU-DECODE PATHS BELOW MUST NOT LEAVE mip_source POINTING AT `dst`.
+  //
+  // `dst` is mapped D3D9 staging memory, which is routinely WRITE-COMBINED: fine to write,
+  // unreliable to READ -- a read can bypass the pending write-combine buffers and return stale or
+  // partial bytes. The plain block-compressed path below already detours through normal RAM for
+  // exactly this reason, and its comment names the symptom: "That is the distance speckle on
+  // block-compressed surfaces."
+  //
+  // But only that one path got the treatment. kColorSwizzle, kDXN and BC-alpha all wrote straight
+  // into `dst` and left mip_source = dst, so every level of their chains was built from a
+  // write-combined read-back. kDXN is the normal-map format, i.e. every world surface in this
+  // game. Measured: with mips disabled entirely the scene is CLEAN, so level 0 is fine and the
+  // corruption is produced by the chain -- which is what this fixes.
+  uint8_t* argb_stage = nullptr;
+  const size_t argb_bytes = size_t(locked.Pitch) * height;
   if (dst) {
     if (host.decode == TexDecode::kColorSwizzle) {
       // Detile the compressed colour blocks, then decode to A8R8G8B8 applying the channel swizzle
       // (the compressed host format cannot honour a broadcast swizzle) -- see src_bc above.
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
-      DecodeBcColorSwizzledToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy, src_limit);
+      argb_stage = ArgbScratch(argb_bytes);
+      DecodeBcColorSwizzledToArgb(argb_stage, uint32_t(locked.Pitch), scratch, extent.block_width,
                                   extent.block_height, t.width, height, src_bc, bpb, t.swizzle);
       // A broadcast-swizzle sprite that decodes to all zero is not resident yet: its texel pool has
       // not been streamed in (the same residency gap behind the distant-surface confetti). Caching
@@ -4853,20 +5366,28 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         for (uint32_t x = 0; x < t.width; ++x) sa += r[x * 4 + 3];
       }
       swizzle_all_zero = sa == 0;
+      std::memcpy(dst, argb_stage, argb_bytes);
+      mip_source = argb_stage;
     } else if (host.decode == TexDecode::kDXN) {
       // CPU-decode DXN normal maps with the hardware RGGG swizzle (see PickHostTextureFormat).
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
-      DecodeDXNToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy, src_limit);
+      argb_stage = ArgbScratch(argb_bytes);
+      DecodeDXNToArgb(argb_stage, uint32_t(locked.Pitch), scratch, extent.block_width,
                       extent.block_height, t.width, height);
+      std::memcpy(dst, argb_stage, argb_bytes);
+      mip_source = argb_stage;
     } else if (host.decode != TexDecode::kNone) {
       // CPU-decode single-channel BC-alpha: detile the compressed 8-byte blocks
       // into a linear scratch buffer, then expand each block to A8R8G8B8 (v,v,v,v).
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
-      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
-      DecodeBCAlphaToArgb(dst, uint32_t(locked.Pitch), scratch, extent.block_width,
+      DetileMip2D(scratch, extent.block_width * bpb, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy, src_limit);
+      argb_stage = ArgbScratch(argb_bytes);
+      DecodeBCAlphaToArgb(argb_stage, uint32_t(locked.Pitch), scratch, extent.block_width,
                           extent.block_height, t.width, height,
                           host.decode == TexDecode::kDXT5A, t.swizzle);
+      std::memcpy(dst, argb_stage, argb_bytes);
+      mip_source = argb_stage;
     } else if (build_mips) {
       // Detile into ordinary RAM and copy up, rather than writing straight into the mapped
       // surface. The mip chain below has to READ level 0 back, and `dst` is D3D9 staging
@@ -4877,7 +5398,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // built from it. That is the distance speckle on block-compressed surfaces.
       const size_t level0_bytes = size_t(extent.block_height) * dst_row_bytes;
       uint8_t* staged = DetileScratch(level0_bytes);
-      DetileMip2D(staged, dst_row_bytes, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
+      DetileMip2D(staged, dst_row_bytes, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy, src_limit);
       const Swizzle32 swz = MakeSwizzle32(t.swizzle);
       if (host.swizzle32 && !swz.identity) {
         for (uint32_t by = 0; by < extent.block_height; ++by) {
@@ -4887,13 +5408,33 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       std::memcpy(dst, staged, level0_bytes);
       mip_source = staged;
     } else {
-      DetileMip2D(dst, dst_row_bytes, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy);
+      DetileMip2D(dst, dst_row_bytes, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy, src_limit);
       const Swizzle32 swz = MakeSwizzle32(t.swizzle);
       if (host.swizzle32 && !swz.identity) {
         for (uint32_t by = 0; by < extent.block_height; ++by) {
           SwizzleRow32(dst + size_t(by) * dst_row_bytes, extent.block_width, swz);
         }
       }
+    }
+  }
+
+  // D9TEX -- our side of the REFTEX comparison. Same dedup key and same fields, so the two logs
+  // diff directly. The question is whether the native renderer decodes textures the reference
+  // never loads (we bind or resolve differently) or the same set (the difference is which
+  // subresource, not which texture). Per-draw comparison cannot answer this -- the two backends
+  // run unsynchronised, which is what made FETCHCMP report 27,616 bogus mismatches -- but SET
+  // comparison needs no synchronisation at all.
+  if (REXCVAR_GET(nx1_d3d9_dbg_texset)) {
+    static std::mutex d9_m;
+    static std::unordered_set<uint64_t> d9_seen;
+    const uint64_t sig = (uint64_t(t.base_address >> 12) << 40) ^
+                         (uint64_t(t.mip_address >> 12) << 20) ^
+                         (uint64_t(t.width - 1) << 8) ^ uint64_t(t.format);
+    std::lock_guard<std::mutex> lk(d9_m);
+    if (d9_seen.size() < 60000 && d9_seen.insert(sig).second) {
+      REXGPU_INFO("D9TEX base={:08X} mip={:08X} {}x{} fmt={} tiled={} packed={} mip_max={}",
+                  t.base_address, t.mip_address, t.width, height, t.format, t.tiled ? 1 : 0,
+                  t.packed_mips ? 1 : 0, t.mip_max_level);
     }
   }
 
@@ -4960,10 +5501,50 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     uint64_t h = 1469598103934665603ull;
     const size_t hashed = size_t(dst_row_bytes) * extent.block_height;
     for (size_t i = 0; i < hashed; i += 257) h = (h ^ dst[i]) * 1099511628211ull;
+    // DMA COVERAGE CENSUS -- see the cvar's comment. Runs on every decode so the sample is not
+    // selected by the provenance detector, which is measured unreliable.
+    if (REXCVAR_GET(nx1_d3d9_dbg_dmacover) && guest_bytes) {
+      ++dmacover_decodes_;
+      const uint32_t p_first = t.base_address >> 12;
+      const uint32_t p_last = uint32_t((uint64_t(t.base_address) + guest_bytes - 1) >> 12);
+      for (uint32_t p = p_first; p <= p_last; ++p) {
+        switch (DmaPageVerdictFor(p << 12)) {
+          case 0: ++dmacover_pg_never_; break;
+          case 1: ++dmacover_pg_skipped_; break;
+          default: ++dmacover_pg_written_; break;
+        }
+      }
+      // Decode-level: did the copy covering our BASE reach the last byte we decode? Measured from
+      // the copy's own base, since a texture can sit partway into a larger copy's destination.
+      uint32_t cbase = 0, cbytes = 0, calt = 0;
+      if (DmaCoverageFor(t.base_address, &cbase, &cbytes, &calt)) {
+        const uint64_t need = (uint64_t(t.base_address) - cbase) + guest_bytes;
+        if (cbytes < need) {
+          ++dmacover_under_;
+          // The discriminator for the lo-vs-hi ImageAllocInfo question: if the half we DIDN'T use
+          // would have spanned the texture, the size choice is simply wrong.
+          if (calt >= need) ++dmacover_alt_fits_;
+        } else {
+          ++dmacover_covered_;
+        }
+      } else {
+        ++dmacover_nocopy_;
+      }
+    }
+    // THIS COUNTER READ ZERO FOR ITS ENTIRE LIFE, and not because nothing wrote the pages.
+    // `src_pages_total` is declared 0 at the top of this function and not assigned until ~130
+    // lines BELOW here, so the loop bound was always 0, the body never ran, and every
+    // DECODECHANGE line in every log has reported "page writes 0 -> 0" unconditionally. It was
+    // read across sessions as proof that guest texture memory moves through paths the write-watch
+    // cannot see, and a GPU-write watch was built on that reading. Derive the span locally from
+    // the bytes this decode actually reads, so the number cannot depend on assignment order.
     uint32_t wsum = 0;
-    for (uint32_t i = 0; i < src_pages_total; ++i) {
-      const uint32_t p = (t.base_address >> 12) + i;
-      if (p < page_writes_.size()) wsum += page_writes_[p];
+    if (guest_bytes) {
+      const uint32_t p_first = t.base_address >> 12;
+      const uint32_t p_last = uint32_t((uint64_t(t.base_address) + guest_bytes - 1) >> 12);
+      for (uint32_t p = p_first; p <= p_last && p < page_writes_.size(); ++p) {
+        wsum += page_writes_[p];
+      }
     }
     auto& prev = decode_hashes_[DecodeViewKey(t)];
     // Index every decode's content by hash, and ask whether a CHANGED texture now holds content
@@ -5198,6 +5779,78 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     REXCVAR_SET(nx1_d3d9_dbg_dump_mixed, REXCVAR_GET(nx1_d3d9_dbg_dump_mixed) - 1);
   }
   pageorigin_dump_this_ = false;
+
+  // OPERATOR-AIMED FRAME CAPTURE -- deliberately classifies NOTHING.
+  //
+  // The previous version of this scored the decoded image and dumped what "looked corrupt". It
+  // captured eight textures at 22-99% and every one was perfect: an Xbox controller on
+  // transparency, litter and rubble decal atlases, dark grass. Alpha-masked decals are mostly
+  // black with sparse high-contrast content, so they trip both a blackness test and a variance
+  // test. That is the FOURTH time this project has judged texture CONTENT to infer badness and
+  // been wrong, and content simply cannot separate corruption from legitimately dark or detailed
+  // art -- no threshold fixes that, so no threshold is used here.
+  //
+  // Instead: when armed, dump every distinct texture bound over the next N frames. The operator
+  // can SEE the speckle; point at it, arm this, and the corrupt texture is necessarily in the
+  // capture. Picking it out afterwards is a human looking at pictures, which is the one step in
+  // this investigation that has never produced a false result.
+  // NO GATE BEYOND THE OPERATOR'S FINGER. A scene-resolve gate was tried and does not work: the
+  // in-game menus (class select) draw over a live scene, so they pass it, and those are exactly
+  // the textures that keep getting captured. F6 while looking at the speckle is the whole filter.
+  if (const uint32_t frames_left = REXCVAR_GET(nx1_d3d9_dbg_dump_frame);
+      frames_left && dst && src && guest_bytes && IsBlockCompressed(host.d3d) &&
+      framecap_count_ < REXCVAR_GET(nx1_d3d9_dbg_dump_frame_max) && t.width >= 64 && height >= 64) {
+    const uint64_t id = MixKey(t.base_address, (uint64_t(t.format) << 32) | (t.width << 16) | height);
+    if (framecap_seen_.insert(id).second) {
+      ++framecap_count_;
+      bool watched = false;
+      for (const auto& e : addr_watch_) watched |= e.addr == t.base_address;
+      if (!watched && addr_watch_.size() < 16) {
+        AddrWatch w;
+        w.addr = t.base_address; w.bytes = uint32_t(guest_bytes);
+        w.w = t.width; w.h = height; w.fmt = t.format; w.pitch = t.pitch_pixels;
+        addr_watch_.push_back(w);
+      }
+      std::vector<Rgba8> fimg;
+      DecodeBcImage(host.d3d, mip_source, dst_row_bytes, t.width, height, fimg);
+      char fp[256];
+      if (!fimg.empty()) {
+        std::snprintf(fp, sizeof(fp), "texdump/c%02u_%03u_%08X_%ux%u_f%u.bmp", framecap_batch_, framecap_count_,
+                      t.base_address, t.width, height, t.format);
+        DumpRgbaBmp(fp, fimg, t.width, height);
+      }
+      std::snprintf(fp, sizeof(fp), "texdump/c%02u_%03u_%08X_%ux%u_f%u.bin", framecap_batch_, framecap_count_,
+                    t.base_address, t.width, height, t.format);
+      if (FILE* f = std::fopen(fp, "wb")) {
+        std::fwrite(src, 1, guest_bytes, f);
+        std::fclose(f);
+      }
+      std::snprintf(fp, sizeof(fp), "texdump/c%02u_%03u_%08X_%ux%u_f%u.txt", framecap_batch_, framecap_count_,
+                    t.base_address, t.width, height, t.format);
+      if (FILE* f = std::fopen(fp, "wb")) {
+        std::fprintf(f,
+                     "base=%08X width=%u height=%u format=%u bytes=%zu\n"
+                     "pitch_pixels=%u tiled=%u endian=%u swizzle=0x%03X\n"
+                     "block_width=%u block_height=%u block_pitch_h=%u block_pitch_v=%u bpb=%u\n"
+                     "mip_max_level=%u packed_mips=%u mip_address=%08X dimension=%u depth=%u\n"
+                     "host_d3dfmt=0x%08X frame=%llu\n"
+                     // The SOURCE dwords, so the geometry above can be re-derived by hand against
+                     // GPUTEXTURE_FETCH_CONSTANT instead of taken on trust. Size is in raw[2]:
+                     // width_minus_1 = bits 0..12, height_minus_1 = bits 13..25. This is what
+                     // separates "the guest asked for 256x256" from "we misread the size field",
+                     // which is the open question on the proven 11401000 over-read.
+                     "raw=%08X:%08X:%08X:%08X:%08X:%08X\n",
+                     t.base_address, t.width, height, t.format, guest_bytes, t.pitch_pixels,
+                     t.tiled ? 1u : 0u, uint32_t(t.endian), t.swizzle, extent.block_width,
+                     extent.block_height, extent.block_pitch_h, extent.block_pitch_v, bpb,
+                     t.mip_max_level, t.packed_mips ? 1u : 0u, t.mip_address, t.dimension, t.depth,
+                     uint32_t(host.d3d), static_cast<unsigned long long>(frame_),
+                     t.raw[0], t.raw[1], t.raw[2], t.raw[3], t.raw[4], t.raw[5]);
+        std::fclose(f);
+      }
+    }
+  }
+
   if (const uint32_t tex_dump_left = REXCVAR_GET(nx1_d3d9_dbg_texdump);
       dst && ((tex_dump_left && dump_size_ok) || hash_dump_match || dump_flagged)) {
     if (tex_dump_left && !hash_dump_match && !dump_flagged) {
@@ -5245,6 +5898,47 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       std::snprintf(path, sizeof(path), "texdump/%s_%08X_%ux%u_f%u.bmp",
                     dump_flagged ? "MIXED" : "tex", t.base_address, t.width, height, t.format);
       DumpRgbaBmp(path, img, t.width, height);
+
+      // THE FORK THIS INVESTIGATION HAS NEVER RESOLVED: are the BYTES wrong, or is our DECODE
+      // wrong? Every instrument so far has measured provenance -- where bytes came from -- which
+      // answers neither, and eleven of them have misled. Dumping the COMPLETE guest source
+      // alongside the image we produced from it makes the question answerable offline by decoding
+      // the same bytes with an independent implementation:
+      //   independent decode CLEAN  -> the bytes are fine and our untile/BC path is wrong
+      //   independent decode BROKEN -> the bytes really are another asset's, and no amount of
+      //                                decode work will help; it is delivery or identity
+      // The existing raw_/rawok_ dumps only cover the first tile row and a control row, which
+      // cannot answer this for a texture whose corruption is spread over the whole image.
+      //
+      // The sidecar is not optional: a raw dump without pitch/endian/swizzle/tiled cannot be
+      // decoded by anything but this build, and a dump aimed at an address goes stale because the
+      // pool reassigns addresses between launches.
+      if (src && guest_bytes) {
+        char rp[256];
+        std::snprintf(rp, sizeof(rp), "texdump/full_%08X_%ux%u_f%u.bin", t.base_address, t.width,
+                      height, t.format);
+        if (FILE* f = std::fopen(rp, "wb")) {
+          std::fwrite(src, 1, guest_bytes, f);
+          std::fclose(f);
+        }
+        std::snprintf(rp, sizeof(rp), "texdump/full_%08X_%ux%u_f%u.txt", t.base_address, t.width,
+                      height, t.format);
+        if (FILE* f = std::fopen(rp, "wb")) {
+          std::fprintf(f,
+                       "base=%08X width=%u height=%u format=%u bytes=%zu\n"
+                       "pitch_pixels=%u tiled=%u endian=%u swizzle=0x%03X\n"
+                       "block_width=%u block_height=%u block_pitch_h=%u block_pitch_v=%u bpb=%u\n"
+                       "mip_max_level=%u packed_mips=%u mip_address=%08X dimension=%u depth=%u\n"
+                       "host_d3dfmt=0x%08X frame=%llu\n",
+                       t.base_address, t.width, height, t.format, guest_bytes, t.pitch_pixels,
+                       t.tiled ? 1u : 0u, uint32_t(t.endian), t.swizzle, extent.block_width,
+                       extent.block_height, extent.block_pitch_h, extent.block_pitch_v, bpb,
+                       t.mip_max_level, t.packed_mips ? 1u : 0u, t.mip_address, t.dimension,
+                       t.depth, uint32_t(host.d3d),
+                       static_cast<unsigned long long>(frame_));
+          std::fclose(f);
+        }
+      }
     }
 
     // ALSO dump mip level 1, decoded from mip_address. Xenos keeps level 0 at base_address and
@@ -5690,20 +6384,22 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   entry.layout_key = layout_key;
   entry.dirty = false;
   {
-    uint32_t probe_bytes = 0;
-    if (const auto* fi_d = rex::graphics::FormatInfo::Get(t.format)) {
-      const uint32_t bw_d = (t.width + fi_d->block_width - 1) / fi_d->block_width;
-      const uint32_t bh_d = (height + fi_d->block_height - 1) / fi_d->block_height;
-      probe_bytes = bw_d * bh_d * fi_d->bytes_per_block();
-    }
-    if (uint64_t(PhysicalAddress(t.base_address)) + probe_bytes > (uint64_t(kMirrorPages) << 12)) {
-      probe_bytes = 0;  // same clamp as the bind-time probe
-    }
-    if (uint64_t(PhysicalAddress(t.base_address)) + probe_bytes > (uint64_t(kMirrorPages) << 12)) {
-      probe_bytes = 0;  // same clamp as the bind-time probe
-    }
-    entry.probe_hash =
-        probe_bytes ? ProbeGuestContent(TranslatePhysical(t.base_address), probe_bytes) : 0;
+    // SEED AND CHECK MUST USE THE SAME FUNCTION OVER THE SAME BYTES.
+    //
+    // They did not, briefly, and the cost was immediate: the seed hashed a linear range while the
+    // bind-time check hashed a different span, so every probe mismatched, every texture rebuilt
+    // every frame, and CONTENTPROBE went 3,513 -> 1,211,952 (~224 rebuilds/frame) with the frame
+    // rate collapsing. Any future change here has to move both sites together.
+    //
+    // `extent` is already clamped to the VISIBLE block grid above (a wider pitch stays in
+    // block_pitch_h for addressing), which is exactly what ProbeTiledContent wants.
+    const uint32_t probe_bytes = extent.block_pitch_h * extent.block_pitch_v * bpb;
+    const bool probe_in_range =
+        uint64_t(PhysicalAddress(t.base_address)) + probe_bytes <= (uint64_t(kMirrorPages) << 12);
+    entry.probe_hash = probe_in_range
+                           ? ProbeTiledContent(TranslatePhysical(t.base_address), extent, bpb,
+                                               t.tiled, REXCVAR_GET(nx1_d3d9_probe_samples))
+                           : 0;
     entry.probe_frame = frame_;
   }
   // Arm the premature-decode ladder HERE, at the actual end of a decode. It was first placed at
@@ -6475,6 +7171,15 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_writeback_all, false, "GPU",
 void ResourceTracker::MarkResolveDest(const TextureFetchConstant& dest, WritebackVerdict verdict) {
   if (!dest.base_address) {
     return;
+  }
+  // ARE WE IN GAMEPLAY, OR IN A MENU? The scene renders to a ~1024x600 target, so a resolve of
+  // that shape is the frame's scene resolve and nothing in the front end produces one. This is
+  // what gates the frame capture: an earlier capture ran in the menus, which have rendered
+  // correctly for months, and dumped 8 pristine front-end textures. Recorded as a FRAME NUMBER
+  // rather than a sticky flag so it self-clears -- "the scene resolved within the last couple of
+  // frames" means we are in gameplay right now, not that we passed through it once at startup.
+  if (dest.height >= 500 && dest.height <= 720 && dest.width >= 800) {
+    scene_resolve_frame_ = frame_;
   }
   // Conservative extent: the real tiled extent when the format is known, else a plain 32bpp
   // estimate. Over-marking a page or two only widens the census's reach; under-marking would

@@ -66,6 +66,17 @@ constexpr int kToggleKey = VK_F4;
 // F3 matches the ReXGlue D3D12 side, where F3 is already the debug key.
 constexpr int kPickerKey = VK_F3;
 constexpr int kLogKey = VK_F2;
+/// Capture every texture on screen RIGHT NOW.
+///
+/// Manual on purpose. Two automatic selectors failed here: scoring decoded images for "corruption"
+/// captured eight pristine decal atlases (dark art scores identically to garbage), and gating on
+/// the ~600p scene resolve still caught the in-game menus, because the class-select screen draws
+/// over a live scene. The operator can see the speckle and no heuristic can, so the trigger is a
+/// key. F1 because the artifact is fleeting and it is the easiest key to hit without looking.
+constexpr int kCaptureKey = VK_F1;
+/// Frames a single press captures. More than one because a texture is only dumped on the frame it
+/// is decoded on, and a settled scene may re-bind from cache without re-decoding.
+constexpr uint32_t kCaptureFrames = 20;
 }  // namespace
 
 Overlay& Overlay::Get() {
@@ -164,6 +175,12 @@ LRESULT CALLBACK Overlay::WndProcThunk(HWND hwnd, UINT msg, WPARAM wparam, LPARA
   }
   if (msg == WM_KEYDOWN && int(wparam) == kLogKey) {
     self.log_visible_ = !self.log_visible_;
+    return 0;
+  }
+  // Arms the frame capture. Swallowed like the other overlay keys so a press cannot also mean
+  // something to the game while the player is standing in front of the artifact.
+  if (msg == WM_KEYDOWN && int(wparam) == kCaptureKey) {
+    ResourceTracker::Get().ArmFrameCapture(kCaptureFrames);
     return 0;
   }
 

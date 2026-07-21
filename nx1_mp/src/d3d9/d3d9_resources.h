@@ -21,8 +21,10 @@
 
 #ifdef _WIN32
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -88,6 +90,17 @@ class ResourceTracker {
   /// dynamic buffers out of a moving pool, so their addresses churn and the caches would
   /// otherwise grow without bound (measured: 22k live vertex buffers and still climbing).
   void AdvanceFrame();
+
+  /// Capture every distinct block-compressed texture decoded over the next `frames` frames:
+  /// full guest source, our decode, and the parameters needed to decode it elsewhere.
+  ///
+  /// Driven by a key (F6), not by a heuristic. Two automatic selectors were tried and both
+  /// captured perfectly good textures -- content scoring cannot tell dark art from garbage, and
+  /// the scene-resolve gate still admitted the in-game menus, which draw over a live scene. The
+  /// operator can see the artifact; nothing else here can.
+  ///
+  /// Each press starts a new batch, so repeated presses accumulate instead of overwriting.
+  void ArmFrameCapture(uint32_t frames);
 
   /// Translate the guest's bound D3D::CVertexDeclaration. Returns nullptr if any
   /// element uses a Xenos vertex format we cannot express or decode.
@@ -360,6 +373,84 @@ class ResourceTracker {
   // memory global lock, so it must NOT touch the texture cache -- it only queues the written range,
   // which DrainMemoryWrites() applies from AdvanceFrame on the render thread.
   void* mem_watch_handle_ = nullptr;  ///< RegisterPhysicalMemoryInvalidationCallback handle
+
+  // GPU-WRITE WATCH. Host page protection traps CPU stores only, so every write the GPU makes to
+  // guest memory -- which is how this title streams textures, via the ImageCache's memexport blit
+  // -- is invisible to mem_watch_handle_ above. Measured: 3036 of 3047 DECODECHANGE lines report
+  // "page writes 0 -> 0", i.e. content changed completely with neither a CPU write nor one of our
+  // own 379,158 mirrored DMA copies ever touching the page. A cache that cannot see those writes
+  // serves its first decode forever, which is what the speckle is.
+  //
+  // The reference is told about them explicitly at SharedMemory::RangeWrittenByGpu, and exposes
+  // RegisterGlobalWatch as the sanctioned way to subscribe. Same queue-only discipline as the
+  // write-watch: this fires on the reference's GPU worker thread INSIDE that subsystem's global
+  // critical region, so it must only queue -- never touch the texture map.
+  void* gpu_watch_handle_ = nullptr;  ///< SharedMemory::RegisterGlobalWatch handle
+  /// Idempotent; a no-op until the reference's SharedMemory exists (created in SetupContext),
+  /// so Initialize may be too early and AdvanceFrame retries until it takes.
+  void RegisterGpuWriteWatch();
+  static void GpuWriteWatchThunk(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                 void* ctx, uint32_t address_first, uint32_t address_last,
+                                 bool invalidated_by_gpu);
+  void OnGpuWrite(uint32_t address_first, uint32_t address_last);
+  uint64_t gpu_write_ranges_ = 0;   ///< GPU-write ranges queued
+  uint64_t gpu_write_pages_ = 0;    ///< pages they covered
+  uint64_t gpu_write_blasts_ = 0;   ///< whole-buffer "destination unknown" invalidations
+  uint64_t gpu_write_dropped_ = 0;  ///< ranges skipped as over-wide
+  uint64_t rearm_calls_ = 0;        ///< pages re-armed by nx1_d3d9_rearm_watch
+
+  // Per-decode DMA coverage census (nx1_d3d9_dbg_dmacover). Decode-level verdicts first, then
+  // page-level, because they answer different questions: a texture can be "covered" by a copy
+  // whose span reached every page and still hold foreign bytes, because the per-page skip leaves
+  // empty-source pages untouched. Both are needed or "covered" is unfalsifiable.
+  uint64_t dmacover_decodes_ = 0;
+  uint64_t dmacover_nocopy_ = 0;     ///< no mirrored copy recorded for the base page
+  uint64_t dmacover_covered_ = 0;    ///< a copy spanned everything we decode
+  uint64_t dmacover_under_ = 0;      ///< the copy was SHORTER than the texture we decode
+  uint64_t dmacover_alt_fits_ = 0;   ///< ...and the other ImageAllocInfo half would have fit
+  uint64_t dmacover_pg_never_ = 0;   ///< pages no copy ever targeted
+  uint64_t dmacover_pg_skipped_ = 0; ///< pages spanned by a copy but skipped (empty source)
+  uint64_t dmacover_pg_written_ = 0; ///< pages a copy actually wrote
+
+  // Operator-aimed frame capture. No heuristic: it dumps what is bound while the game scene is
+  // on screen and a human picks the corrupt ones out of the pictures.
+  /// Base address -> frame it was last bound. Used to find where the NEXT live texture starts, so
+  /// a decode can stop there instead of reading into it. Only recent entries count: a stale base
+  /// inside our range would clamp a texture that is perfectly fine.
+  std::map<uint32_t, uint64_t> live_bases_;
+  uint64_t clamp_hits_ = 0;     ///< decodes clamped
+  uint64_t clamp_bytes_ = 0;    ///< bytes NOT read because of it
+
+  /// ADDRESS WATCH -- "do the correct bytes EVER appear at this address?"
+  ///
+  /// Everything else is now eliminated: the decode is provably correct (an independent clean-room
+  /// decoder reproduces the renderer's output exactly), and the bytes at the address are wrong at
+  /// decode time in BOTH modes -- stale in the mirror (MIRRORSTALE 499/14000), and equally wrong
+  /// when read live. Yet the reference renders these surfaces correctly from the same memory.
+  ///
+  /// So either the correct content is at that address at some OTHER moment and we sample the wrong
+  /// one, or it is never there and the reference reads somewhere else. Those need completely
+  /// different fixes and nothing measured so far separates them.
+  ///
+  /// Each F1-captured texture is re-read from LIVE guest memory every frame; whenever its content
+  /// hash changes, that version is written out. Offline, decode every version: if any is a clean
+  /// image, we are reading at the wrong TIME. If none ever is, we are reading the wrong PLACE.
+  struct AddrWatch {
+    uint32_t addr = 0, bytes = 0, w = 0, h = 0, fmt = 0, pitch = 0;
+    uint64_t last_hash = 0;
+    uint32_t versions = 0;
+  };
+  std::vector<AddrWatch> addr_watch_;
+  uint32_t addr_watch_frames_ = 0;
+  void PollAddrWatch();
+
+  uint32_t framecap_count_ = 0;
+  uint32_t framecap_batch_ = 0;  ///< bumped per press so batches do not overwrite each other
+  std::unordered_set<uint64_t> framecap_seen_;
+  /// Frame of the most recent ~600p scene resolve, i.e. "the game world was rendering then".
+  /// Gates the capture so it cannot fill up in the menus, which render correctly.
+  uint64_t scene_resolve_frame_ = 0;
+
   std::mutex dirty_mu_;               ///< guards writes_pending_
   std::vector<std::pair<uint32_t, uint32_t>> writes_pending_;  ///< (phys_addr, len) queued by callback
   void DrainMemoryWrites();  ///< apply queued guest writes: invalidate mirror pages, dirty entries
@@ -539,10 +630,73 @@ class ResourceTracker {
   /// std::vector, which malloc'd AND zero-filled up to a texture's worth of bytes on every
   /// rebuild only for DetileMip2D to overwrite every one of them. Grow-only, never shrunk, so
   /// after warm-up the resize is a no-op.
-  std::vector<uint8_t> detile_scratch_;
-  uint8_t* DetileScratch(size_t bytes) {
-    if (detile_scratch_.size() < bytes) detile_scratch_.resize(bytes);
-    return detile_scratch_.data();
+  ///
+  /// THREAD_LOCAL, NOT A MEMBER. This was one shared buffer handed to every caller with no lock,
+  /// while texture decoding demonstrably runs on several threads at once (the async translation
+  /// worker plus the render thread -- one run shows texture-path messages from t27788, t22092 and
+  /// t29680). Two concurrent decodes therefore wrote their blocks into the SAME memory, and
+  /// `resize()` could reallocate it out from under a thread mid-write.
+  ///
+  /// That is a precise match for the speckle: addressing is correct, the source bytes are
+  /// correct and stable (TORNPAGES 0 of 102,172), yet the output is another texture's blocks --
+  /// which is why NO re-addressing of the captured guest bytes reproduces the decoded image, and
+  /// why the corrupted regions kept showing recognisable content from other assets (UI glyphs,
+  /// other surfaces). The "foreign page provenance" detectors were seeing real foreign content;
+  /// it just never came from guest memory. It also explains immunity to every delivery, timing,
+  /// invalidation and cache-identity fix tried against it.
+  ///
+  /// Per-thread costs one buffer per decoding thread, which is a few MB at most.
+  static std::vector<uint8_t>& DetileScratchBuf() {
+    static thread_local std::vector<uint8_t> scratch;
+    return scratch;
+  }
+  /// PROOF THAT THE RACE IS REAL, not inferred. The fix above rests on decodes overlapping across
+  /// threads, and the only evidence for that was log lines carrying different thread ids -- which
+  /// shows several threads touch the texture path, NOT that they are ever inside it together.
+  /// These counters answer it directly: distinct threads that have ever taken scratch, and the
+  /// highest number simultaneously holding it. `overlap_max > 1` is the race, observed.
+  /// If it stays 1, the buffer was never actually shared concurrently and the thread_local change
+  /// is merely defensive -- in which case do not credit it with anything.
+  static std::atomic<uint32_t>& DetileScratchInFlight() {
+    static std::atomic<uint32_t> in_flight{0};
+    return in_flight;
+  }
+  static std::atomic<uint32_t>& DetileScratchOverlapMax() {
+    static std::atomic<uint32_t> overlap_max{0};
+    return overlap_max;
+  }
+  static std::atomic<uint32_t>& DetileScratchThreads() {
+    static std::atomic<uint32_t> threads{0};
+    return threads;
+  }
+  static uint8_t* DetileScratch(size_t bytes) {
+    auto& scratch = DetileScratchBuf();
+    if (scratch.empty()) {
+      DetileScratchThreads().fetch_add(1, std::memory_order_relaxed);
+    }
+    // Counted around the resize+return only. A decode holds the pointer well past this point, so
+    // this UNDER-reports overlap; a non-zero result is therefore conservative evidence.
+    const uint32_t n = DetileScratchInFlight().fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint32_t prev = DetileScratchOverlapMax().load(std::memory_order_relaxed);
+    while (n > prev &&
+           !DetileScratchOverlapMax().compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+    }
+    if (scratch.size() < bytes) scratch.resize(bytes);
+    DetileScratchInFlight().fetch_sub(1, std::memory_order_acq_rel);
+    return scratch.data();
+  }
+  /// This thread's scratch size, for the memory report.
+  static size_t DetileScratchBytes() { return DetileScratchBuf().size(); }
+
+  /// A SECOND scratch, for the CPU-decode paths' expanded ARGB output.
+  ///
+  /// Separate from DetileScratch because those paths need both at once: the detiled compressed
+  /// blocks in one buffer and the expanded ARGB in another. Same thread_local discipline -- see
+  /// DetileScratch for why a shared buffer here is a data race.
+  static uint8_t* ArgbScratch(size_t bytes) {
+    static thread_local std::vector<uint8_t> scratch;
+    if (scratch.size() < bytes) scratch.resize(bytes);
+    return scratch.data();
   }
 
   uint64_t tex_uploads_ = 0;    ///< level-0 uploads (new texture or content changed)

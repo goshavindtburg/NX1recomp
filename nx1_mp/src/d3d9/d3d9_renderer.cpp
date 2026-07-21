@@ -2782,20 +2782,58 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
         }
         const TextureFetchConstant rt =
             DecodeTextureFetchConstant(reinterpret_cast<const uint8_t*>(ref_be));
-        // The BASE ADDRESS is the signal. The register file is updated asynchronously by the
-        // ring, so filter/LOD fields drift harmlessly between the two snapshots; pointing at
-        // different memory does not.
-        if (rt.valid && t.valid && rt.base_address != t.base_address) {
+        // GEOMETRY IS ALSO THE SIGNAL, and testing only the address is what let this bug hide.
+        //
+        // This used to fire solely on base_address, on the reasoning that "pointing at different
+        // memory" is the only thing that matters. It is not. A binding with the RIGHT address and
+        // the WRONG SIZE reads past the end of whatever lives there and pulls in the next
+        // allocation, and that is a PROVEN cause of the speckle: guest 11401000 holds a valid
+        // 128x256 DXT1 texture, a binding declared it 256x256, and decoding the identical bytes
+        // both ways gives a clean image at 128x256 and clean-top-half-plus-garbage at 256x256.
+        // The two reads of that address one frame apart were 100.00% byte-identical, so nothing
+        // was wrong with the memory at all.
+        //
+        // This is why the "binding is correct, 0 divergences over 11,144 aligned draws" result
+        // cannot be cited against this: it compared addresses only, and was blind to the entire
+        // failure mode by construction.
+        //
+        // Address and geometry mismatches are counted apart because they mean different things,
+        // and because the register file genuinely does lag the shadow by a draw or two -- a
+        // geometry difference that appears once and never repeats is that lag, while one that
+        // recurs on the same (shader, sampler) is a real disagreement.
+        // THIS WHOLE COMPARISON IS ONLY MEANINGFUL WHEN THE REFERENCE IS RASTERISING.
+        //
+        // Measured with nx1_skip_reference_raster=true: 27,616 "address mismatches", with the GPU
+        // side reporting the SAME handful of addresses across dozens of different pixel shaders.
+        // That is not a bug, it is total desynchronisation -- we execute draws at hook time on the
+        // guest thread while the ring is processed independently, so "the current draw" means
+        // different things on each side. It is the positional-comparison trap this project already
+        // documented once. Do not read anything into these counters unless the reference is
+        // executing the same draws.
+        //
+        // geom is tested INDEPENDENTLY of addr: it used to be gated behind !addr_bad, and since
+        // addr_bad is ~always true under that desync, the geometry test never actually ran and
+        // reported a meaningless geom=0.
+        const bool addr_bad = rt.valid && t.valid && rt.base_address != t.base_address;
+        const bool geom_bad = rt.valid && t.valid &&
+                              (rt.width != t.width || rt.height != t.height ||
+                               rt.format != t.format || rt.pitch_pixels != t.pitch_pixels);
+        if (addr_bad || geom_bad) {
           static std::mutex m;
           static std::vector<uint64_t> seen;
-          const uint64_t key = (uint64_t(d.ps_object) << 8) | sampler;
+          static uint32_t addr_hits = 0, geom_hits = 0;
+          const uint64_t key = (uint64_t(d.ps_object) << 8) | sampler | (geom_bad ? (1ull << 60) : 0);
           std::lock_guard<std::mutex> lk(m);
-          if (seen.size() < 32 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+          (geom_bad ? geom_hits : addr_hits)++;
+          if (seen.size() < 64 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
             seen.push_back(key);
-            REXGPU_WARN("nx1_d3d9: FETCHCMP s{} MISMATCH ps={:08X} | ours base={:08X} {}x{} "
-                        "fmt={} | gpu base={:08X} {}x{} fmt={}",
-                        sampler, d.ps_object, t.base_address, t.width, t.height, t.format,
-                        rt.base_address, rt.width, rt.height, rt.format);
+            REXGPU_WARN("nx1_d3d9: FETCHCMP s{} {} ps={:08X} | ours base={:08X} {}x{} fmt={} "
+                        "pitch={} | gpu base={:08X} {}x{} fmt={} pitch={} | totals addr={} geom={}",
+                        sampler, addr_bad ? (geom_bad ? "ADDR+GEOM-MISMATCH" : "ADDR-MISMATCH")
+                                          : "GEOMETRY-MISMATCH", d.ps_object,
+                        t.base_address, t.width, t.height, t.format, t.pitch_pixels,
+                        rt.base_address, rt.width, rt.height, rt.format, rt.pitch_pixels,
+                        addr_hits, geom_hits);
           }
         }
       }
@@ -2873,6 +2911,16 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     }
     if (REXCVAR_GET(nx1_d3d9_dbg_nomips)) {
       mip_filter = D3DTEXF_NONE;
+      // PROOF THAT IT TOOK. A run with this on looked identical to one without, which is not what
+      // disabling mips normally looks like -- so count the DECISION, not the SetSamplerState call.
+      // The sampler-state cache below suppresses redundant calls, so counting API calls would
+      // under-report and look like the cvar was being ignored when it was merely already applied.
+      static std::atomic<uint64_t> forced{0};
+      if ((forced.fetch_add(1, std::memory_order_relaxed) % 200000) == 0) {
+        REXGPU_WARN("nx1_d3d9: NOMIPS forced MIPFILTER=NONE on {} sampler applications so far "
+                    "(nonzero here proves the cvar is reaching the sampler state)",
+                    forced.load(std::memory_order_relaxed));
+      }
     }
     // Debug: refuse the top N mips of chosen slots on one material. The artifact under
     // investigation is distance-dependent -- saturated up close, merely speckled far away -- which

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <unordered_set>
 #include <cstdint>
 #include <utility>
 
@@ -988,15 +989,18 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   // each distinct texture once so the two sets can be diffed: a texture the native renderer
   // decodes from an empty base_page will show up here under whatever page actually holds it.
   {
+    // Cap raised from 300 and the linear vector replaced with a set. At 300 this budget was spent
+    // during startup, so a REFTEX list compared against gameplay-time captures overlapped on only
+    // 9 addresses and the comparison was worthless. The point of this log is to diff the SET of
+    // textures the reference loads against the set the native renderer decodes, which needs the
+    // whole run, not the first 300.
     static std::mutex ref_m;
-    static std::vector<uint64_t> ref_seen;
+    static std::unordered_set<uint64_t> ref_seen;
     std::lock_guard<std::mutex> lk(ref_m);
     const uint64_t sig = (uint64_t(key_out.base_page) << 40) ^
                          (uint64_t(key_out.mip_page) << 20) ^
                          (uint64_t(key_out.width_minus_1) << 8) ^ uint64_t(key_out.format);
-    if (std::find(ref_seen.begin(), ref_seen.end(), sig) == ref_seen.end() &&
-        ref_seen.size() < 300) {
-      ref_seen.push_back(sig);
+    if (ref_seen.size() < 60000 && ref_seen.insert(sig).second) {
       REXGPU_INFO("REFTEX base={:08X} mip={:08X} {}x{} fmt={} tiled={} packed={} mip_max={}",
                   key_out.base_page << 12, key_out.mip_page << 12,
                   uint32_t(key_out.width_minus_1) + 1, uint32_t(key_out.height_minus_1) + 1,

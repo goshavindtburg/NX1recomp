@@ -99,6 +99,15 @@ class CommandProcessor {
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
 
+  // NX1: the backend's guest-memory mirror, or nullptr if this backend has none.
+  //
+  // Exposed so the native D3D9 renderer can RegisterGlobalWatch on it. That watch is the only
+  // notification either renderer gets for GPU-side writes to guest memory (memexport, resolves):
+  // host page protection traps CPU stores only, so the D3D9 texture cache is otherwise blind to
+  // them -- measured as 3036 of 3047 texture content changes reporting "page writes 0 -> 0".
+  // See SharedMemory::RangeWrittenByGpu, which is where those writes are announced.
+  virtual class SharedMemory* Nx1SharedMemory() { return nullptr; }
+
   // "Desired" is for the external thread managing the post-processing effect.
   SwapPostEffect GetDesiredSwapPostEffect() const { return swap_post_effect_desired_; }
   void SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect);
