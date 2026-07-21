@@ -116,6 +116,25 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_track_addr, 0, "GPU",
 /// the speckle is the image cache's not-resident placeholder rather than damaged data.
 /// Measured: 34 distinct addresses reached one hash in a single run, with several more hashes
 /// reached by a dozen addresses each.
+/// SLOT REUSE: does a texture's new content belong to a DIFFERENT texture we have already seen?
+///
+/// This is the last standing explanation. Sources are complete (PARTIALSRC 0.4% over 19k decodes),
+/// memory is written, nothing tears, decodes are deterministic -- and yet the picture is wrong,
+/// with dumps showing real texel data from other images (smoke sprites rendering as rust and
+/// brickwork). If the streaming pool reassigns an address while we still bind it, we would decode
+/// whatever now lives there, faithfully, and paint another texture's content onto this surface.
+///
+/// Testable directly: index every decode's content hash by address, and when a texture's content
+/// CHANGES, look the new hash up. A hit at a different address names both parties -- the surface
+/// that went wrong and the texture whose bytes it is now showing.
+///
+/// Hashes reached by many addresses are EXCLUDED: small shared dummy and flat maps legitimately
+/// converge (measured: 16x16, 32x32, 64x64 solid-black images at 8+ addresses each), and counting
+/// those as reuse is the false positive that makes this test useless.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_slotreuse, false, "GPU",
+                    "When a texture's decoded content changes, report whether the new content was "
+                    "previously decoded at a DIFFERENT address -- i.e. the pool reused the slot");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_convergence_n, 0, "GPU",
                       "Dump a decoded image once this many DISTINCT texture addresses have "
                       "produced identical content (0 = off, 8 is a good start)");
@@ -3856,6 +3875,34 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       if (p < page_writes_.size()) wsum += page_writes_[p];
     }
     auto& prev = decode_hashes_[DecodeViewKey(t)];
+    // Index every decode's content by hash, and ask whether a CHANGED texture now holds content
+    // first seen somewhere else. Registration happens for all decodes; the report only on change.
+    if (REXCVAR_GET(nx1_d3d9_dbg_slotreuse)) {
+      struct SeenTex {
+        uint32_t addr, w, h, fmt, addr_count;
+      };
+      static std::mutex sm;
+      static std::unordered_map<uint64_t, SeenTex> seen;
+      std::lock_guard<std::mutex> lk(sm);
+      auto it = seen.find(h);
+      if (it == seen.end()) {
+        if (seen.size() < 65536) {
+          seen.emplace(h, SeenTex{t.base_address, t.width, height, t.format, 1});
+        }
+      } else {
+        if (it->second.addr != t.base_address) {
+          ++it->second.addr_count;
+          // <= 3 distinct addresses: not one of the shared dummy maps that legitimately converge.
+          if (prev.hash && prev.hash != h && it->second.addr_count <= 3) {
+            REXGPU_WARN("nx1_d3d9: SLOTREUSE {:08X} ({}x{} fmt={}) changed INTO content first "
+                        "decoded at {:08X} ({}x{} fmt={}) -- this surface is now showing another "
+                        "texture's bytes, so the pool reassigned the slot under us",
+                        t.base_address, t.width, height, t.format, it->second.addr, it->second.w,
+                        it->second.h, it->second.fmt);
+          }
+        }
+      }
+    }
     if (prev.hash && prev.hash != h) {
       ++prev.changes;
       REXGPU_WARN("nx1_d3d9: DECODECHANGE {:08X} {}x{} fmt={} frame {} -> {} | hash {:016X} -> "
