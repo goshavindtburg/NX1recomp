@@ -4371,6 +4371,32 @@ const uint8_t* ResourceTracker::MirrorSnapshot(uint32_t phys_addr, uint32_t len)
   const uint32_t p1 = (phys_addr + len - 1) >> 12;
   for (uint32_t p = p0; p <= p1; ++p) {
     if (!(mirror_valid_[p >> 6] & (uint64_t(1) << (p & 63)))) {
+      // VALIDATE AND ARM THE WATCH **BEFORE** THE COPY, NOT AFTER.
+      //
+      // This ordering is the reference's, and its header states the reason outright
+      // (rexglue-sdk/include/rex/graphics/shared_memory.h:135-140): "MakeRangeValid must be called
+      // for each successfully uploaded range as early as possible, BEFORE the memcpy, to make sure
+      // invalidation that happened during the CPU -> GPU memcpy isn't missed."
+      //
+      // We had it inverted, which opened two windows the reference does not have:
+      //   1. During the memcpy the page was UNPROTECTED, so a guest write landing mid-copy raised
+      //      no fault at all -- we captured a torn page and were not told.
+      //   2. We then SET the valid bit, so the torn page was cached as good, and the watch was
+      //      armed only afterwards.
+      // The result is a torn page LOCKED IN as valid, wrong until something unrelated happens to
+      // invalidate it. That is the artifact's exact shape: a surface that is wrong persistently and
+      // then "resolves when you get close", which is content_probe forcing the rebuild.
+      //
+      // With this order a write racing the copy faults against the protection we just armed, and
+      // the callback clears the bit we just set -- so the page is simply re-copied next request.
+      // A torn read can no longer become permanent; it becomes self-healing, which is precisely
+      // what makes the reference immune while reading the very same memory.
+      //
+      // Our own read below does not fault: the protection is read-only, and this is a read.
+      mirror_valid_[p >> 6] |= (uint64_t(1) << (p & 63));
+      if (auto* mem = rex::system::kernel_state()->memory()) {
+        mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
+      }
       std::memcpy(mirror_ + (size_t(p) << 12), phys_base_ + (size_t(p) << 12), 4096);
       // TORN-PAGE TEST. This copy runs on the render thread with NOTHING synchronising it
       // against the guest thread, which may be part-way through writing this very page --
@@ -4396,9 +4422,30 @@ const uint8_t* ResourceTracker::MirrorSnapshot(uint32_t phys_addr, uint32_t len)
           }
         }
       }
-      mirror_valid_[p >> 6] |= (uint64_t(1) << (p & 63));
-      if (auto* mem = rex::system::kernel_state()->memory()) {
-        mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
+      // NOTHING re-validates here. The bit was set before the copy on purpose: if the guest wrote
+      // this page while we were copying it, the invalidation callback has already cleared that bit
+      // and re-setting it now would reintroduce exactly the bug this ordering fixes.
+      //
+      // AND THAT IS MEASURABLE. If the bit is gone by the time the copy finishes, a guest write
+      // raced us: under the OLD ordering that page was captured torn and then cached as valid --
+      // wrong until something unrelated invalidated it. Under this ordering it is simply re-copied
+      // on the next request. So this counter is the frequency of the bug that was just fixed, and
+      // a zero means the race does not happen and the fix, while correct, changes nothing.
+      {
+        static std::atomic<uint64_t> copies{0}, raced{0};
+        const uint64_t n = copies.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!(mirror_valid_[p >> 6] & (uint64_t(1) << (p & 63)))) {
+          raced.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((n % 500000) == 1) {
+          const uint64_t r = raced.load(std::memory_order_relaxed);
+          REXGPU_WARN("nx1_d3d9: MIRRORRACE {} page copies, {} ({:.4f}%) were INVALIDATED WHILE "
+                      "BEING COPIED -- the guest wrote the page mid-snapshot. Each of these was a "
+                      "torn page that the old validate-after-copy ordering cached as good; they are "
+                      "now re-read instead. Zero means the race does not occur and this fix, though "
+                      "correct, changes nothing",
+                      n, r, 100.0 * double(r) / double(n));
+        }
       }
     }
   }
