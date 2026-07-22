@@ -30,6 +30,13 @@
  *    tornpages, ...) keep it. Those are what you switch ON for an experiment;
  *    these are what you switch OFF to get the frame rate back.
  *
+ * ONE OWNER PER LOG LINE. A line that already has its own cvar -- an instrument you deliberately
+ * arm, like dbg_hwcensus, dbg_track_addr, profile, dmacopy_mirror -- is NOT also put behind a
+ * category switch. The first pass did that to 40 sites, which would have meant turning a category
+ * off for frame rate silently vetoing an instrument you had switched on: precisely the
+ * "armed instrument prints nothing" failure this codebase has hit repeatedly. Categories cover
+ * routine logging only.
+ *
  * Defaults are TRUE so behaviour is unchanged until someone turns them off.
  */
 

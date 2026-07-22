@@ -855,7 +855,7 @@ void Renderer::BeginFrame() {
     pick_requested_.store(false, std::memory_order_relaxed);
     pick_count_ = 0;
     pick_results_.clear();
-    NX1_LOGI_MISC("nx1_d3d9: PICK armed at ({:.3f}, {:.3f}) of the window, box {}px",
+    REXGPU_INFO("nx1_d3d9: PICK armed at ({:.3f}, {:.3f}) of the window, box {}px",
                 pick_nx_, pick_ny_,
                 REXCVAR_GET(nx1_d3d9_dbg_pick_size) ? REXCVAR_GET(nx1_d3d9_dbg_pick_size) : 8);
   }
@@ -1046,7 +1046,7 @@ void Renderer::Present() {
   // refreshed the cache entries' last_frame within this frame.
   last_sig_valid_ = false;
   if (REXCVAR_GET(nx1_d3d9_record) && REXCVAR_GET(nx1_d3d9_profile) && !cmdbuf_.draws().empty()) {
-    NX1_LOGI_STATS("nx1_d3d9: PROF/record {} draws, {} constant deltas, {:.2f} MB, {:.2f} ms",
+    REXGPU_INFO("nx1_d3d9: PROF/record {} draws, {} constant deltas, {:.2f} MB, {:.2f} ms",
                 cmdbuf_.draws().size(), cmdbuf_.delta_count(),
                 double(cmdbuf_.captured_bytes()) / (1024.0 * 1024.0), prof_record_ns_ / 1e6);
   }
@@ -1079,14 +1079,14 @@ void Renderer::Present() {
       const auto tp = ResourceTracker::Get().TakeTextureProfile();
       const double tf = 1.0 / (1e6 * prof_frames);
       // Splits the textures phase: cache resolution vs rebuild, and the rebuild into its stages.
-      NX1_LOGI_STATS("nx1_d3d9: PROF/tex lookup={:.2f} upload={:.2f} ms/frame over {:.1f} rebuilds/frame "
+      REXGPU_INFO("nx1_d3d9: PROF/tex lookup={:.2f} upload={:.2f} ms/frame over {:.1f} rebuilds/frame "
                   "| stage={:.2f} decode={:.2f} mipgen={:.2f} commit={:.2f} ms | {:.0f} us/rebuild",
                   tp.lookup_ns * tf, tp.upload_ns * tf, double(tp.uploads) / prof_frames,
                   tp.stage_ns * tf, tp.decode_ns * tf, tp.mipgen_ns * tf, tp.commit_ns * tf,
                   tp.uploads ? double(tp.upload_ns) / (1e3 * tp.uploads) : 0.0);
       // Why the rebuilds happen, and at what memory cost -- the two numbers that decide whether
       // the fix is the commit policy, the eviction policy, or the streaming pool.
-      NX1_LOGI_STATS("nx1_d3d9: PROF/tex why: new={:.1f} layout={:.1f} dirty={:.1f} zero={:.1f} per "
+      REXGPU_INFO("nx1_d3d9: PROF/tex why: new={:.1f} layout={:.1f} dirty={:.1f} zero={:.1f} per "
                   "frame | {:.2f} MB/frame decoded ({:.1f} GB/s effective)",
                   double(tp.why_new) / prof_frames, double(tp.why_layout) / prof_frames,
                   double(tp.why_dirty) / prof_frames, double(tp.why_zero) / prof_frames,
@@ -3626,7 +3626,7 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
         track_n && dump_ps && d.ps_object == dump_ps && sampler == track_n - 1 && t.base_address &&
         REXCVAR_GET(nx1_d3d9_dbg_track_addr) != t.base_address) {
       REXCVAR_SET(nx1_d3d9_dbg_track_addr, t.base_address);
-      NX1_LOGI_TEX("nx1_d3d9: TRACKFOLLOW ps={:08X} sampler={} -> {:08X} ({}x{} fmt={})",
+      REXGPU_INFO("nx1_d3d9: TRACKFOLLOW ps={:08X} sampler={} -> {:08X} ({}x{} fmt={})",
                   dump_ps, sampler, t.base_address, t.width, t.height, t.format);
     }
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, t, sampler);
