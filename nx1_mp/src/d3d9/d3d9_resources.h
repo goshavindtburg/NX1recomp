@@ -84,6 +84,7 @@ enum class DirtySource : uint8_t {
   kProbe,         ///< nx1_d3d9_content_probe polled live memory and saw different content
   kMipReloc,      ///< the guest moved this texture's mip tail
   kRecheck,       ///< nx1_d3d9_redecode_delay scheduled re-examination
+  kResolve,       ///< OUR resolve writeback wrote this guest memory (host-side, unfaulting)
   kPartial,       ///< decoded from a holey/empty source, retrying
   kDebug,         ///< forced by a dump or a debug cvar
   kCount

@@ -3673,8 +3673,8 @@ void ResourceTracker::LogCacheStats() {
               REXCVAR_GET(nx1_d3d9_gpu_write_watch_max_mb), gpu_write_dropped_);
   {
     // Unconditional, including zeros, with both columns: rebuilds and how many changed content.
-    static const char* kSrc[] = {"cpu_write", "gpu_write", "dma", "probe",
-                                 "mip_reloc", "recheck",   "partial", "debug"};
+    static const char* kSrc[] = {"cpu_write", "gpu_write", "dma",     "probe",
+                                 "mip_reloc", "recheck",   "resolve", "partial", "debug"};
     std::string line;
     for (size_t i = 0; i < size_t(DirtySource::kCount); ++i) {
       line += fmt::format("{}={}/{} ", kSrc[i], changed_by_source_[i], dirty_by_source_[i]);
@@ -4532,7 +4532,7 @@ void ResourceTracker::DrainMemoryWrites() {
     }
     g_drain_matched = matched;  // consumed by the match test below
     if ((reports.fetch_add(1, std::memory_order_relaxed) % 600) == 1) {
-      static const char* kSrc[] = {"cpu", "gpu", "dma", "probe", "mip", "recheck", "partial", "dbg"};
+      static const char* kSrc[] = {"cpu", "gpu", "dma", "probe", "mip", "recheck", "resolve", "partial", "dbg"};
       std::string line;
       for (size_t i = 0; i < size_t(DirtySource::kCount); ++i) {
         line += fmt::format("{}={}/{} ", kSrc[i],
@@ -8529,6 +8529,12 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
 /// (plus real rasterization) made the scene nearly clean until its readback path hit memory
 /// pressure. This writeback makes the D3D9 renderer self-sufficient instead -- no reference
 /// raster, no readback cvars.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_resolve_invalidates, false, "GPU",
+                    "Report the resolve writeback's host-side guest-memory write to the texture "
+                    "cache. Correct, but measured WORSE on screen: it forces a re-decode that "
+                    "reads resolve output through the sampling texture's format, not the "
+                    "resolve's. Off until that mismatch is handled");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_resolve_writeback, true, "GPU",
                     "Write resolve results back into guest memory so CPU-side texture bakes "
                     "read real pixels. The fix for baked-texture speckle (imposters, decals)");
@@ -8827,6 +8833,43 @@ void ResourceTracker::ResolveWriteback(IDirect3DTexture9* tex, uint32_t width, u
   writeback_bytes_ += guest_bytes;
   const double us =
       double((std::chrono::steady_clock::now() - t0).count()) / 1000.0;
+  // TELL THE TEXTURE CACHE WE JUST WROTE THIS MEMORY.
+  //
+  // This function writes resolved render-target data into guest RAM through TranslatePhysical --
+  // a HOST-side write. Host page protection only traps GUEST stores, so it does not fault, and
+  // until now nothing was notified: not our texture cache, not the mirror. A texture sampling
+  // this memory (render-to-texture, which is exactly what a resolve destination is for) kept
+  // serving its previous decode.
+  //
+  // What covered for it was nx1_d3d9_content_probe, which POLLS live memory and rebuilds when the
+  // content differs -- and REBUILDSRC measured the probe responsible for 1308 of 1405
+  // content-changing rebuilds, 93% of every time we adopt new bytes, against 10 from real guest
+  // writes. So the probe has largely been cleaning up after THIS. That also explains why enabling
+  // it was the largest single improvement of the investigation.
+  //
+  // Polling is a poor substitute for a notification we can simply make: ProbeTiledContent is
+  // SAMPLED (nx1_d3d9_probe_samples, 512 by default), so it can miss the change entirely and leave
+  // a resolved-into texture stale indefinitely. Reporting the write explicitly is precise, cannot
+  // miss, and is what the reference does for the same event (RangeWrittenByGpu on its resolve
+  // path). kResolve so REBUILDSRC shows how much of the probe's work this takes over.
+  // MEASURED WORSE ON SCREEN, SO DEFAULT OFF -- but kept, because the hole it closes is real.
+  //
+  // Reporting the write is correct: this function writes guest memory host-side and nothing was
+  // told. But forcing the re-decode it implies makes the picture worse (user, 2026-07-22), and the
+  // likely reason is that the two events are not the same thing. We write format 6 (8_8_8_8) pixels
+  // here; a texture bound at this address with a DIFFERENT descriptor -- DXT1, say -- then decodes
+  // resolve output through the wrong format and produces noise. Previously the SAMPLED content
+  // probe often missed the change, so that texture kept its older and correct decode.
+  //
+  // So the invalidation is honest and the decode it triggers is wrong for an unrelated reason.
+  // Turning it on is the right thing once a re-decode after a resolve uses the resolve's own
+  // format rather than the fetch constant's; until then it trades a stale texture for a garbled
+  // one. Also note this is a narrow path: format 6 only, dimension 1, and budgeted to
+  // nx1_d3d9_writeback_max per destination -- it cannot account for the probe's 1308 content
+  // changes, and an earlier claim in this file that it could was wrong.
+  if (REXCVAR_GET(nx1_d3d9_resolve_invalidates)) {
+    InvalidateGuestRange(phys, uint32_t(guest_bytes), DirtySource::kResolve);
+  }
   NX1_LOGI_MISC("nx1_d3d9: WRITEBACK {:08X} {}x{} tiled={} endian={} {} KiB in {:.0f} us "
               "(#{} total)",
               dest.base_address, width, height, dest.tiled ? 1 : 0, dest.endian,
