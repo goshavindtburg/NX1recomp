@@ -72,6 +72,16 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_lod, 0, "GPU",
 /// show clean colour bands, the plumbing (level count, strides, UpdateTexture) is sound and
 /// the fault is in BoxFilterHalf/EncodeBcImage; if they still show noise, the plumbing is
 /// wrong and the filtered pixels were never the problem.
+/// Verify that decoded level 0 actually lands in the staging surface UpdateTexture reads.
+///
+/// Diagnostic only, and NOT cheap: it copies the level twice and compares. Run it for one session,
+/// read the STAGECHECK line, turn it off. See the site for why the double read is the control
+/// rather than an accident.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_stagecheck, false, "GPU",
+                    "Read decoded level 0 back out of the staging surface twice and compare "
+                    "against what we decoded: separates an unstable readback from a write that "
+                    "never landed");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipfill, 0, "GPU",
                       "Debug mip chain: 1=flat colour per level (tests plumbing), "
                       "2=synthetic gradient as the level-0 source (tests filter+encoder "
@@ -777,6 +787,36 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_guest_mips, false, "GPU",
 
 // Defined in d3d9_renderer.cpp beside the sampler-state translation that honours it.
 REXCVAR_DECLARE(bool, nx1_d3d9_basemap);
+
+// Reference-side upload capture, defined in the SDK (d3d12/shared_memory.cpp). Declared here so a
+// texture dump can AIM it at the very texture being dumped -- see the mip dump site.
+REXCVAR_DECLARE(uint32_t, nx1_refupload_addr);
+REXCVAR_DECLARE(uint32_t, nx1_refupload_bytes);
+
+/// Point the reference-side upload capture at whatever texture we just dumped.
+///
+/// Without this, pairing the two halves is a chicken-and-egg problem: the reference watch is aimed
+/// by ADDRESS, but pool addresses are reassigned every launch, so an address read out of one run's
+/// log captures unrelated memory in the next. A whole capture was wasted on that -- and on my own
+/// note claiming the picker's TRACK ALL button already did this, which it never did (the string
+/// `refupload` did not appear anywhere in nx1_mp/src before this).
+///
+/// Aiming from inside the dump makes the two halves refer to the same texture BY CONSTRUCTION,
+/// in the same run, with no address copied by hand.
+/// Auto-capture a decode that looks corrupt, because the artifact is now a ONE-FRAME flicker that
+/// cannot be dumped by hand. Percentage of corrupt-looking 4x4 blocks at or above which to dump;
+/// 0 = off. Clean world textures score 2-5%, a confirmed-bad specimen scored 45.7%, so ~25 is a
+/// reasonable first threshold. See the trigger site for why a content score is safe HERE
+/// specifically when this file records it being unsafe elsewhere.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_autodump_corrupt, 0, "GPU",
+                      "Dump any level-0 decode scoring at least this % corrupt blocks (0 = off). "
+                      "Catches a one-frame flicker that cannot be captured by hand");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_autodump_max, 12, "GPU",
+                      "Stop after this many auto-dumps, so one bad frame cannot fill the disk");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_dump_aims_refupload, true, "GPU",
+                    "When a texture dump fires, point nx1_refupload_addr/bytes at that same "
+                    "texture so the reference's uploaded bytes can be paired with our decode");
 
 REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
                     "Give textures a mip chain, filtered down from level 0 by the driver. Off "
@@ -5911,6 +5951,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // game. Measured: with mips disabled entirely the scene is CLEAN, so level 0 is fine and the
   // corruption is produced by the chain -- which is what this fixes.
   uint8_t* argb_stage = nullptr;
+  /// Bytes written into `dst` from a normal-RAM buffer, for the staging readback check below.
+  /// Zero for the plain path, which detiles straight into `dst` and so has nothing to compare to.
+  size_t staged_bytes = 0;
   const size_t argb_bytes = size_t(locked.Pitch) * height;
   if (dst) {
     if (host.decode == TexDecode::kColorSwizzle) {
@@ -5933,6 +5976,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       swizzle_all_zero = sa == 0;
       std::memcpy(dst, argb_stage, argb_bytes);
       mip_source = argb_stage;
+      staged_bytes = argb_bytes;
     } else if (host.decode == TexDecode::kDXN) {
       // CPU-decode DXN normal maps with the hardware RGGG swizzle (see PickHostTextureFormat).
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
@@ -5942,6 +5986,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                       extent.block_height, t.width, height);
       std::memcpy(dst, argb_stage, argb_bytes);
       mip_source = argb_stage;
+      staged_bytes = argb_bytes;
     } else if (host.decode != TexDecode::kNone) {
       // CPU-decode single-channel BC-alpha: detile the compressed 8-byte blocks
       // into a linear scratch buffer, then expand each block to A8R8G8B8 (v,v,v,v).
@@ -5953,6 +5998,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                           host.decode == TexDecode::kDXT5A, t.swizzle);
       std::memcpy(dst, argb_stage, argb_bytes);
       mip_source = argb_stage;
+      staged_bytes = argb_bytes;
     } else if (build_mips) {
       // Detile into ordinary RAM and copy up, rather than writing straight into the mapped
       // surface. The mip chain below has to READ level 0 back, and `dst` is D3D9 staging
@@ -5972,6 +6018,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       }
       std::memcpy(dst, staged, level0_bytes);
       mip_source = staged;
+      staged_bytes = level0_bytes;
     } else {
       DetileMip2D(dst, dst_row_bytes, src, extent, bpb, t.endian, t.tiled, packed_ox, packed_oy, src_limit);
       const Swizzle32 swz = MakeSwizzle32(t.swizzle);
@@ -5980,6 +6027,56 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           SwizzleRow32(dst + size_t(by) * dst_row_bytes, extent.block_width, swz);
         }
       }
+    }
+  }
+
+  // DOES LEVEL 0 ACTUALLY LAND IN THE STAGING SURFACE?
+  //
+  // The one segment never verified IN THE LINE OF FIRE. The decode has been checked twice against
+  // independent implementations -- but always against DUMP files, which are written from the
+  // Rgba8/scratch buffers, not from the memory UpdateTexture reads. The synthetic-texture test
+  // proved upload/sampler/level-selection sound, but it bypasses the decode entirely. So nothing
+  // has ever confirmed that the bytes we decoded are the bytes sitting in level 0 when the upload
+  // happens.
+  //
+  // It was assumed unverifiable: `dst` is mapped staging, believed write-combined and unreliable
+  // to read back. That assumption looks wrong -- the ENC round-trip already reads back mip levels
+  // of this same SYSTEMMEM texture and gets coherent images.
+  //
+  // THE CONTROL IS BUILT IN, because "readback differs from source" has two causes and the whole
+  // point is to separate them. Read `dst` TWICE into separate buffers:
+  //   A != B          -> the readback itself is unstable (write-combining is real). Says nothing
+  //                      about what the GPU receives, and the check must be discarded.
+  //   A == B, A != src-> the readback is stable and the bytes genuinely differ from what we
+  //                      decoded. That is a write that did not land, in the line of fire.
+  //   A == B == src   -> level 0 is exactly what we decoded. Segment closed for good.
+  if (REXCVAR_GET(nx1_d3d9_dbg_stagecheck) && dst && staged_bytes && mip_source != dst) {
+    static std::mutex m;
+    static uint64_t checks = 0, unstable = 0, differing = 0, diff_bytes = 0;
+    std::vector<uint8_t> a(staged_bytes), b(staged_bytes);
+    std::memcpy(a.data(), dst, staged_bytes);
+    std::memcpy(b.data(), dst, staged_bytes);
+    const bool stable = std::memcmp(a.data(), b.data(), staged_bytes) == 0;
+    const bool same = std::memcmp(a.data(), mip_source, staged_bytes) == 0;
+    size_t nbad = 0;
+    if (stable && !same) {
+      for (size_t i = 0; i < staged_bytes; ++i) {
+        if (a[i] != mip_source[i]) ++nbad;
+      }
+    }
+    std::lock_guard<std::mutex> lk(m);
+    ++checks;
+    if (!stable) ++unstable;
+    if (stable && !same) {
+      ++differing;
+      diff_bytes += nbad;
+    }
+    if ((checks % 2000) == 1) {
+      REXGPU_WARN("nx1_d3d9: STAGECHECK {} level-0 uploads verified | readback UNSTABLE={} (a "
+                  "nonzero here voids the rest -- write-combined memory) | stable-but-DIFFERENT "
+                  "from the decode={} ({} bytes total). All zeros = level 0 reaches the GPU "
+                  "exactly as decoded",
+                  checks, unstable, differing, diff_bytes);
     }
   }
 
@@ -6544,6 +6641,66 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   if (build_mips && dst) {
     std::vector<Rgba8> cur, next;
     DecodeBcImage(host.d3d, mip_source, dst_row_bytes, t.width, height, cur);
+    // CATCH THE ONE-FRAME FLICKER. The artifact is now a bad texture appearing for a single frame
+    // at random, which cannot be captured by hand -- by the time the picker is aimed it is gone.
+    //
+    // WHY A CONTENT SCORE IS ACCEPTABLE HERE, given this file records being burned by content
+    // classifiers three times: those classifiers DECIDED things (hide this texture, keep the older
+    // decode, flag a page foreign) and a false positive silently corrupted the result. This one
+    // only decides WHETHER TO WRITE A DUMP. A false positive costs a few files; it cannot change
+    // what is rendered and cannot bias a conclusion, because the conclusion is drawn from the
+    // dumped image afterwards. Trigger, not verdict.
+    //
+    // Metric matches tools/texture_analysis/indep.py's score(): fraction of 4x4 blocks that are
+    // black (mean < 8) or noise (std > 40), so an auto-dump and an offline score are comparable.
+    if (const uint32_t thr = REXCVAR_GET(nx1_d3d9_dbg_autodump_corrupt);
+        thr && !cur.empty() && t.width >= 4 && height >= 4) {
+      uint32_t bad = 0, total = 0;
+      for (uint32_t by = 0; by + 4 <= height; by += 4) {
+        for (uint32_t bx = 0; bx + 4 <= t.width; bx += 4) {
+          float sum = 0.0f, sum2 = 0.0f;
+          for (uint32_t y = 0; y < 4; ++y) {
+            for (uint32_t x = 0; x < 4; ++x) {
+              const Rgba8& p = cur[size_t(by + y) * t.width + (bx + x)];
+              const float v = (float(p.r) + float(p.g) + float(p.b)) / 3.0f;
+              sum += v;
+              sum2 += v * v;
+            }
+          }
+          const float mean = sum / 16.0f;
+          const float var = std::max(0.0f, sum2 / 16.0f - mean * mean);
+          if (mean < 8.0f || std::sqrt(var) > 40.0f) ++bad;
+          ++total;
+        }
+      }
+      const uint32_t pct = total ? uint32_t(100ull * bad / total) : 0;
+      static std::atomic<uint32_t> auto_dumps{0};
+      if (pct >= thr && auto_dumps.load(std::memory_order_relaxed) <
+                            REXCVAR_GET(nx1_d3d9_dbg_autodump_max)) {
+        const uint32_t n = auto_dumps.fetch_add(1, std::memory_order_relaxed) + 1;
+        char p[256];
+        std::snprintf(p, sizeof(p), "texdump/auto%02u_%08X_f%llu_L0.bmp", n, t.base_address,
+                      static_cast<unsigned long long>(frame_));
+        DumpRgbaBmp(p, cur, t.width, height);
+        std::snprintf(p, sizeof(p), "texdump/auto%02u_%08X_%ux%u_f%u.bin", n, t.base_address,
+                      t.width, height, t.format);
+        if (FILE* f = std::fopen(p, "wb")) {
+          std::fwrite(src, 1, guest_bytes, f);
+          std::fclose(f);
+        }
+        // Aim the reference capture at it too, so the pair is available for this specimen.
+        if (sampler == 0 && REXCVAR_GET(nx1_d3d9_dbg_dump_aims_refupload)) {
+          REXCVAR_SET(nx1_refupload_addr, PhysicalAddress(t.base_address));
+          REXCVAR_SET(nx1_refupload_bytes, guest_bytes);
+        }
+        REXGPU_WARN("nx1_d3d9: AUTODUMP #{} {:08X} s{} {}x{} fmt={} frame={} scored {}% corrupt "
+                    "blocks (threshold {}) | src {} of {} pages empty -> texdump/auto{:02}_* . "
+                    "This is a decode that reached the screen; the score is only the trigger, "
+                    "judge it from the image",
+                    n, t.base_address, sampler, t.width, height, t.format, frame_, pct, thr,
+                    partial_pages, src_pages_total, n);
+      }
+    }
     // Spend the budget on the MATERIAL being investigated, not on whichever textures happen to
     // rebuild first -- four clean chains once "proved" the mip builder sound while the
     // speckling surfaces went unexamined. Use the picker's DUMP MIPS button, which filters to
@@ -6575,6 +6732,20 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // misread layout field looks like -- and tiled/pitch/endian/dimension have never once
       // been logged for a corrupt texture. pitch especially: it is a 9-bit field scaled by 32,
       // so a texture whose pitch exceeds its width has rows we are reading at the wrong stride.
+      // AIM THE REFERENCE-SIDE CAPTURE AT THIS SAME TEXTURE, so the two halves cannot drift apart.
+      // Slot 0 only: the dump fires for every slot a material binds, and letting a high slot
+      // re-aim it would move the watch off the colormap -- which is the surface that is actually
+      // on screen -- between one dump and the next.
+      if (sampler == 0 && REXCVAR_GET(nx1_d3d9_dbg_dump_aims_refupload)) {
+        const uint32_t phys = PhysicalAddress(t.base_address);
+        REXCVAR_SET(nx1_refupload_addr, phys);
+        REXCVAR_SET(nx1_refupload_bytes, guest_bytes);
+        REXGPU_WARN("nx1_d3d9: REFAIM reference upload capture -> {:08X}+{} bytes (the texture "
+                    "this dump just wrote). Pair texdump/refup_* with mip_{:08X}_f{}_L0.bmp; a "
+                    "capture with ZERO refup files for this range means the reference never "
+                    "re-uploaded it, which is itself the retention answer",
+                    phys, guest_bytes, t.base_address, frame_);
+      }
       REXGPU_INFO("nx1_d3d9: mip dump s{} {}x{} fmt {} levels={} mip_filter={} aniso={} "
                   "src_empty_pages={}/{} mip_address={:08X} | tiled={} pitch={} dim={} "
                   "endian={} swizzle={:#05x} sign={},{},{},{} blocks={}x{} pitchblocks={}x{} "
