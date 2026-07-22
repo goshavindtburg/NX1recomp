@@ -749,6 +749,11 @@ class ResourceTracker {
     uint64_t first_frame = 0;
     uint32_t decodes = 0;
     uint32_t changes = 0;
+    /// The hash BEFORE the current one, so an X -> Y -> X return can be recognised. That return is
+    /// the one-frame flicker the artifact has been reduced to, and it is a mechanism signal: a
+    /// decode reverting to its own previous value cannot be explained by the texture merely being
+    /// detailed, which is what defeated every content-based corruption score.
+    uint64_t prev_hash = 0;
   };
   std::unordered_map<uint64_t, DecodeStamp> decode_hashes_;
 

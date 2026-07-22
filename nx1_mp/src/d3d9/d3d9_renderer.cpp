@@ -233,6 +233,15 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_surface_lo, 0, "GPU",
 ///
 /// surface_key is (index buffer, start, count, base vertex): stable per surface ACROSS LOD swaps,
 /// which is precisely what is needed to see a surface change its texture.
+/// Detect the one-frame flicker at the BINDING level: a surface whose bound texture address
+/// goes X -> Y -> X. The decode-level equivalent came back a clean ARMED negative (932
+/// DECODECHANGE events, zero reverting), so if the artifact is a momentary wrong texture it
+/// has to be the binding, not the decode. Requiring a return to the PREVIOUS address is what
+/// separates a one-frame excursion from ordinary LOD progression through a sequence.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_flicker_bind, false, "GPU",
+                    "Log when a surface binds a different texture and then returns to the "
+                    "previous one -- the one-frame flicker at the binding layer");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_texswap, false, "GPU",
                     "Log when a surface changes the texture address bound to a sampler, with the "
                     "frame gap since its last change");
@@ -2990,6 +2999,66 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // Decoded once here and handed to GetTexture: the sampler state below needs the same
     // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
     const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(sampler));
+    // THE FLICKER, AT THE BINDING LEVEL.
+    //
+    // The decode-level detector is armed and reports a clean negative: 932 DECODECHANGE events,
+    // ZERO of them reverting to the previous hash. So the artifact is not one texture decoded
+    // wrong and then right -- decodes change and stay changed. That leaves the level above: a
+    // surface binding a DIFFERENT texture for one frame and then going back.
+    //
+    // Same X -> Y -> X mechanism test, on the bound ADDRESS. Keyed on (surface, material, sampler)
+    // because surface_key alone collides -- it is (index buffer, start, count, base vertex), which
+    // two instances of one prop share, and a census keyed that way once manufactured 25,818 fake
+    // swaps. Only a return to the PREVIOUS address counts, so ordinary LOD progression (a walk
+    // through A, B, C) never fires; a one-frame excursion does.
+    if (REXCVAR_GET(nx1_d3d9_dbg_flicker_bind) && t.valid && t.base_address && d.surface_key) {
+      struct BindHist {
+        uint64_t key = 0;
+        uint32_t addr = 0, prev_addr = 0;
+        uint64_t frame = 0;
+      };
+      static std::mutex bm;
+      static std::vector<BindHist> hist;
+      static std::atomic<uint64_t> reverts{0}, evaluated{0};
+      uint64_t key = d.surface_key * 0x100000001B3ull ^ d.ps_object;
+      key = key * 0x100000001B3ull ^ sampler;
+      std::lock_guard<std::mutex> lk(bm);
+      evaluated.fetch_add(1, std::memory_order_relaxed);
+      BindHist* hb = nullptr;
+      for (auto& e : hist) {
+        if (e.key == key) { hb = &e; break; }
+      }
+      if (!hb && hist.size() < 8192) {
+        hist.push_back(BindHist{key, t.base_address, 0, frames_presented_});
+        hb = &hist.back();
+      }
+      if (hb && hb->addr != t.base_address && hb->frame != frames_presented_) {
+        const bool revert = hb->prev_addr == t.base_address;
+        if (revert) {
+          const uint64_t n = reverts.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (n <= 24) {
+            REXGPU_WARN("nx1_d3d9: BINDFLICK #{} surface={:016X} ps={:08X} s{} bound {:08X}, then "
+                        "{:08X} for {} frame(s), then RETURNED to {:08X} ({}x{} fmt={}). A return "
+                        "to the previous address is a one-frame excursion, not LOD progression",
+                        n, d.surface_key, d.ps_object, sampler, t.base_address, hb->addr,
+                        frames_presented_ - hb->frame, t.base_address, t.width, t.height,
+                        t.format);
+          }
+        }
+        hb->prev_addr = hb->addr;
+        hb->addr = t.base_address;
+        hb->frame = frames_presented_;
+      }
+      // ARMING, unconditional including zero: a silent zero here would be indistinguishable from
+      // "the binding never flickers", which is the whole result.
+      if ((evaluated.load(std::memory_order_relaxed) % 2000000) == 1) {
+        REXGPU_WARN("nx1_d3d9: BINDFLICK evaluated {} binds across {} tracked (surface,ps,sampler) "
+                    "keys, {} address REVERSIONS. Zero reversions with a large evaluated count is a "
+                    "real negative: surfaces do not momentarily bind a different texture",
+                    evaluated.load(std::memory_order_relaxed), hist.size(),
+                    reverts.load(std::memory_order_relaxed));
+      }
+    }
     // DOES THIS SURFACE KEEP SWAPPING ITS TEXTURE? See nx1_d3d9_dbg_texswap.
     if (REXCVAR_GET(nx1_d3d9_dbg_texswap) && t.valid && t.base_address && d.surface_key) {
       // KEY MUST INCLUDE THE MATERIAL, AND SWAPS MUST BE COUNTED ACROSS FRAMES.

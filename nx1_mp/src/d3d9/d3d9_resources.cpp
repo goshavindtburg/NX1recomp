@@ -808,6 +808,19 @@ REXCVAR_DECLARE(uint32_t, nx1_refupload_bytes);
 /// 0 = off. Clean world textures score 2-5%, a confirmed-bad specimen scored 45.7%, so ~25 is a
 /// reasonable first threshold. See the trigger site for why a content score is safe HERE
 /// specifically when this file records it being unsafe elsewhere.
+/// Capture the ONE-FRAME FLICKER by mechanism instead of by content score.
+///
+/// A decode hash going X -> Y -> X is a surface that was momentarily wrong and fixed itself. No
+/// content classifier can identify that: black-heavy UI and high-frequency detail art both trip a
+/// corruption threshold (a clean wood-grain wall scored 58% "noise"), so such a threshold samples
+/// high-variance textures rather than broken ones. A hash reverting to its own previous value
+/// cannot be produced by the texture merely being detailed.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_dump_flicker, false, "GPU",
+                    "Dump the source bytes when a texture's decode returns to its previous hash "
+                    "after one differing decode -- the one-frame flicker, caught by mechanism");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_flicker_max, 24, "GPU",
+                      "Stop after this many flicker captures");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_autodump_corrupt, 0, "GPU",
                       "Dump any level-0 decode scoring at least this % corrupt blocks (0 = off). "
                       "Catches a one-frame flicker that cannot be captured by hand");
@@ -6243,6 +6256,39 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                   "{:016X} | page writes {} -> {}",
                   t.base_address, t.width, height, t.format, prev.frame, frame_, prev.hash, h,
                   prev.writes, wsum);
+      // FLICKER DETECTOR. The artifact is now a surface showing the right texture, ONE bad frame,
+      // then the right texture again -- i.e. a decode hash going X -> Y -> X. That is a MECHANISM
+      // signal, not a content judgement, and it is the thing to capture.
+      //
+      // Content scoring failed at this: black-heavy UI and high-frequency detail art (wood grain
+      // scored 58% "noise" while being perfectly clean) both trip it, so a corruption threshold
+      // samples high-variance textures rather than broken ones. A hash reverting to its own
+      // previous value cannot be explained by the texture merely being detailed.
+      //
+      // Dump the MIDDLE state Y: it is the frame that reached the screen wrong. `prev2` is the
+      // hash before `prev`, so `h == prev2` with `prev.hash != h` is exactly the X -> Y -> X
+      // return, and `prev` was the bad one. We dump on the RETURN, when the pattern is confirmed,
+      // and record the offending hash so the earlier dump of Y can be matched up in the log.
+      if (REXCVAR_GET(nx1_d3d9_dbg_dump_flicker) && prev.prev_hash && prev.prev_hash == h) {
+        static std::atomic<uint32_t> flicks{0};
+        const uint32_t n = flicks.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= REXCVAR_GET(nx1_d3d9_dbg_dump_flicker_max)) {
+          char fp[256];
+          std::snprintf(fp, sizeof(fp), "texdump/flick%02u_%08X_%ux%u_f%u.bin", n, t.base_address,
+                        t.width, height, t.format);
+          if (FILE* f = std::fopen(fp, "wb")) {
+            std::fwrite(src, 1, guest_bytes, f);
+            std::fclose(f);
+          }
+          REXGPU_WARN("nx1_d3d9: FLICKER #{} {:08X} {}x{} fmt={} RETURNED to hash {:016X} after one "
+                      "frame at {:016X} (frames {} -> {}) | src {} of {} pages empty. The bad state "
+                      "was {:016X}; this is a surface that was momentarily wrong and fixed itself, "
+                      "which no content classifier can identify",
+                      n, t.base_address, t.width, height, t.format, h, prev.hash, prev.frame,
+                      frame_, partial_pages, src_pages_total, prev.hash);
+        }
+      }
+      prev.prev_hash = prev.hash;
     }
     // Live convergence detector: how many DISTINCT addresses have produced this exact content?
     if (const uint32_t conv_n = REXCVAR_GET(nx1_d3d9_dbg_convergence_n); conv_n > 1) {
