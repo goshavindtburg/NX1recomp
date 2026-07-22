@@ -602,6 +602,35 @@ void LogCmdBufTraffic() {
 }
 }  // namespace
 
+//=============================================================================
+// The descriptor commit point
+//=============================================================================
+//
+// D3D::SetPending_FetchConstants (guest 0x820D88E0) is where texture descriptors actually reach
+// the GPU: per run of dirty slots it emits a SET_CONSTANT header for GPUREG_FETCHCONSTANTS
+// (0x4800) and copies 24 bytes verbatim out of pDevice + 0x480 + 24n. Nothing else in the draw
+// path emits them -- the only other emitter, PM4SetTextureFetchConstant_D3D, is video-codec only.
+//
+// It commits ONLY the slots flagged in m_Pending.m_Mask[3], and D3DDevice_Draw* zeroes that mask
+// straight afterwards. Slots the guest wrote WITHOUT flagging never reach the GPU, so the device
+// shadow we read at draw time can be fresher than what is actually bound. Mirroring here is what
+// makes our view match the hardware's -- and the reference's, which reads the same registers.
+//
+// r3 = CDevice*, r4 = the dirty bits LEFT-JUSTIFIED (slot n at bit 63-n; the guest recovers the
+// index with cntlzd). Captured BEFORE __imp__ because the recompiled body clobbers r3-r12, and
+// mirrored before it runs so we copy the bytes it is about to send rather than whatever follows.
+REX_EXTERN(__imp__rex_SetPending_FetchConstants_D3D_YAXPAVCDevice_1_K_Z);
+REX_HOOK_RAW(rex_SetPending_FetchConstants_D3D_YAXPAVCDevice_1_K_Z) {
+#ifdef _WIN32
+  const uint32_t device = ctx.r3.u32;
+  const uint64_t dirty = ctx.r4.u64;
+  if (EnsureRenderer()) {
+    nx1::d3d9::Renderer::Get().NoteFetchConstantsCommitted(base, device, dirty);
+  }
+#endif
+  __imp__rex_SetPending_FetchConstants_D3D_YAXPAVCDevice_1_K_Z(ctx, base);
+}
+
 REX_HOOK_RAW(rex_D3DDevice_RunCommandBuffer) {
   g_cb_run.fetch_add(1, std::memory_order_relaxed);
   LogCmdBufTraffic();

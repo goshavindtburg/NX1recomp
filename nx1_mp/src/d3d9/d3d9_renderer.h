@@ -369,6 +369,37 @@ class Renderer {
 
   /// Sampler slots the currently bound shaders actually declare, latched by
   /// BindShadersAndConstants for BindTextures. 0xFFFF = "unknown, bind everything".
+  /// MIRROR OF THE FETCH CONSTANTS THE GUEST HAS ACTUALLY COMMITTED TO THE GPU.
+  ///
+  /// The device shadow at `device + kFetchConstants` is NOT what the GPU has. The guest's PM4
+  /// emitter `D3D::SetPending_FetchConstants` (guest 0x820D88E0) copies a slot's 24 bytes into the
+  /// ring ONLY when that slot's bit is set in `m_Pending.m_Mask[3]`, and the draw zeroes the mask
+  /// afterwards. Two paths change the shadow without setting the bit:
+  ///   - SetTexture marks dirty from a CALLER-SUPPLIED mask argument, not from `Sampler`; only the
+  ///     _Inline wrapper guarantees the two agree, and there are seven such variants.
+  ///   - SetTexture(N, NULL) sets no bit at all -- it just clears the Type field in the shadow.
+  /// In both cases the GPU keeps the value an earlier draw committed while a shadow read returns
+  /// the fresher one. WE ARE TOO FRESH; the GPU's older value is the correct one, which is exactly
+  /// why the reference (which builds descriptors from the PM4 register file) renders these
+  /// correctly. Measured at ~0.15% of bindings, on slots shaders provably sample.
+  ///
+  /// So mirror what the emitter commits and read descriptors from here instead. Guest-thread only
+  /// -- both the commit hook and CaptureDrawState run there, so no lock.
+ public:
+  void NoteFetchConstantsCommitted(const uint8_t* base, uint32_t guest_device, uint64_t dirty_mask);
+
+ private:
+  /// Which device the mirror belongs to; a different one resets it rather than blending two.
+  uint32_t fc_mirror_device_ = 0;
+  /// Bit per texture slot that has been committed at least once. Slots never committed fall back
+  /// to the live shadow -- without that, the first bind of every slot would have no mirror entry
+  /// and would reintroduce the very bug this fixes.
+  uint32_t fc_mirror_valid_ = 0;
+  /// Raw big-endian bytes, exactly as the shadow holds them, so DecodeTextureFetchConstant applies
+  /// unchanged. 16 pixel-sampler slots (D3D tracks 26 total; 16..25 are vertex samplers).
+  uint8_t fc_mirror_[16 * guest_device::kFetchConstantStride] = {};
+
+ public:
   uint32_t active_sampler_mask_ = 0xFFFFu;
   /// True when active_sampler_mask_ is the "could not walk the shader, assume all 16" fallback
   /// rather than the slots the shader actually declares. See the latch in BindTextures' caller.

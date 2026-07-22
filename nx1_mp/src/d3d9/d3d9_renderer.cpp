@@ -261,6 +261,24 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_fetchcmp, false, "GPU",
 ///
 /// Answers one question: do we ever bind a texture address the GPU's register file never held?
 /// Non-zero = we bind textures the guest never asked for (the stale-descriptor hypothesis).
+/// Read texture descriptors from what the guest COMMITTED to the GPU, not from its device shadow.
+///
+/// DEFAULT OFF, because it was MEASURED to change essentially nothing. The mechanism is real in the
+/// guest code -- the PM4 emitter is gated on a dirty mask that SetTexture does not always set (see
+/// Renderer::NoteFetchConstantsCommitted) -- but it practically never fires: `FCMIRROR` counted
+/// **2012 differences in 140,800,016 slot serves**, all during warm-up, then zero. Against that it
+/// is not worth 16 memcmp+memcpy per draw on the guest thread, which PROF/bound shows is the longer
+/// pole.
+///
+/// Kept, not deleted, for two reasons: it is correct-by-construction if a build ever does exercise
+/// the ungated paths, and the commit hook it depends on is what PROVED the binding layer correct
+/// (see nx1_d3d9_dbg_fetchset's FETCHSET-COMMIT line: 5810 of 5810 layouts we bind were observed
+/// being committed).
+REXCVAR_DEFINE_BOOL(nx1_d3d9_committed_fetch, false, "GPU",
+                    "Bind textures from the fetch constants the guest actually committed to the "
+                    "GPU rather than its device shadow. Measured as a no-op after warm-up; kept "
+                    "for correctness-by-construction and because its hook proves the binding");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_fetchset, false, "GPU",
                     "Accumulate the SET of texture addresses we bind and the set the PM4 register "
                     "file holds, and report ours-not-in-theirs. Unlike dbg_fetchcmp this needs no "
@@ -274,6 +292,19 @@ std::mutex g_fetchset_m;
 std::unordered_set<uint32_t> g_fetchset_ref_seen;  ///< every address the register file has held
 std::unordered_set<uint64_t> g_fetchset_ref_layouts;  ///< every full LAYOUT it has held
 uint64_t g_fetchset_draws = 0;
+
+/// GROUND TRUTH WITHOUT SAMPLING. The two sets above are built by reading Xenia's register file at
+/// OUR draw times -- a SUBSAMPLE of its history, because its command-processor thread runs
+/// decoupled from ours. An incomplete ground-truth set MANUFACTURES orphans: a descriptor that was
+/// genuinely committed, but only sat in the registers between two of our samples, reads as "never
+/// GPU state". I claimed the union-over-slots form made the test conservative; that was true of the
+/// slot choice and NOT of the sampling, and the FETCHSET orphan counts have to be re-read in that
+/// light.
+///
+/// These sets have no such hole: they are filled from the guest's own PM4 emitter hook, which sees
+/// EVERY commit. Comparing against them settles whether the orphans were ever real.
+std::unordered_set<uint32_t> g_commit_addrs;
+std::unordered_set<uint64_t> g_commit_layouts;
 
 /// The fields that decide WHICH BYTES a fetch reads and HOW they are interpreted.
 ///
@@ -3372,6 +3403,26 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
             for (const uint64_t k : ours_layouts) {
               if (!g_fetchset_ref_layouts.count(k)) ++layout_orphans;
             }
+            // THE CONTROL. Same orphan question, asked against commits we OBSERVED rather than
+            // registers we SAMPLED. If this collapses to ~0 while the sampled figure stays high,
+            // the orphans were an artifact of subsampling Xenia's register file and the whole
+            // descriptor line is void.
+            uint32_t commit_orphan_addr = 0, commit_orphan_layout = 0;
+            for (const uint32_t a : ours_seen) {
+              if (!g_commit_addrs.count(a)) ++commit_orphan_addr;
+            }
+            for (const uint64_t k : ours_layouts) {
+              if (!g_commit_layouts.count(k)) ++commit_orphan_layout;
+            }
+            REXGPU_WARN("nx1_d3d9: FETCHSET-COMMIT vs OBSERVED COMMITS (no sampling): "
+                        "addr-orphans={} layout-orphans={} | commit sets: {} addrs, {} layouts | "
+                        "committed_fetch={} <- MUST BE 0 FOR THIS TO MEAN ANYTHING. With it on we "
+                        "bind FROM the mirror, which is filled FROM these commits, so the orphan "
+                        "count is ~0 by construction and proves nothing. Empty commit sets mean "
+                        "the emitter hook never fired and the whole line is void",
+                        commit_orphan_addr, commit_orphan_layout, g_commit_addrs.size(),
+                        g_commit_layouts.size(),
+                        REXCVAR_GET(nx1_d3d9_committed_fetch) ? 1 : 0);
             REXGPU_WARN("nx1_d3d9: FETCHSET-LAYOUT ours={} distinct layouts, register file={} | "
                         "never-in-register-file={} (vs {} by ADDRESS alone) -- the difference is "
                         "bindings whose address is legitimate but whose geometry the GPU never "
@@ -3581,6 +3632,49 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
   tracker.SetDumpDraw(false, false);
 }
 
+void Renderer::NoteFetchConstantsCommitted(const uint8_t* base, uint32_t guest_device,
+                                           uint64_t dirty_mask) {
+  if (fc_mirror_device_ != guest_device) {
+    fc_mirror_device_ = guest_device;
+    fc_mirror_valid_ = 0;
+  }
+  const uint8_t* fetch = GuestPointer(base, guest_device + guest_device::kFetchConstants);
+  // The mask arrives LEFT-JUSTIFIED: slot n is bit 63-n, which is what makes the guest's
+  // `cntlzd` yield the slot index directly (recomp: `rldicr r4,r28,32,31` then count leading
+  // zeros). Read it the same way rather than assuming a little-endian bit order.
+  uint32_t committed = 0;
+  for (uint32_t slot = 0; slot < 16; ++slot) {
+    if (!((dirty_mask >> (63 - slot)) & 1ull)) {
+      continue;
+    }
+    const size_t off = size_t(slot) * guest_device::kFetchConstantStride;
+    std::memcpy(fc_mirror_ + off, fetch + off, guest_device::kFetchConstantStride);
+    fc_mirror_valid_ |= (1u << slot);
+    ++committed;
+    // Record what was ACTUALLY committed, as sampling-free ground truth for FETCHSET.
+    if (REXCVAR_GET(nx1_d3d9_dbg_fetchset)) {
+      const TextureFetchConstant c = DecodeTextureFetchConstant(fc_mirror_ + off);
+      if (c.valid && c.base_address) {
+        std::lock_guard<std::mutex> lk(g_fetchset_m);
+        if (g_commit_addrs.size() < 65536) g_commit_addrs.insert(c.base_address);
+        if (g_commit_layouts.size() < 65536) g_commit_layouts.insert(FetchLayoutKey(c));
+      }
+    }
+  }
+  // ARMING. If the bit convention above is wrong this reports zero slots forever while the fix
+  // silently does nothing, which is indistinguishable from "the bug was not real". Printed
+  // unconditionally on a cadence, with the call count, so a zero is diagnosable.
+  static uint64_t calls = 0, slots = 0;
+  ++calls;
+  slots += committed;
+  if ((calls % 200000) == 1) {
+    REXGPU_WARN("nx1_d3d9: FCCOMMIT {} emitter calls, {} slot commits mirrored, valid_mask={:#06x}."
+                " Slots staying 0 while calls climb means the dirty-mask bit order is wrong and the "
+                "mirror is inert",
+                calls, slots, fc_mirror_valid_);
+  }
+}
+
 void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, RecordedDraw& d) {
   // Every fetch constant, as one memcpy of RAW guest bytes. The 32 slots are contiguous, and
   // -- exactly as with the constant blocks -- byte-swapping here is what makes recording
@@ -3604,6 +3698,34 @@ void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, Reco
   std::memcpy(d.fetch_constants, fetch, kTextureBytes);
   std::memcpy(reinterpret_cast<uint8_t*>(d.fetch_constants) + kStreamSlot0, fetch + kStreamSlot0,
               kStreamBytes);
+  // OVERWRITE THE TEXTURE SLOTS WITH WHAT THE GUEST ACTUALLY COMMITTED. The shadow copy above
+  // stays as the fallback for slots never yet committed (and for the whole array when this is
+  // off, which is the A/B). See NoteFetchConstantsCommitted for why the shadow is wrong.
+  if (REXCVAR_GET(nx1_d3d9_committed_fetch) && fc_mirror_device_ == guest_device) {
+    static uint64_t slots_replaced = 0, slots_differing = 0, draws_seen = 0;
+    ++draws_seen;
+    for (uint32_t slot = 0; slot < 16; ++slot) {
+      if (!(fc_mirror_valid_ & (1u << slot))) {
+        continue;
+      }
+      const size_t off = size_t(slot) * guest_device::kFetchConstantStride;
+      uint8_t* dst = reinterpret_cast<uint8_t*>(d.fetch_constants) + off;
+      // Counted BEFORE the overwrite: this is the whole claim of the fix made into a number. If
+      // the shadow and the committed value never differ, there was nothing to fix here and the
+      // 0.15% FETCHSET result must be explained some other way.
+      if (std::memcmp(dst, fc_mirror_ + off, guest_device::kFetchConstantStride) != 0) {
+        ++slots_differing;
+      }
+      std::memcpy(dst, fc_mirror_ + off, guest_device::kFetchConstantStride);
+      ++slots_replaced;
+    }
+    if ((draws_seen % 400000) == 1) {
+      REXGPU_WARN("nx1_d3d9: FCMIRROR {} draws, {} slots served from the committed mirror, {} of "
+                  "them DIFFERED from the device shadow -- that difference is the bug being "
+                  "corrected; zero means the shadow was right all along",
+                  draws_seen, slots_replaced, slots_differing);
+    }
+  }
 
   d.vs_object = BoundVertexShader(base, guest_device);
   d.ps_object = BoundPixelShader(base, guest_device);
