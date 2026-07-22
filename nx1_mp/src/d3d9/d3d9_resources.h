@@ -91,6 +91,33 @@ class ResourceTracker {
   /// otherwise grow without bound (measured: 22k live vertex buffers and still climbing).
   void AdvanceFrame();
 
+  /// Capture a bound texture's guest bytes into the CPU mirror AT DRAW TIME, on the guest thread.
+  ///
+  /// THE FIX FOR THE DRAW->DECODE WINDOW, measured at 1762 events / 0.044% of sampler-0 draws with
+  /// nx1_d3d9_async on and EXACTLY 0 of 8.5M with it off. The descriptor is snapshotted when the draw
+  /// is recorded, but the bytes were being read later on the worker; if the streamer recycled that
+  /// slot in between we decoded the new occupant with the old geometry, which is noise. 0.044% sounds
+  /// negligible and is not: a poisoned decode is CACHED, so it persists until something re-decodes
+  /// it -- 0.27 per frame, ~16/second, and 1762 events against 3478 live textures.
+  ///
+  /// Cheap because the mirror only copies pages that are not already valid; a resident page costs one
+  /// bitmask test. So the steady-state cost is bounded by newly-dirtied texture memory, which is
+  /// exactly the memory that had to be re-read anyway.
+  ///
+  /// Requires nx1_d3d9_texture_mirror, which is what makes the decode read the mirror rather than
+  /// live RAM. Without it this is a no-op and the window stays open.
+  void PrefetchTextureAtDraw(const TextureFetchConstant& t);
+
+  /// Fingerprint the bytes the DECODE will actually read -- i.e. through the mirror, not live RAM.
+  ///
+  /// Needed because nx1_d3d9_dbg_window reads LIVE memory on both sides, by design: it asks whether
+  /// the guest's bytes changed between draw and decode. The draw-time prefetch does not change live
+  /// memory, only what the decode sees, so WINDOW cannot observe the fix at all and will keep
+  /// reporting the same rate whether or not it works. Comparing THIS against the draw-time live
+  /// fingerprint is what actually validates it: equal means the decode is reading the bytes that
+  /// were there when the descriptor was captured.
+  uint64_t MirrorFingerprint(uint32_t base_address, uint32_t bytes);
+
   /// Capture every distinct block-compressed texture decoded over the next `frames` frames:
   /// full guest source, our decode, and the parameters needed to decode it elsewhere.
   ///
@@ -896,6 +923,7 @@ class ResourceTracker {
   /// fill>0 means a "still speckles" reading is real evidence rather than an unarmed no-op.
   uint64_t mipfill_levels_ = 0;
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
+  uint64_t prefetch_draws_ = 0;      ///< draw-time mirror prefetches (window fix)
   uint64_t probe_rebuilds_ = 0;        ///< rebuilds forced by the content probe
   uint64_t forced_rechecks_ = 0;       ///< re-decodes forced by nx1_d3d9_redecode_delay
   /// Re-decodes refused by nx1_d3d9_keep_best for being poorer than the decode already held.
@@ -936,6 +964,18 @@ D3DPRIMITIVETYPE HostPrimitiveType(uint32_t xenos_primitive_type);
 /// Primitive count for `index_count` indices of `xenos_primitive_type`.
 uint32_t HostPrimitiveCount(uint32_t xenos_primitive_type, uint32_t index_count);
 
+/// Cheap fingerprint of the first bytes of a texture's guest memory.
+///
+/// Exists to MEASURE THE DRAW->DECODE WINDOW. With nx1_d3d9_async on, the descriptor is snapshotted
+/// at draw time on the guest thread while the bytes are read later on the worker; if the streamer
+/// recycles that slot in between, we decode the new occupant's bytes with the old texture's
+/// geometry, which produces noise rather than a recognisable wrong image. Fingerprinting at capture
+/// time and re-checking at decode time counts exactly that, with async ON and the frame rate
+/// untouched -- so it does not inherit the confound that makes async=false ambiguous (that also
+/// drops the frame rate, and frame time is itself an input to the artifact).
+///
+/// Returns 0 when the address cannot be read, so a caller can tell "unreadable" from a real value.
+uint64_t GuestTextureFingerprint(uint32_t base_address, uint32_t bytes);
 }  // namespace nx1::d3d9
 
 #endif  // _WIN32

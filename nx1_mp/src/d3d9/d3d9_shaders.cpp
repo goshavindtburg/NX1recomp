@@ -19,6 +19,8 @@
 #include <rex/cvar.h>
 #include <rex/logging/macros.h>
 
+#include "d3d9_log.h"
+
 #include "d3d9_constants.h"
 
 #include "guest_d3d.h"
@@ -135,7 +137,7 @@ bool ShaderCache::Initialize(IDirect3DDevice9Ex* device) {
   bytecode_storage_ = blob.release();
   shaders_ = new ShaderMap();
 
-  REXGPU_INFO("nx1_d3d9: SM3 shader cache loaded ({} entries, {} KiB)", g_nx1Sm3CacheEntryCount,
+  NX1_LOGI_MISC("nx1_d3d9: SM3 shader cache loaded ({} entries, {} KiB)", g_nx1Sm3CacheEntryCount,
               g_nx1Sm3CacheDecompressedSize / 1024);
   return true;
 #endif

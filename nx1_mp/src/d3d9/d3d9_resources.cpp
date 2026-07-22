@@ -16,6 +16,8 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging/macros.h>
+
+#include "d3d9_log.h"
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 #include <rex/system/kernel_state.h>
@@ -745,6 +747,19 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipsrc, 0, "GPU",
 /// auto-generated chains alone. nx1_d3d9_mips 0 disables both at once, which cannot tell our
 /// BC encoder apart from the driver's minification -- and with mips off entirely a minified
 /// surface aliases, which reads as speckle too. This isolates the half we wrote.
+// Category switches for the renderer's recurring logging -- see d3d9_log.h for why. Registered
+// under "Logging" so the F4 overlay gives them their own sidebar entry (it builds the sidebar from
+// the set of cvar categories). Defaults true: turning logging off is opt-in, so nothing silently
+// stops reporting.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_log_stats, true, "Logging",
+                    "Periodic renderer statistics (PROF, cache/MEM, mipgen, resolve rollups)");
+REXCVAR_DEFINE_BOOL(nx1_d3d9_log_texture, true, "Logging",
+                    "Per-texture events (decode changes, new textures, tracked addresses)");
+REXCVAR_DEFINE_BOOL(nx1_d3d9_log_dma, true, "Logging",
+                    "Image-cache DMA and command-buffer traffic (DMACOPY, DMARETRY, CMDBUF)");
+REXCVAR_DEFINE_BOOL(nx1_d3d9_log_misc, true, "Logging",
+                    "Other recurring renderer logging not covered by the categories above");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_bc_mips, true, "GPU",
                     "Build mip chains for block-compressed textures on the CPU (diagnostic: "
                     "set false to leave BC textures unmipped while keeping driver auto-mips)");
@@ -1817,7 +1832,7 @@ void NoteResolveTextureCensus(uint32_t phys_base, uint64_t bytes, bool served) {
       std::lock_guard<std::mutex> lk(g_resolve_seen_m);
       spans = g_resolve_seen.size();
     }
-    REXGPU_WARN("nx1_d3d9: HWCENSUS rtt: {} decodes overlap a resolved region and WERE served, {} "
+    NX1_LOGW_STATS("nx1_d3d9: HWCENSUS rtt: {} decodes overlap a resolved region and WERE served, {} "
                 "overlap and were NOT ({} = the render-to-texture bug class), {} do not overlap at "
                 "all. {} distinct resolve destinations observed. Only a NON-ZERO unserved count "
                 "implicates EDRAM/render-to-texture in the speckle",
@@ -1868,14 +1883,14 @@ void NoteHwCensus(const nx1::d3d9::TextureFetchConstant& t) {
       for (const uint32_t k : pairs) {
         all += fmt::format("f{}:{:03X} ", k >> 16, k & 0xFFFF);
       }
-      REXGPU_WARN("nx1_d3d9: HWCENSUS swizzle pairs (format:swizzle) -- {}. 0x688 = identity "
+      NX1_LOGW_STATS("nx1_d3d9: HWCENSUS swizzle pairs (format:swizzle) -- {}. 0x688 = identity "
                   "(ABGR), 0x60A = ARGB. A BLOCK-COMPRESSED format (18/19/20/49/58/59/60) paired "
                   "with anything other than identity or a broadcast is a swizzle we DROP",
                   all);
     }
   }
   if ((n.fetch_add(1, std::memory_order_relaxed) % 20000) == 0) {
-    REXGPU_WARN(
+    NX1_LOGW_STATS(
         "nx1_d3d9: HWCENSUS tex: exp_adjust!=0 {}x | stacked {}x | border {}x | lod_bias!=0 {}x | "
         "grad_exp!=0 {}x | force_bcw {}x | sign values 0x{:X} (bit n = mode n; 2=biased 1=signed) "
         "| clamp modes 0x{:X} (bits 4/5/6/7 = the BORDER modes) | clamp_policy 0x{:X} (bit1 = OGL, "
@@ -2761,6 +2776,75 @@ void SwizzleRow32(uint8_t* row, uint32_t texels, const Swizzle32& s) {
 
 }  // namespace
 
+// Declared in d3d9_resources.h. Defined here -- OUTSIDE the anonymous namespace above, so it has
+// external linkage, but after it, so PhysicalAddress and TranslatePhysical are in scope.
+uint64_t ResourceTracker::MirrorFingerprint(uint32_t base_address, uint32_t bytes) {
+  const uint32_t phys = PhysicalAddress(base_address);
+  constexpr uint64_t kPhysWindowBytes = 0x20000000ull;
+  if (!phys || uint64_t(phys) + bytes > kPhysWindowBytes) {
+    return 0;
+  }
+  // Through MirrorSnapshot on purpose: this must see exactly what the decode sees.
+  const uint8_t* p = MirrorSnapshot(phys, bytes);
+  if (!p) {
+    return 0;
+  }
+  uint64_t h = 0xCBF29CE484222325ull;
+  for (uint32_t i = 0; i < bytes; ++i) {
+    h = (h ^ p[i]) * 0x100000001B3ull;
+  }
+  return h ? h : 1;
+}
+
+void ResourceTracker::PrefetchTextureAtDraw(const TextureFetchConstant& t) {
+  if (!t.valid || !t.base_address || !REXCVAR_GET(nx1_d3d9_texture_mirror)) {
+    return;
+  }
+  const auto* fmt = rex::graphics::FormatInfo::Get(t.format);
+  if (!fmt) {
+    return;
+  }
+  // Same span the decode itself computes (see GetTexture), so the pages captured here are exactly
+  // the pages it will read. Deriving it any other way would leave part of the texture unmirrored
+  // and the window open for that part.
+  const uint32_t pitch_pixels = t.pitch_pixels ? t.pitch_pixels : t.width;
+  const rex::graphics::TextureExtent extent = rex::graphics::TextureExtent::Calculate(
+      fmt, pitch_pixels, t.height, /*depth=*/1, t.tiled, /*is_guest=*/true);
+  const uint32_t bpb = fmt->bytes_per_block();
+  const size_t bytes =
+      t.tiled ? TiledSurfaceExtentBytes(extent.block_pitch_h, extent.block_pitch_v, bpb)
+              : size_t(extent.block_pitch_h) * extent.block_pitch_v * bpb;
+  if (!bytes || bytes > (1u << 26)) {  // 64 MB sanity bound; an absurd span means a bad descriptor
+    return;
+  }
+  MirrorSnapshot(t.base_address, uint32_t(bytes));
+  ++prefetch_draws_;
+}
+
+uint64_t GuestTextureFingerprint(uint32_t base_address, uint32_t bytes) {
+  const uint32_t phys = PhysicalAddress(base_address);
+  // Same 512 MB physical window ResourceTracker::kMirrorPages covers, stated locally rather than
+  // widening that class's access surface for a diagnostic. An unbounded read here crashed the game
+  // once already (muzzle-flash sprites decode on the spot).
+  constexpr uint64_t kPhysWindowBytes = 0x20000000ull;
+  if (!phys || uint64_t(phys) + bytes > kPhysWindowBytes) {
+    return 0;
+  }
+  const uint8_t* p = TranslatePhysical(phys);
+  if (!p) {
+    return 0;
+  }
+  // Deliberately LIVE memory, not MirrorSnapshot: the question is whether the guest's bytes changed
+  // between the draw and the decode, and the mirror would serve a cached page and hide exactly that.
+  // Cheap FNV over a short prefix -- this runs per draw on the guest thread, which PROF/bound shows
+  // is the longer pole, so it has to stay small.
+  uint64_t h = 0xCBF29CE484222325ull;
+  for (uint32_t i = 0; i < bytes; ++i) {
+    h = (h ^ p[i]) * 0x100000001B3ull;
+  }
+  return h ? h : 1;  // 0 is reserved for "unreadable"
+}
+
 //=============================================================================
 
 D3DPRIMITIVETYPE HostPrimitiveType(uint32_t xenos_primitive_type) {
@@ -3488,7 +3572,7 @@ void ResourceTracker::LogCacheStats() {
   const size_t vbs = vertex_buffers_ ? static_cast<VertexBufferMap*>(vertex_buffers_)->size() : 0;
   const size_t ibs = index_buffers_ ? static_cast<IndexBufferMap*>(index_buffers_)->size() : 0;
   const size_t resolves = resolves_ ? static_cast<ResolveMap*>(resolves_)->size() : 0;
-  REXGPU_INFO(
+  NX1_LOGI_STATS(
       "nx1_d3d9: cache frame={} textures={} vb={} ib={} resolves={} | uploads={} rebuilds={} "
       "evicted={} failures={} unsupported={} | driver texmem={} MiB",
       frame_, textures, vbs, ibs, resolves, tex_uploads_, tex_rebuilds_, tex_evicted_,
@@ -3516,7 +3600,7 @@ void ResourceTracker::LogCacheStats() {
   if (REXCVAR_GET(nx1_d3d9_dbg_dmacover)) {
     const uint64_t d = dmacover_decodes_ ? dmacover_decodes_ : 1;
     const uint64_t pg = dmacover_pg_never_ + dmacover_pg_skipped_ + dmacover_pg_written_;
-    REXGPU_WARN("nx1_d3d9: DMACOVER {} decodes | UNDERCOPIED {} ({:.1f}%, other half would fit in "
+    NX1_LOGW_DMA("nx1_d3d9: DMACOVER {} decodes | UNDERCOPIED {} ({:.1f}%, other half would fit in "
                 "{}) | covered {} ({:.1f}%) | no copy recorded {} ({:.1f}%)",
                 dmacover_decodes_, dmacover_under_, 100.0 * double(dmacover_under_) / double(d),
                 dmacover_alt_fits_, dmacover_covered_,
@@ -3525,7 +3609,7 @@ void ResourceTracker::LogCacheStats() {
     // READ THE PAGE LINE AGAINST THE DECODE LINE. "covered" only means a copy's SPAN reached the
     // page; the per-page skip still leaves empty-source pages holding the previous occupant, and
     // that shows up here as `spanned but skipped` while the decode line says covered.
-    REXGPU_WARN("nx1_d3d9: DMACOVER pages {} | never targeted {} ({:.1f}%) | spanned but SKIPPED "
+    NX1_LOGW_DMA("nx1_d3d9: DMACOVER pages {} | never targeted {} ({:.1f}%) | spanned but SKIPPED "
                 "{} ({:.1f}%) | actually written {} ({:.1f}%)",
                 pg, dmacover_pg_never_, 100.0 * double(dmacover_pg_never_) / double(pg ? pg : 1),
                 dmacover_pg_skipped_,
@@ -3538,42 +3622,42 @@ void ResourceTracker::LogCacheStats() {
   // CLAMP hits=0 with the cvar on means no decode ever overlapped a live neighbour, so the
   // over-read is not happening in this scene -- read that before concluding anything from the
   // picture. Non-zero says how much foreign memory we STOPPED decoding as texels.
-  REXGPU_WARN("nx1_d3d9: CLAMP {} | {} decodes clamped to the next live texture base, {} KiB of "
+  NX1_LOGW_STATS("nx1_d3d9: CLAMP {} | {} decodes clamped to the next live texture base, {} KiB of "
               "the next allocation not decoded",
               REXCVAR_GET(nx1_d3d9_clamp_alloc) ? "on" : "off", clamp_hits_, clamp_bytes_ >> 10);
   REXGPU_INFO("nx1_d3d9: REARM {} ({} pages re-armed) -- pair with the DECODECHANGE no-write-delta "
               "fraction: if forcing the re-arm collapses it, our cached armed bit had gone stale "
               "against the protection the reference also manages",
               REXCVAR_GET(nx1_d3d9_rearm_watch) ? "on" : "off", rearm_calls_);
-  REXGPU_INFO("nx1_d3d9: REDECODE forced={} rechecks (nx1_d3d9_redecode_delay={}) -- pair this "
+  NX1_LOGI_STATS("nx1_d3d9: REDECODE forced={} rechecks (nx1_d3d9_redecode_delay={}) -- pair this "
               "with the DECODECHANGE count: rechecks that found DIFFERENT bytes are decodes that "
               "had been taken before the data landed",
               forced_rechecks_, REXCVAR_GET(nx1_d3d9_redecode_delay));
-  REXGPU_INFO("nx1_d3d9: CONTENTPROBE {} rebuilds forced by a changed slot occupant -- each one "
+  NX1_LOGI_STATS("nx1_d3d9: CONTENTPROBE {} rebuilds forced by a changed slot occupant -- each one "
               "is a surface that would otherwise have rendered another texture's bytes",
               probe_rebuilds_);
   // Unconditional, including zero. Zero with the gate ON is a real result: it would mean re-decodes
   // are never poorer than what they replace, so the churn seen in the POLL trajectories is not
   // reaching the decode path and keep-best cannot be the answer.
-  REXGPU_WARN("nx1_d3d9: KEEPBEST {} re-decodes refused as poorer than the decode already held "
+  NX1_LOGW_STATS("nx1_d3d9: KEEPBEST {} re-decodes refused as poorer than the decode already held "
               "(gate={}, drop>={}%, max {} consecutive per entry)",
               keepbest_refused_, REXCVAR_GET(nx1_d3d9_keep_best) ? "on" : "off",
               REXCVAR_GET(nx1_d3d9_keep_best_drop_pct), REXCVAR_GET(nx1_d3d9_keep_best_max));
-  REXGPU_INFO("nx1_d3d9: PARTIALSRC {} of {} decodes had an incomplete source ({}%) | {} of {} "
+  NX1_LOGI_STATS("nx1_d3d9: PARTIALSRC {} of {} decodes had an incomplete source ({}%) | {} of {} "
               "source pages were still empty ({}%) -- the objective speckle baseline",
               partial_decodes_, decodes_total_,
               decodes_total_ ? partial_decodes_ * 100 / decodes_total_ : 0, partial_pages_sum_,
               decode_pages_sum_,
               decode_pages_sum_ ? partial_pages_sum_ * 100 / decode_pages_sum_ : 0);
-  REXGPU_INFO("nx1_d3d9: RESOLVEMAP served={} rejected_stale={} (entries={})", resolve_served_,
+  NX1_LOGI_STATS("nx1_d3d9: RESOLVEMAP served={} rejected_stale={} (entries={})", resolve_served_,
               resolve_rejected_, resolves_ ? static_cast<ResolveMap*>(resolves_)->size() : 0);
-  REXGPU_INFO("nx1_d3d9: SRCCLASS repeating(placeholder-like)={} high-entropy(garbage-like)={} "
+  NX1_LOGI_STATS("nx1_d3d9: SRCCLASS repeating(placeholder-like)={} high-entropy(garbage-like)={} "
               "-- two DIFFERENT failures; a fix that moves only one is not the whole bug",
               repeating_source_binds_, highentropy_source_binds_);
-  REXGPU_INFO("nx1_d3d9: PLACEHOLDER binds={} (textures bound at the engine's not-resident "
+  NX1_LOGI_STATS("nx1_d3d9: PLACEHOLDER binds={} (textures bound at the engine's not-resident "
               "buffer {:08X}); a config that streams properly drives this toward zero",
               placeholder_binds_, DefaultPixelsAddress());
-  REXGPU_INFO("nx1_d3d9: mipgen guest={} built={} auto={} basemap(level0 only)={} "
+  NX1_LOGI_STATS("nx1_d3d9: mipgen guest={} built={} auto={} basemap(level0 only)={} "
               "skipped(no chain declared)={} skipped(fmt)={} mip_relocs={} | mipfill mode={} "
               "levels_overwritten={}",
               mips_guest_, mips_built_, mips_auto_, mips_basemap_, mips_skip_nochain_,
@@ -3637,11 +3721,11 @@ void ResourceTracker::LogCacheStats() {
         if (e.tex && e.owned) rv_bytes += uint64_t(e.width) * e.height * 4;
       }
     }
-    REXGPU_INFO("nx1_d3d9: MEMPOOLS textures={} ({} MiB) vbs={} ({} MiB) render_targets={} "
+    NX1_LOGI_STATS("nx1_d3d9: MEMPOOLS textures={} ({} MiB) vbs={} ({} MiB) render_targets={} "
                 "({} MiB) resolves={} ({} MiB)",
                 tex_n, tex_bytes / (1024 * 1024), vb_n, vb_bytes / (1024 * 1024), rt_n,
                 rt_bytes / (1024 * 1024), rv_n, rv_bytes / (1024 * 1024));
-    REXGPU_INFO("nx1_d3d9: MEM private={} MiB working={} MiB | tex_cache={} MiB vb_cache={} MiB "
+    NX1_LOGI_STATS("nx1_d3d9: MEM private={} MiB working={} MiB | tex_cache={} MiB vb_cache={} MiB "
                 "(largest vb {} KiB) | writes_pending={} detile_scratch={} KiB mirror_valid={} MiB",
                 pmc.PrivateUsage / (1024 * 1024), pmc.WorkingSetSize / (1024 * 1024),
                 tex_bytes / (1024 * 1024), vb_bytes / (1024 * 1024), vb_max / 1024, pending,
@@ -3652,7 +3736,7 @@ void ResourceTracker::LogCacheStats() {
   // Was the shared detile buffer ever actually contended? threads>1 with overlap_max>1 is the
   // race observed directly rather than inferred from log thread ids. overlap_max==1 means the
   // buffer was never concurrently held and the thread_local change fixed nothing real.
-  REXGPU_WARN("nx1_d3d9: DETILESCRATCH {} threads used it, max {} held it at once ({})",
+  NX1_LOGW_STATS("nx1_d3d9: DETILESCRATCH {} threads used it, max {} held it at once ({})",
               DetileScratchThreads().load(std::memory_order_relaxed),
               DetileScratchOverlapMax().load(std::memory_order_relaxed),
               DetileScratchOverlapMax().load(std::memory_order_relaxed) > 1
@@ -4370,7 +4454,7 @@ void ResourceTracker::DrainMemoryWrites() {
     }
     for (const auto& [addr, len] : writes) {
       if (addr < track + span && addr + len > track) {
-        REXGPU_INFO("nx1_d3d9: TRACK {:08X} WRITE frame={} range={:08X}+{} (+{} into a {} byte "
+        NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} WRITE frame={} range={:08X}+{} (+{} into a {} byte "
                     "window, {})",
                     track, frame_, addr, len, addr > track ? addr - track : 0, span,
                     span_known ? "the entry's real watch_size" : "ASSUMED 1 page, no entry found");
@@ -4391,7 +4475,7 @@ void ResourceTracker::DrainMemoryWrites() {
     if (!claimed) {
       for (const auto& [addr, len] : writes) {
         if (addr <= track && track < addr + len) {
-          REXGPU_INFO("nx1_d3d9: TRACK {:08X} WRITE with NO cache entry watching it (frame {})",
+          NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} WRITE with NO cache entry watching it (frame {})",
                       track, frame_);
           break;
         }
@@ -4411,7 +4495,7 @@ void ResourceTracker::DrainMemoryWrites() {
       ++n;
     }
     MirrorInvalidateAll();
-    REXGPU_INFO("nx1_d3d9: REDECODE forced {} cached textures to re-decode from current memory", n);
+    NX1_LOGI_STATS("nx1_d3d9: REDECODE forced {} cached textures to re-decode from current memory", n);
   }
   for (auto [key, entry] : *textures) {
     if (!entry.watch_size) continue;
@@ -4450,7 +4534,7 @@ void ResourceTracker::DrainMemoryWrites() {
       if (hit_base || hit_mips) {
         entry.dirty = true;
         if (const uint32_t track = TrackedMatch(entry.watch_addr); track) {
-          REXGPU_INFO("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} ({} {}+{})",
+          NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} ({} {}+{})",
                       track, frame_, addr, len, hit_base ? "watch" : "MIP watch",
                       hit_base ? entry.watch_addr : entry.mip_watch_addr,
                       hit_base ? entry.watch_size : entry.mip_watch_size);
@@ -4465,11 +4549,11 @@ void ResourceTracker::ReportEffectCandidates() {
   std::vector<NewTex> v = baseline_new_;
   std::sort(v.begin(), v.end(),
             [](const NewTex& a, const NewTex& b) { return a.episodes > b.episodes; });
-  REXGPU_INFO("nx1_d3d9: EFFECTS {} newcomers since baseline, ranked by appearances",
+  NX1_LOGI_MISC("nx1_d3d9: EFFECTS {} newcomers since baseline, ranked by appearances",
               v.size());
   for (size_t i = 0; i < v.size() && i < 25; ++i) {
     const auto& n = v[i];
-    REXGPU_INFO("nx1_d3d9: EFFECTS {:08X} {}x{} fmt={} sampler={} appearances={} frames_bound={}",
+    NX1_LOGI_MISC("nx1_d3d9: EFFECTS {:08X} {}x{} fmt={} sampler={} appearances={} frames_bound={}",
                 n.addr, n.width, n.height, n.format, n.sampler, n.episodes, n.frames_bound);
   }
 }
@@ -4479,7 +4563,7 @@ void ResourceTracker::LearnTextureBaseline(uint32_t frames) {
   baseline_ready_ = false;
   baseline_addrs_.clear();
   baseline_new_.clear();
-  REXGPU_INFO("nx1_d3d9: NEWTEX learning baseline over {} frames -- keep the effect OFF screen",
+  NX1_LOGI_TEX("nx1_d3d9: NEWTEX learning baseline over {} frames -- keep the effect OFF screen",
               frames);
 }
 
@@ -4561,7 +4645,7 @@ void ResourceTracker::AdvanceFrame() {
     if (req == kAutotrackRelease) {
       REXCVAR_SET(nx1_d3d9_dbg_track_addr, 0u);
       autotrack_latched_ = 0;
-      REXGPU_WARN("nx1_d3d9: AUTOTRACK released -- that texture decoded COMPLETE, so it healed "
+      NX1_LOGW_TEX("nx1_d3d9: AUTOTRACK released -- that texture decoded COMPLETE, so it healed "
                   "and is not the permanent case. Hunting the next candidate");
     } else {
       REXCVAR_SET(nx1_d3d9_dbg_track_addr, req);
@@ -4572,7 +4656,7 @@ void ResourceTracker::AdvanceFrame() {
       // nor a large fixed span works.
       if (const uint32_t span = autotrack_span_.exchange(0, std::memory_order_relaxed)) {
         REXCVAR_SET(nx1_d3d9_dbg_track_bytes, span);
-        REXGPU_WARN("nx1_d3d9: AUTOTRACK watch window set to {} bytes to match the texture, so a "
+        NX1_LOGW_TEX("nx1_d3d9: AUTOTRACK watch window set to {} bytes to match the texture, so a "
                     "copy landing anywhere in its base is visible (a fixed 64 KB window covered "
                     "only the first quarter of a 512x512 BC base)",
                     span);
@@ -4656,7 +4740,7 @@ void ResourceTracker::AdvanceFrame() {
       if (nz != last_nz || hash != last_hash) {
         // Same count with a different hash is the interesting case and is called out, because it
         // means the texture was REPLACED rather than filled -- invisible to the old poll.
-        REXGPU_WARN("nx1_d3d9: TRACK {:08X} POLL frame={} nonzero={}/{} ({} empty of {} pages) "
+        NX1_LOGW_TEX("nx1_d3d9: TRACK {:08X} POLL frame={} nonzero={}/{} ({} empty of {} pages) "
                     "hash={:016X}{}",
                     track, frame_, nz, span, empty_pages, pages, hash,
                     (nz == last_nz && last_nz != 0xFFFFFFFFu)
@@ -4682,7 +4766,7 @@ void ResourceTracker::AdvanceFrame() {
       // Threshold is against the SPAN now that the poll covers the whole texture; it used to be
       // against a fixed 8192 and would have fired ~32x too easily on a 256 KB base.
       if (autotrack_latched_ == track && uint64_t(nz) * 100 >= uint64_t(span) * 50u) {
-        REXGPU_WARN("nx1_d3d9: AUTOTRACK {:08X} RELEASED at frame {} -- it FILLED ({}/{} "
+        NX1_LOGW_TEX("nx1_d3d9: AUTOTRACK {:08X} RELEASED at frame {} -- it FILLED ({}/{} "
                     "nonzero), so it was caught mid-stream rather than stuck. The mip chain "
                     "landing before the base level is normal streaming order; only a texture "
                     "that STAYS starved is the specimen. Re-arming the hunt",
@@ -4698,7 +4782,7 @@ void ResourceTracker::AdvanceFrame() {
     baseline_addrs_.erase(std::unique(baseline_addrs_.begin(), baseline_addrs_.end()),
                           baseline_addrs_.end());
     baseline_ready_ = true;
-    REXGPU_INFO("nx1_d3d9: NEWTEX baseline is {} addresses -- now reporting newcomers",
+    NX1_LOGI_TEX("nx1_d3d9: NEWTEX baseline is {} addresses -- now reporting newcomers",
                 baseline_addrs_.size());
   }
   ++frame_;
@@ -5141,7 +5225,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       uint32_t base_empty = 0, base_pages = 0, mip_empty = 0, mip_pages = 0;
       scan(t.base_address, base_bytes, &base_empty, &base_pages);
       scan(t.mip_address, base_bytes, &mip_empty, &mip_pages);
-      REXGPU_INFO("nx1_d3d9: TRACK {:08X} BIND frame={} sampler={} {}x{} fmt={} dim={} "
+      NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} BIND frame={} sampler={} {}x{} fmt={} dim={} "
                   "mip_min={} mip_max={} mip_filter={} lod_bias={} packed={} | base {} bytes, "
                   "{} of {} pages EMPTY | mip_address={:08X} {} of {} pages EMPTY",
                   t.base_address, frame_, sampler, t.width, t.height, t.format, t.dimension,
@@ -5183,7 +5267,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       ++resolve_served_;
       NoteResolveTextureCensus(PhysicalAddress(t.base_address), 0, true);
       if (dbg_track && t.base_address == dbg_track) {
-        REXGPU_INFO("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={}", t.base_address,
+        NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={}", t.base_address,
                     frame_);
       }
       return resolve_flat_tex_[i];
@@ -5196,7 +5280,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         static uint64_t last_resolve_frame = 0;
         if (frame_ != last_resolve_frame) {
           last_resolve_frame = frame_;
-          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={} ({}x{}) -- this is "
+          NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} SERVED FROM RESOLVE MAP frame={} ({}x{}) -- this is "
                       "a render target, not a CPU-decoded texture",
                       t.base_address, frame_, it->second.width, it->second.height);
         }
@@ -5283,7 +5367,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   auto& entry = (*map)[key];
   if (const uint32_t track = TrackedMatch(t.base_address);
       track && entry.tex && entry.layout_key != layout_key) {
-    REXGPU_INFO("nx1_d3d9: TRACK {:08X} LAYOUT CHANGED frame={} sampler={} {}x{} fmt={} -- the "
+    NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} LAYOUT CHANGED frame={} sampler={} {}x{} fmt={} -- the "
                 "pool handed this address to a different texture",
                 t.base_address, frame_, sampler, t.width, height, t.format);
   }
@@ -5481,7 +5565,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         entry.dirty = false;  // keep what we have; a later, better write can dirty it again
         entry.last_frame = frame_;
         if (const uint32_t track = TrackedMatch(t.base_address); track) {
-          REXGPU_WARN("nx1_d3d9: TRACK {:08X} KEEPBEST refused re-decode #{} frame={} -- source is "
+          NX1_LOGW_TEX("nx1_d3d9: TRACK {:08X} KEEPBEST refused re-decode #{} frame={} -- source is "
                       "{}/{} populated where the decode we hold came from {}/{}. Adopting it would "
                       "show a poorer moment of a churning slot",
                       track, entry.keepbest_refusals, frame_, nz, sampled, entry.best_nonzero,
@@ -5501,7 +5585,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       static uint64_t last_logged = 0;
       if (frame_ != last_logged) {
         last_logged = frame_;
-        REXGPU_INFO("nx1_d3d9: TRACK {:08X} CACHED frame={} dirty={} committed={} retry_frame={} "
+        NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} CACHED frame={} dirty={} committed={} retry_frame={} "
                     "layout_ok=1 good_frames={} mip_source={} ({})",
                     t.base_address, frame_, entry.dirty ? 1 : 0, entry.committed ? 1 : 0,
                     entry.retry_frame, entry.good_frames, entry.mip_source,
@@ -5792,14 +5876,14 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           ++mirrorstale_stale_decodes_;
           mirrorstale_stale_pages_ += diff;
           if (mirrorstale_stale_decodes_ <= 12) {
-            REXGPU_WARN("nx1_d3d9: MIRRORSTALE {:08X} {}x{} fmt={} -- {} of {} snapshot pages "
+            NX1_LOGW_TEX("nx1_d3d9: MIRRORSTALE {:08X} {}x{} fmt={} -- {} of {} snapshot pages "
                         "DIFFER from live guest memory, so this decode is about to use bytes the "
                         "slot no longer holds",
                         t.base_address, t.width, height, t.format, diff, pages);
           }
         }
         if ((mirrorstale_decodes_ % 2000) == 0) {
-          REXGPU_WARN("nx1_d3d9: MIRRORSTALE {} of {} decodes read a STALE snapshot ({} of {} "
+          NX1_LOGW_TEX("nx1_d3d9: MIRRORSTALE {} of {} decodes read a STALE snapshot ({} of {} "
                       "pages differed from live memory). Nonzero means the DECODE SOURCE, not "
                       "guest memory, is what holds the wrong texture",
                       mirrorstale_stale_decodes_, mirrorstale_decodes_, mirrorstale_stale_pages_,
@@ -6107,7 +6191,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                          (uint64_t(t.width - 1) << 8) ^ uint64_t(t.format);
     std::lock_guard<std::mutex> lk(d9_m);
     if (d9_seen.size() < 60000 && d9_seen.insert(sig).second) {
-      REXGPU_INFO("D9TEX base={:08X} mip={:08X} {}x{} fmt={} tiled={} packed={} mip_max={}",
+      NX1_LOGI_TEX("D9TEX base={:08X} mip={:08X} {}x{} fmt={} tiled={} packed={} mip_max={}",
                   t.base_address, t.mip_address, t.width, height, t.format, t.tiled ? 1 : 0,
                   t.packed_mips ? 1 : 0, t.mip_max_level);
     }
@@ -6153,7 +6237,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     if (const uint32_t budget = REXCVAR_GET(nx1_d3d9_dbg_classify); budget &&
         (best_period || distinct >= 250)) {
       REXCVAR_SET(nx1_d3d9_dbg_classify, budget - 1);
-      REXGPU_WARN("nx1_d3d9: SRCCLASS {:08X} {}x{} fmt={} -> {} (period={} distinct={}/256)",
+      NX1_LOGW_STATS("nx1_d3d9: SRCCLASS {:08X} {}x{} fmt={} -> {} (period={} distinct={}/256)",
                   t.base_address, t.width, height, t.format,
                   best_period ? "REPEATING (placeholder-like)" : "HIGH-ENTROPY (garbage-like)",
                   best_period, distinct);
@@ -6241,7 +6325,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           ++it->second.addr_count;
           // <= 3 distinct addresses: not one of the shared dummy maps that legitimately converge.
           if (prev.hash && prev.hash != h && it->second.addr_count <= 3) {
-            REXGPU_WARN("nx1_d3d9: SLOTREUSE {:08X} ({}x{} fmt={}) changed INTO content first "
+            NX1_LOGW_TEX("nx1_d3d9: SLOTREUSE {:08X} ({}x{} fmt={}) changed INTO content first "
                         "decoded at {:08X} ({}x{} fmt={}) -- this surface is now showing another "
                         "texture's bytes, so the pool reassigned the slot under us",
                         t.base_address, t.width, height, t.format, it->second.addr, it->second.w,
@@ -6252,7 +6336,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     }
     if (prev.hash && prev.hash != h) {
       ++prev.changes;
-      REXGPU_WARN("nx1_d3d9: DECODECHANGE {:08X} {}x{} fmt={} frame {} -> {} | hash {:016X} -> "
+      // Rate-limited: 1058 lines in one session. The COUNT is what matters (it is the churn signal
+      // compared across A/B runs); the individual lines were only ever useful when chasing a named
+      // texture, and TRACK does that better.
+      static std::atomic<uint64_t> dc_seen{0};
+      const bool dc_print = (dc_seen.fetch_add(1, std::memory_order_relaxed) % 200) == 0;
+      if (dc_print)
+      NX1_LOGW_TEX("nx1_d3d9: DECODECHANGE {:08X} {}x{} fmt={} frame {} -> {} | hash {:016X} -> "
                   "{:016X} | page writes {} -> {}",
                   t.base_address, t.width, height, t.format, prev.frame, frame_, prev.hash, h,
                   prev.writes, wsum);
@@ -6389,7 +6479,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         h = (h ^ dst[i]) * 1099511628211ull;
       }
       REXCVAR_SET(nx1_d3d9_dbg_partial_src, budget - 1);
-      REXGPU_WARN("nx1_d3d9: PARTIALSRC {:08X} fmt={} {}x{} EMPTY {}/{} pages -- decoded hash "
+      NX1_LOGW_STATS("nx1_d3d9: PARTIALSRC {:08X} fmt={} {}x{} EMPTY {}/{} pages -- decoded hash "
                   "{:016X} (frame {})",
                   t.base_address, t.format, t.width, height, pages_empty, pages_total, h, frame_);
     }
@@ -6413,7 +6503,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         pages_empty += page_nz == 0 ? 1 : 0;
       }
     }
-    REXGPU_INFO("nx1_d3d9: TRACK {:08X} DECODE frame={} fmt={} {}x{} bytes={} nonzero={}/{} "
+    NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} DECODE frame={} fmt={} {}x{} bytes={} nonzero={}/{} "
                 "emptypages={}/{} dirty={} committed={}",
                 t.base_address, frame_, t.format, t.width, height, guest_bytes, nonzero,
                 guest_bytes, pages_empty, pages_total, entry.dirty ? 1 : 0,
@@ -6444,10 +6534,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           }
         }
         if (first_hit == INT32_MIN) {
-          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SWEEP no populated page within +/-1 MB",
+          NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} SWEEP no populated page within +/-1 MB",
                       t.base_address);
         } else {
-          REXGPU_INFO("nx1_d3d9: TRACK {:08X} SWEEP nearest populated page at offset {} "
+          NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} SWEEP nearest populated page at offset {} "
                       "({:08X})",
                       t.base_address, first_hit, uint32_t(int64_t(t.base_address) + first_hit));
         }
@@ -6809,7 +6899,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // the current one, it WAS good once and we replaced it, and the frames tell us when.
       if (auto it = decode_hashes_.find(DecodeViewKey(t)); it != decode_hashes_.end()) {
         const auto& st = it->second;
-        REXGPU_WARN("nx1_d3d9: DECODEHIST {:08X} decodes={} changes={} | first frame {} hash "
+        NX1_LOGW_TEX("nx1_d3d9: DECODEHIST {:08X} decodes={} changes={} | first frame {} hash "
                     "{:016X} | now frame {} hash {:016X} | {}",
                     t.base_address, st.decodes, st.changes, st.first_frame, st.first_hash,
                     st.frame, st.hash,
@@ -6836,7 +6926,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
             wb += std::to_string(n);
           }
         }
-        REXGPU_WARN("nx1_d3d9: PAGEWRITES {:08X} {} pages, {} never written | per-page: {}",
+        NX1_LOGW_TEX("nx1_d3d9: PAGEWRITES {:08X} {} pages, {} never written | per-page: {}",
                     t.base_address, np, zero_pages, wb);
       }
 
@@ -6956,7 +7046,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_LIVE.bmp",
                         t.base_address);
           DumpRgbaBmp(dump_path, limg, t.width, height);
-          REXGPU_WARN("nx1_d3d9: MIRRORDIFF {:08X} {} of {} pages differ from live guest memory "
+          NX1_LOGW_TEX("nx1_d3d9: MIRRORDIFF {:08X} {} of {} pages differ from live guest memory "
                       "-> texdump/mip_{:08X}_LIVE.bmp",
                       t.base_address, diff_pages, src_pages_total, t.base_address);
         }
@@ -7290,7 +7380,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           const uint64_t nr = non_n.load(std::memory_order_relaxed);
           // Unconditional, including zeros: if one class never appears the classifier is wrong,
           // and a "non-resident textures are the bad ones" reading would be unfalsifiable.
-          REXGPU_WARN("nx1_d3d9: RESIDENCY resident={} decodes (mean {} permille populated) | "
+          NX1_LOGW_STATS("nx1_d3d9: RESIDENCY resident={} decodes (mean {} permille populated) | "
                       "NOT-resident={} decodes (mean {} permille) | no-mip-chain={}. "
                       "Non-resident means base_address points into the FASTFILE BLOB "
                       "(mip == base + align(baseSize,4096)); a low mean there is a blob that has "
@@ -7435,7 +7525,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       // that the partial_pages gate is gone, so logging them all would bury the signal under
       // every healthy texture in the scene.
       if (base_starved_mostly && (n <= 8 || (n % 200) == 0)) {
-        REXGPU_WARN("nx1_d3d9: AUTOTRACK passed over {:08X} {}x{} fmt={} ({} of {} base pages "
+        NX1_LOGW_TEX("nx1_d3d9: AUTOTRACK passed over {:08X} {}x{} fmt={} ({} of {} base pages "
                     "EMPTY ({} also >={}% zero), mip_address={:08X} {} of {} pages delivered) "
                     "-- {}. {} starved candidates passed over so far; still hunting",
                     t.base_address, t.width, height, t.format, base_empty, base_total,
@@ -7448,7 +7538,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     } else {
       autotrack_span_.store(uint32_t(guest_bytes), std::memory_order_relaxed);
       autotrack_request_.store(t.base_address, std::memory_order_relaxed);
-      REXGPU_WARN("nx1_d3d9: AUTOTRACK {:08X} {}x{} fmt={} -- *** STARVED BASE, DELIVERED MIPS: "
+      NX1_LOGW_TEX("nx1_d3d9: AUTOTRACK {:08X} {}x{} fmt={} -- *** STARVED BASE, DELIVERED MIPS: "
                   "{} of {} base pages ENTIRELY zero ({} also >={}% zero) while mip_address={:08X} "
                   "has {} of {} pages delivered. *** Tracking from here. Watch for a DMACOPY "
                   "landing on the BASE range (and what its source held), and for a WRITE arriving "
@@ -8117,7 +8207,7 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
 
   auto* map = static_cast<ResolveMap*>(resolves_);
   if (const uint32_t track = TrackedMatch(PhysicalAddress(dest_address)); track) {
-    REXGPU_INFO("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
+    NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
                 height);
   }
   auto& entry = (*map)[PhysicalAddress(dest_address)];
@@ -8546,7 +8636,7 @@ void ResourceTracker::ResolveWriteback(IDirect3DTexture9* tex, uint32_t width, u
   writeback_bytes_ += guest_bytes;
   const double us =
       double((std::chrono::steady_clock::now() - t0).count()) / 1000.0;
-  REXGPU_INFO("nx1_d3d9: WRITEBACK {:08X} {}x{} tiled={} endian={} {} KiB in {:.0f} us "
+  NX1_LOGI_MISC("nx1_d3d9: WRITEBACK {:08X} {}x{} tiled={} endian={} {} KiB in {:.0f} us "
               "(#{} total)",
               dest.base_address, width, height, dest.tiled ? 1 : 0, dest.endian,
               guest_bytes / 1024, us, writebacks_done_);
@@ -8578,7 +8668,7 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
   }
   auto* map = static_cast<ResolveMap*>(resolves_);
   if (const uint32_t track = TrackedMatch(PhysicalAddress(dest_address)); track) {
-    REXGPU_INFO("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
+    NX1_LOGI_TEX("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
                 height);
   }
   auto& entry = (*map)[PhysicalAddress(dest_address)];

@@ -36,6 +36,8 @@
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging/macros.h>
+
+#include "d3d9_log.h"
 #include <rex/ppc/context.h>
 
 #include "d3d9_renderer.h"
@@ -339,7 +341,7 @@ REX_HOOK_RAW(rex_D3DDevice_Resolve) {
     if (ctx.r8.u32) level.fetch_add(1, std::memory_order_relaxed);
     if (ctx.r9.u32) slice.fetch_add(1, std::memory_order_relaxed);
     if ((n.fetch_add(1, std::memory_order_relaxed) % 2000) == 0) {
-      REXGPU_WARN("nx1_d3d9: HWCENSUS resolve: exponent_bias!=0 {}x | source_select mask 0x{:X} "
+      NX1_LOGW_STATS("nx1_d3d9: HWCENSUS resolve: exponent_bias!=0 {}x | source_select mask 0x{:X} "
                   "(bit4 = DEPTHSTENCIL, bits1-3 = RT1..3) | fragment_select mask 0x{:X} (bit N = "
                   "selector N*0x10; bit1 = FRAGMENT0, which is EQUIVALENT to ALLFRAGMENTS on a "
                   "single-sampled buffer and therefore harmless -- bits 2/3/4 = FRAGMENT1/2/3 are "
@@ -439,7 +441,7 @@ REX_HOOK_RAW(rex_D3DDevice_Swap) {
     if (++frames >= 60) {
       const uint64_t ns = g_imp_ns.exchange(0, std::memory_order_relaxed);
       const uint64_t calls = g_imp_calls.exchange(0, std::memory_order_relaxed);
-      REXGPU_INFO("nx1_d3d9: PROF/imp guest-D3D-library {:.2f} ms/frame over {} draws/frame",
+      NX1_LOGI_STATS("nx1_d3d9: PROF/imp guest-D3D-library {:.2f} ms/frame over {} draws/frame",
                   double(ns) / (1e6 * frames), calls / frames);
       frames = 0;
     }
@@ -594,9 +596,12 @@ void NoteDrawForCmdBufCensus() {
 void LogCmdBufTraffic() {
   static std::atomic<uint64_t> last{0};
   const uint64_t total = g_cb_run.load() + g_cb_async.load() + g_cb_r_run.load();
-  if (total - last.load() >= 100) {
+  // Every 100 calls was 1330 log lines in one session -- the single largest source in the log,
+  // ungated, long after the command-buffer question it answered was settled. The counters still
+  // accumulate; only the printing is thinned.
+  if (total - last.load() >= 20000) {
     last.store(total);
-    REXGPU_WARN("nx1_d3d9: CMDBUF traffic run={} async={} r_run={}", g_cb_run.load(),
+    NX1_LOGW_DMA("nx1_d3d9: CMDBUF traffic run={} async={} r_run={}", g_cb_run.load(),
                 g_cb_async.load(), g_cb_r_run.load());
   }
 }
@@ -652,7 +657,7 @@ REX_HOOK_RAW(rex_R_RunCommandBuffer_YAXPBUGfxBackEndData_IPAUGfxDrawListIter_PBU
   --g_in_cmdbuf;
   const uint64_t w = g_cb_windows_closed.fetch_add(1, std::memory_order_relaxed) + 1;
   if ((w % 2000) == 0) {
-    REXGPU_WARN("nx1_d3d9: CBDRAWS {} playbacks | our draws INSIDE={} OUTSIDE={} -- zero inside "
+    NX1_LOGW_DMA("nx1_d3d9: CBDRAWS {} playbacks | our draws INSIDE={} OUTSIDE={} -- zero inside "
                 "means command-buffer geometry never reaches our renderer at all",
                 w, g_draws_in_cb.load(), g_draws_out_cb.load());
   }
@@ -675,7 +680,7 @@ REX_HOOK_RAW(rex_ImageCache_GetDefaultPixels_YAPBEXZ) {
 #ifdef _WIN32
   const uint32_t pixels = ctx.r3.u32;
   if (pixels && nx1::d3d9::ResourceTracker::SetDefaultPixelsAddress(pixels)) {
-    REXGPU_WARN("nx1_d3d9: DEFAULTPIXELS buffer at {:08X} -- textures bound at this address are "
+    NX1_LOGW_MISC("nx1_d3d9: DEFAULTPIXELS buffer at {:08X} -- textures bound at this address are "
                 "the engine's own not-resident placeholder",
                 pixels);
   }
@@ -724,7 +729,7 @@ REX_HOOK_RAW(rex_ImageCache_WaitFence_YAHXZ) {
       ns.fetch_add(uint64_t((std::chrono::steady_clock::now() - t0).count()),
                    std::memory_order_relaxed);
   if ((n % 200) == 0) {
-    REXGPU_WARN("nx1_d3d9: IMGFENCE {} calls, {} armed, {} ms total | last ret={} "
+    NX1_LOGW_DMA("nx1_d3d9: IMGFENCE {} calls, {} armed, {} ms total | last ret={} "
                 "pending={} fence={:08X} -> {:08X}",
                 n, armed.load(), total / 1000000, ctx.r3.u32, pending_before, fence_before,
                 nx1::d3d9::GuestRead32(base, kImgCacheFence));
@@ -819,7 +824,7 @@ bool ClassifyDmaSource(const uint8_t* base, uint32_t src, uint32_t bytes) {
   // that region, then mirroring it -- however correctly -- could never have fixed them, and
   // hours of work were aimed at the wrong memory. A 16 MB-region histogram settles it.
   if ((n % 2000) == 0) {
-    REXGPU_WARN("nx1_d3d9: DMASRC {} copies | {} from EMPTY source, {} from low-variance "
+    NX1_LOGW_DMA("nx1_d3d9: DMASRC {} copies | {} from EMPTY source, {} from low-variance "
                 "source -- a high share means the mirror is propagating garbage, i.e. the data "
                 "never reaches CPU RAM at all",
                 n, empty.load(), lowvar.load());
@@ -982,7 +987,7 @@ void VerifyPendingDma(const uint8_t* base) {
           std::fwrite(dbuf.data(), 1, dbuf.size(), f);
           std::fclose(f);
         }
-        REXGPU_WARN("nx1_d3d9: DMADUMP dst={:08X} src={:08X} {} bytes -> texdump/dma_*_src.bin "
+        NX1_LOGW_DMA("nx1_d3d9: DMADUMP dst={:08X} src={:08X} {} bytes -> texdump/dma_*_src.bin "
                     "and _dst.bin ({}% identical)",
                     e.dst, e.src, dump_bytes, same * 100 / compared);
       }
@@ -995,7 +1000,7 @@ void VerifyPendingDma(const uint8_t* base) {
       exact.fetch_add(1, std::memory_order_relaxed);
     }
     if (k <= 12 || (k % 500) == 0) {
-      REXGPU_WARN("nx1_d3d9: DMAVERIFY dst={:08X} src={:08X} {} bytes | {}% identical, first "
+      NX1_LOGW_DMA("nx1_d3d9: DMAVERIFY dst={:08X} src={:08X} {} bytes | {}% identical, first "
                   "difference at {} | source itself moved {}% while we waited | running: {} "
                   "copies, {} byte-exact, {}% mean",
                   e.dst, e.src, e.bytes, pct, first_bad, src_moved * 100 / compared, k,
@@ -1084,7 +1089,7 @@ void NoteDmaChain(uint32_t dst, uint32_t src, uint32_t bytes, bool src_empty) {
     }
     if (reported.fetch_add(1, std::memory_order_relaxed) < 24) {
       if (known) {
-        REXGPU_WARN("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY -- that source was itself "
+        NX1_LOGW_DMA("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY -- that source was itself "
                     "the destination of a copy from {:08X} ({} bytes) which we {}, so the break "
                     "is UPSTREAM",
                     dst, src, it->second.src, it->second.bytes,
@@ -1125,7 +1130,7 @@ void NoteDmaChain(uint32_t dst, uint32_t src, uint32_t bytes, bool src_empty) {
           case WV::kNever:
             break;
         }
-        REXGPU_WARN("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY and NEVER a DMA destination "
+        NX1_LOGW_DMA("nx1_d3d9: DMACHAIN dst={:08X} src={:08X} EMPTY and NEVER a DMA destination "
                     "-- an ORIGIN. Observed writes to its first two pages: {} and {}. It is {}",
                     dst, src, w0, w1, why);
       }
@@ -1137,7 +1142,7 @@ void NoteDmaChain(uint32_t dst, uint32_t src, uint32_t bytes, bool src_empty) {
     // so the totals line -- the only unbiased view -- never printed at all and the conclusion had
     // to be drawn from the first 24 occurrences.
     if ((reported.load() % 200) == 0) {
-      REXGPU_WARN("nx1_d3d9: DMACHAIN totals: {} empty sources traced UPSTREAM ({} to a copy we "
+      NX1_LOGW_DMA("nx1_d3d9: DMACHAIN totals: {} empty sources traced UPSTREAM ({} to a copy we "
                   "skipped -- break propagates; {} to one we DID mirror -- our write missed), {} "
                   "are ORIGINS never written by any copy we see. As resolve destinations those "
                   "empty sources are: {} never resolved, {} written back (yet still empty), {} "
@@ -1276,7 +1281,7 @@ void NoteDmaCoverage(uint32_t dst, uint32_t bytes, uint32_t alt) {
   if (g_dma_cover.size() > 400000) {
     static std::atomic<uint64_t> capped{0};
     if ((capped.fetch_add(1, std::memory_order_relaxed) % 10000) == 0) {
-      REXGPU_WARN("nx1_d3d9: DMACOVER map hit its {} entry cap -- coverage verdicts from here on "
+      NX1_LOGW_DMA("nx1_d3d9: DMACOVER map hit its {} entry cap -- coverage verdicts from here on "
                   "are UNRELIABLE (pages will read as 'never targeted' merely because we stopped "
                   "recording)",
                   g_dma_cover.size());
@@ -1416,7 +1421,7 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
     static std::atomic<uint64_t> moves{0};
     const uint64_t m = moves.fetch_add(1, std::memory_order_relaxed) + 1;
     if (m <= 8 || (m % 5000) == 0) {
-      REXGPU_WARN("nx1_d3d9: DMAMOVE #{} dst={:08X} src={:08X} {} bytes (src-dst {:+d}) -- source "
+      NX1_LOGW_DMA("nx1_d3d9: DMAMOVE #{} dst={:08X} src={:08X} {} bytes (src-dst {:+d}) -- source "
                   "and destination OVERLAP, so this is a pool compaction: copying verbatim in "
                   "memmove order, skipping and deferring disabled",
                   m, dst, src, bytes, int64_t(sphys) - int64_t(dphys));
@@ -1501,7 +1506,7 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
             g_dma_retry.push_back(
                 {dst + off, src + off, chunk, seq, std::chrono::steady_clock::now()});
           } else if ((dropped.fetch_add(1, std::memory_order_relaxed) % 5000) == 0) {
-            REXGPU_WARN("nx1_d3d9: DMARETRY queue full, {} deferred pages dropped -- those slots "
+            NX1_LOGW_DMA("nx1_d3d9: DMARETRY queue full, {} deferred pages dropped -- those slots "
                         "keep their previous occupant",
                         dropped.load());
           }
@@ -1515,7 +1520,7 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
       // screenshots than the skipping ones. Counted so the harm is a number, not an impression.
       const uint64_t k = g_dma_blanked.fetch_add(1, std::memory_order_relaxed) + 1;
       if ((k % 20000) == 0) {
-        REXGPU_WARN("nx1_d3d9: DMABLANK {} destination pages overwritten with ZEROS by verbatim "
+        NX1_LOGW_DMA("nx1_d3d9: DMABLANK {} destination pages overwritten with ZEROS by verbatim "
                     "copying (empty source page). Each one erases whatever texels the slot already "
                     "held -- this is the black banding",
                     k);
@@ -1703,7 +1708,7 @@ void DrainDmaRetries(uint8_t* base) {
     // because it compared the clobber count against `filled` -- and with dropping enabled a
     // clobbered retry is never applied, so it never reaches `filled` at all. The two are disjoint
     // outcomes, not a subset. Report them as disjoint.
-    REXGPU_WARN("nx1_d3d9: DMARETRY SRCCLOBBER {} retries had their SOURCE overwritten while "
+    NX1_LOGW_DMA("nx1_d3d9: DMARETRY SRCCLOBBER {} retries had their SOURCE overwritten while "
                 "queued and were {} ({} other retries applied normally). Nonzero means a later "
                 "copy recycled the staging page underneath a deferred copy",
                 clobbered.load(),
@@ -1713,7 +1718,7 @@ void DrainDmaRetries(uint8_t* base) {
     // zeros included, so this is the count of destination pages we ourselves emptied. Compare it
     // against POOLWATCH's degraded/partial figures -- if it is large, verbatim is trading the
     // page-duplication artifact for a blanking one.
-    REXGPU_WARN("nx1_d3d9: DMABLANK total {} destination pages overwritten with ZEROS by verbatim "
+    NX1_LOGW_DMA("nx1_d3d9: DMABLANK total {} destination pages overwritten with ZEROS by verbatim "
                 "copying (verbatim={})",
                 g_dma_blanked.load(), REXCVAR_GET(nx1_d3d9_dma_verbatim) ? "on" : "off");
     REXGPU_WARN("nx1_d3d9: DMADENSITY total {} copies refused as less populated than their "
@@ -1721,7 +1726,7 @@ void DrainDmaRetries(uint8_t* base) {
                 "screen: the target is native approaching Xenia's 11650/2564",
                 g_dma_density_refused.load(),
                 REXCVAR_GET(nx1_d3d9_dma_density_guard) ? "on" : "off");
-    REXGPU_WARN("nx1_d3d9: DMARETRY {} deferred copies LANDED (mean {} us late), {} abandoned "
+    NX1_LOGW_DMA("nx1_d3d9: DMARETRY {} deferred copies LANDED (mean {} us late), {} abandoned "
                 "still-empty, {} dropped as stale, {} still queued. Landed>0 means the source "
                 "was simply NOT YET FILLED at call time and we now recover it",
                 k, k ? latency_us.load() / k : 0, abandoned.load(), stale.load(), queued);
@@ -1769,7 +1774,7 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
         std::max(tracked[ti].span ? tracked[ti].span : REXCVAR_GET(nx1_d3d9_dbg_track_bytes), 1u);
     if (dphys < tphys + tspan && tphys < dphys + bytes) {
       const int64_t rel = int64_t(dphys) - int64_t(tphys);
-      REXGPU_WARN("nx1_d3d9: TRACK {:08X} DMACOPY dst={:08X} (phys {:08X}) src={:08X} {} bytes "
+      NX1_LOGW_TEX("nx1_d3d9: TRACK {:08X} DMACOPY dst={:08X} (phys {:08X}) src={:08X} {} bytes "
                   "-- lands on the tracked texture at offset {:+d} ({:+d} pages){}",
                   track, dst, dphys, src, bytes, rel, rel / 4096,
                   (rel % 4096) ? "  *** NOT PAGE ALIGNED ***" : "");
@@ -1922,10 +1927,10 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
   const uint64_t tb = total_bytes.fetch_add(a5, std::memory_order_relaxed) + a5;
   if (n < 32) {
-    REXGPU_WARN("nx1_d3d9: DMACOPY dst={:08X} src={:08X} a5={:08X} a6={:08X}", dst, src, a5, a6);
+    NX1_LOGW_DMA("nx1_d3d9: DMACOPY dst={:08X} src={:08X} a5={:08X} a6={:08X}", dst, src, a5, a6);
   }
   if ((n % 100) == 99) {  // fine-grained: the D3D9-mode run never even reached the old 500
-    REXGPU_WARN("nx1_d3d9: DMACOPY volume {} calls, {} MiB total", n + 1, tb >> 20);
+    NX1_LOGW_DMA("nx1_d3d9: DMACOPY volume {} calls, {} MiB total", n + 1, tb >> 20);
   }
   if (mode >= 2) {
     // a5 confirmed as the byte count by the logged run: clean page multiples, and dst/size

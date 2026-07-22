@@ -11,6 +11,8 @@
 // FormatInfo, for the level-0 guest size recorded with each picked texture (see PickTex).
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/logging/macros.h>
+
+#include "d3d9_log.h"
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/window.h>
@@ -238,6 +240,28 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_surface_lo, 0, "GPU",
 /// DECODECHANGE events, zero reverting), so if the artifact is a momentary wrong texture it
 /// has to be the binding, not the decode. Requiring a return to the PREVIOUS address is what
 /// separates a one-frame excursion from ordinary LOD progression through a sequence.
+/// MEASURE THE DRAW->DECODE WINDOW -- the one hypothesis still standing.
+///
+/// nx1_d3d9_async = false nearly eliminated the speckle, but that A/B is confounded: it also
+/// drops the frame rate, and frame time is itself an input (15 FPS was far worse than 60+).
+/// This measures the mechanism directly with async ON and the frame rate untouched -- how
+/// often the bytes under a bound texture CHANGED between the draw that recorded it and the
+/// decode that read it. Control: with async off it must read ~zero by construction, and a
+/// nonzero reading there would mean the fingerprint itself is unreliable.
+/// Capture a bound texture's bytes into the CPU mirror at DRAW time instead of leaving the
+/// decode to read them later on the worker. Closes the draw->decode window measured by
+/// nx1_d3d9_dbg_window (1762 events / 0.044% of sampler-0 draws with async on, 0 of 8.5M
+/// with it off). Cheap in principle -- the mirror skips pages already valid -- but it runs on
+/// the guest thread, which PROF/bound shows is the longer pole, so measure PROF before
+/// trusting it. Sampler 0 only for now: the colormap is the visible artifact.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_prefetch_at_draw, false, "GPU",
+                    "Snapshot a bound texture into the mirror at draw time, so the decode "
+                    "reads the bytes that were there when the descriptor was captured");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_window, false, "GPU",
+                    "Count how often a bound texture's guest bytes changed between the draw "
+                    "recording it and the decode reading it -- the async draw-to-decode window");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_flicker_bind, false, "GPU",
                     "Log when a surface binds a different texture and then returns to the "
                     "previous one -- the one-frame flicker at the binding layer");
@@ -831,7 +855,7 @@ void Renderer::BeginFrame() {
     pick_requested_.store(false, std::memory_order_relaxed);
     pick_count_ = 0;
     pick_results_.clear();
-    REXGPU_INFO("nx1_d3d9: PICK armed at ({:.3f}, {:.3f}) of the window, box {}px",
+    NX1_LOGI_MISC("nx1_d3d9: PICK armed at ({:.3f}, {:.3f}) of the window, box {}px",
                 pick_nx_, pick_ny_,
                 REXCVAR_GET(nx1_d3d9_dbg_pick_size) ? REXCVAR_GET(nx1_d3d9_dbg_pick_size) : 8);
   }
@@ -880,7 +904,7 @@ void Renderer::Present() {
       for (uint32_t k = 0; k < e.tex_count; ++k) ph.tex[k] = e.tex[k];
       // Every field the selection heuristic uses, so a wrong pick can be diagnosed from the log
       // instead of by guessing which filter rejected the surface.
-      REXGPU_INFO("nx1_d3d9: PICK hit #{} px={} ps={:08X} vs={:08X} rt={:08X} ztest={} zwrite={} "
+      NX1_LOGI_MISC("nx1_d3d9: PICK hit #{} px={} ps={:08X} vs={:08X} rt={:08X} ztest={} zwrite={} "
                   "ucode=0x{:016X} lo32={} s0={:08X} ({}x{} fmt={})",
                   i, pixels, e.ps_object, e.vs_object, e.rt_surface, e.depth_test ? 1 : 0,
                   e.depth_write ? 1 : 0, e.ps_hash, uint32_t(e.ps_hash & 0xFFFFFFFFu),
@@ -923,12 +947,12 @@ void Renderer::Present() {
         r.main_pass = (r.rt_surface == main_rt);
         kept += r.main_pass ? 1 : 0;
       }
-      REXGPU_INFO("nx1_d3d9: PICK done -- {} of {} draws covered the box; {} on the main target "
+      NX1_LOGI_MISC("nx1_d3d9: PICK done -- {} of {} draws covered the box; {} on the main target "
                   "{:08X}, the rest are other passes (shadow / reflection) and are not on screen "
                   "at that pixel",
                   hits, pick_count_, kept, main_rt);
     } else {
-      REXGPU_INFO("nx1_d3d9: PICK done -- no draw covered the box ({} draws tested)", pick_count_);
+      NX1_LOGI_MISC("nx1_d3d9: PICK done -- no draw covered the box ({} draws tested)", pick_count_);
     }
     device_->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
     pick_active_ = false;
@@ -1022,7 +1046,7 @@ void Renderer::Present() {
   // refreshed the cache entries' last_frame within this frame.
   last_sig_valid_ = false;
   if (REXCVAR_GET(nx1_d3d9_record) && REXCVAR_GET(nx1_d3d9_profile) && !cmdbuf_.draws().empty()) {
-    REXGPU_INFO("nx1_d3d9: PROF/record {} draws, {} constant deltas, {:.2f} MB, {:.2f} ms",
+    NX1_LOGI_STATS("nx1_d3d9: PROF/record {} draws, {} constant deltas, {:.2f} MB, {:.2f} ms",
                 cmdbuf_.draws().size(), cmdbuf_.delta_count(),
                 double(cmdbuf_.captured_bytes()) / (1024.0 * 1024.0), prof_record_ns_ / 1e6);
   }
@@ -1055,14 +1079,14 @@ void Renderer::Present() {
       const auto tp = ResourceTracker::Get().TakeTextureProfile();
       const double tf = 1.0 / (1e6 * prof_frames);
       // Splits the textures phase: cache resolution vs rebuild, and the rebuild into its stages.
-      REXGPU_INFO("nx1_d3d9: PROF/tex lookup={:.2f} upload={:.2f} ms/frame over {:.1f} rebuilds/frame "
+      NX1_LOGI_STATS("nx1_d3d9: PROF/tex lookup={:.2f} upload={:.2f} ms/frame over {:.1f} rebuilds/frame "
                   "| stage={:.2f} decode={:.2f} mipgen={:.2f} commit={:.2f} ms | {:.0f} us/rebuild",
                   tp.lookup_ns * tf, tp.upload_ns * tf, double(tp.uploads) / prof_frames,
                   tp.stage_ns * tf, tp.decode_ns * tf, tp.mipgen_ns * tf, tp.commit_ns * tf,
                   tp.uploads ? double(tp.upload_ns) / (1e3 * tp.uploads) : 0.0);
       // Why the rebuilds happen, and at what memory cost -- the two numbers that decide whether
       // the fix is the commit policy, the eviction policy, or the streaming pool.
-      REXGPU_INFO("nx1_d3d9: PROF/tex why: new={:.1f} layout={:.1f} dirty={:.1f} zero={:.1f} per "
+      NX1_LOGI_STATS("nx1_d3d9: PROF/tex why: new={:.1f} layout={:.1f} dirty={:.1f} zero={:.1f} per "
                   "frame | {:.2f} MB/frame decoded ({:.1f} GB/s effective)",
                   double(tp.why_new) / prof_frames, double(tp.why_layout) / prof_frames,
                   double(tp.why_dirty) / prof_frames, double(tp.why_zero) / prof_frames,
@@ -1072,7 +1096,7 @@ void Renderer::Present() {
       // draws write no constants, so a much lower skip rate means another condition is
       // blocking it -- most likely the ring generation, which bumps on every
       // GpuBeginShaderConstantF4 (i.e. every model's world matrix).
-      REXGPU_INFO("nx1_d3d9: PROF/const skipped vs={:.0f}% ps={:.0f}% of {:.0f} draws/frame",
+      NX1_LOGI_STATS("nx1_d3d9: PROF/const skipped vs={:.0f}% ps={:.0f}% of {:.0f} draws/frame",
                   100.0 * prof_const_skipped_vs_ / (prof_draws_ ? prof_draws_ : 1),
                   100.0 * prof_const_skipped_ps_ / (prof_draws_ ? prof_draws_ : 1),
                   double(prof_draws_) / prof_frames);
@@ -1081,7 +1105,7 @@ void Renderer::Present() {
       // What fraction of draws leave each guest dirty mask untouched, and what fraction
       // continue the previous draw's index range. These are the two ceilings: skipping
       // unchanged state, and merging adjacent draws.
-      REXGPU_INFO("nx1_d3d9: PROF/dirty clear%: m0={:.0f} m1={:.0f} m2={:.0f} m3={:.0f} m4={:.0f} "
+      NX1_LOGI_STATS("nx1_d3d9: PROF/dirty clear%: m0={:.0f} m1={:.0f} m2={:.0f} m3={:.0f} m4={:.0f} "
                   "| unchanged%: m0={:.0f} m1={:.0f} m2={:.0f} m3={:.0f} m4={:.0f} "
                   "| contiguous draws {:.0f}%",
                   100.0 * prof_mask_clear_[0] / (prof_draws_ ? prof_draws_ : 1),
@@ -1100,18 +1124,18 @@ void Renderer::Present() {
         prof_mask_same_[i] = 0;
       }
       prof_contiguous_draws_ = 0;
-      REXGPU_INFO("nx1_d3d9: PROF/shd outer hash={:.2f} lookup={:.2f} bind+upload={:.2f} ms/frame",
+      NX1_LOGI_STATS("nx1_d3d9: PROF/shd outer hash={:.2f} lookup={:.2f} bind+upload={:.2f} ms/frame",
                   prof_hash_ns_ * tf, prof_lookup_ns_ * tf, prof_shbind_ns_ * tf);
       prof_hash_ns_ = prof_lookup_ns_ = prof_shbind_ns_ = 0;
       const auto sp = ShaderCache::Get().TakeShaderProfile();
-      REXGPU_INFO("nx1_d3d9: PROF/shd literals={:.2f} read={:.2f} window={:.2f} defs={:.2f} ms/frame "
+      NX1_LOGI_STATS("nx1_d3d9: PROF/shd literals={:.2f} read={:.2f} window={:.2f} defs={:.2f} ms/frame "
                   "| {:.0f} uploads/frame, {:.1f} regs + {:.1f} defs each",
                   sp.literals_ns * tf, sp.read_ns * tf, sp.window_ns * tf, sp.defs_ns * tf,
                   double(sp.calls) / prof_frames,
                   sp.calls ? double(sp.registers) / double(sp.calls) : 0.0,
                   sp.calls ? double(sp.def_writes) / double(sp.calls) : 0.0);
       const auto vp = ResourceTracker::Get().TakeVertexProfile();
-      REXGPU_INFO("nx1_d3d9: PROF/vb layout={:.2f} buffer={:.2f} ms/frame | inside buffer: "
+      NX1_LOGI_STATS("nx1_d3d9: PROF/vb layout={:.2f} buffer={:.2f} ms/frame | inside buffer: "
                   "fast={:.2f} hash={:.2f} convert={:.2f} ms over {:.0f} calls, "
                   "{:.1f} hashes ({:.2f} MB) {:.1f} converts ({:.2f} MB) per frame",
                   prof_vlayout_ns_ * tf, prof_vbuffer_ns_ * tf,
@@ -1121,25 +1145,25 @@ void Renderer::Present() {
                   double(vp.hash_bytes) / (1024.0 * 1024.0 * prof_frames),
                   double(vp.converts) / prof_frames,
                   double(vp.convert_bytes) / (1024.0 * 1024.0 * prof_frames));
-      REXGPU_INFO("nx1_d3d9: PROF/vb dynamic converts {:.1f} of {:.1f} per frame",
+      NX1_LOGI_STATS("nx1_d3d9: PROF/vb dynamic converts {:.1f} of {:.1f} per frame",
                   double(vp.dynamic_converts) / prof_frames,
                   double(vp.converts) / prof_frames);
       prof_vlayout_ns_ = prof_vbuffer_ns_ = 0;
-      REXGPU_INFO("nx1_d3d9: PROF/vtx decl skipped {:.1f}% of {:.0f} | stream skipped {:.1f}% of {:.0f} per frame",
+      NX1_LOGI_STATS("nx1_d3d9: PROF/vtx decl skipped {:.1f}% of {:.0f} | stream skipped {:.1f}% of {:.0f} per frame",
                   prof_decl_calls_ ? 100.0 * double(prof_decl_skips_) / double(prof_decl_calls_) : 0.0,
                   double(prof_decl_calls_) / prof_frames,
                   prof_stream_calls_ ? 100.0 * double(prof_stream_skips_) / double(prof_stream_calls_) : 0.0,
                   double(prof_stream_calls_) / prof_frames);
       prof_decl_skips_ = prof_decl_calls_ = prof_stream_skips_ = prof_stream_calls_ = 0;
       const auto lp = ResourceTracker::Get().TakeLodProfile();
-      REXGPU_INFO("nx1_d3d9: PROF/lod calls={:.0f} no_surface={:.0f} fresh={:.1f} adopt={:.1f} "
+      NX1_LOGI_STATS("nx1_d3d9: PROF/lod calls={:.0f} no_surface={:.0f} fresh={:.1f} adopt={:.1f} "
                   "equal={:.1f} (same={:.1f} diff={:.1f}) substitute={:.1f} per frame",
                   double(lp.calls) / prof_frames, double(lp.no_surface) / prof_frames,
                   double(lp.fresh) / prof_frames, double(lp.adopt) / prof_frames,
                   double(lp.equal) / prof_frames, double(lp.equal_same) / prof_frames,
                   double(lp.equal_diff) / prof_frames, double(lp.substitute) / prof_frames);
       if (prof_blend_match_draws_) {
-        REXGPU_INFO("nx1_d3d9: PROF/blendmatch {:.1f} draws/frame match the isolate filter",
+        NX1_LOGI_STATS("nx1_d3d9: PROF/blendmatch {:.1f} draws/frame match the isolate filter",
                     double(prof_blend_match_draws_) / prof_frames);
         prof_blend_match_draws_ = 0;
       }
@@ -1148,7 +1172,7 @@ void Renderer::Present() {
       // added cost, and the phase timing alone cannot tell the difference.
       {
         const uint64_t total = prof_shader_memo_hits_ + prof_shader_memo_misses_;
-        REXGPU_INFO("nx1_d3d9: PROF/shmemo {:.1f}% hit of {:.0f} resolves/frame",
+        NX1_LOGI_STATS("nx1_d3d9: PROF/shmemo {:.1f}% hit of {:.0f} resolves/frame",
                     total ? 100.0 * double(prof_shader_memo_hits_) / double(total) : 0.0,
                     double(total) / prof_frames);
         prof_shader_memo_hits_ = prof_shader_memo_misses_ = 0;
@@ -1164,12 +1188,12 @@ void Renderer::Present() {
         // small (a 276 ms stall printed as 4.6 ms). These two are per-frame peaks already, so
         // they need a plain ns -> ms conversion.
         static constexpr double kNsToMs = 1.0 / 1e6;
-        REXGPU_INFO("nx1_d3d9: PROF/hitch worst frame {:.1f} ms ({:.1f} ms of it blocked on the "
+        NX1_LOGI_STATS("nx1_d3d9: PROF/hitch worst frame {:.1f} ms ({:.1f} ms of it blocked on the "
                     "worker, {:.1f} ms recording)",
                     prof_frame_max_ns_ * kNsToMs, prof_frame_max_drain_ns_ * kNsToMs,
                     prof_frame_max_record_ns_ * kNsToMs);
         prof_frame_max_ns_ = prof_frame_max_drain_ns_ = prof_frame_max_record_ns_ = 0;
-        REXGPU_INFO("nx1_d3d9: PROF/bound guest waited {:.2f} ms/frame for the worker, worker "
+        NX1_LOGI_STATS("nx1_d3d9: PROF/bound guest waited {:.2f} ms/frame for the worker, worker "
                     "starved {:.2f} ms/frame -- limited by {}",
                     drain_ms, idle_ms,
                     drain_ms > idle_ms * 2.0   ? "TRANSLATION (worker)"
@@ -1183,7 +1207,7 @@ void Renderer::Present() {
       // between-draws=886 ms/frame. An instrument that silently becomes nonsense when its
       // assumption breaks is worse than no instrument, so it stays quiet instead.
       if (!worker_active_) {
-        REXGPU_INFO("nx1_d3d9: PROF/defer guest work: pre-draw={:.2f} between-draws={:.2f} "
+        NX1_LOGI_STATS("nx1_d3d9: PROF/defer guest work: pre-draw={:.2f} between-draws={:.2f} "
                     "post-draw={:.2f} ms/frame",
                     prof_gap_before_first_ns_ * tf, prof_gap_between_ns_ * tf,
                     prof_gap_after_last_ns_ * tf);
@@ -1195,7 +1219,7 @@ void Renderer::Present() {
       for (uint32_t k = 0; k < 3; ++k) {
         const uint64_t total = prof_stable_ok_kind_[k] + prof_stable_changed_kind_[k];
         const uint64_t xtotal = prof_xframe_ok_[k] + prof_xframe_changed_[k];
-        REXGPU_INFO("nx1_d3d9: PROF/stability {:<6} in-frame {:.2f}% unchanged ({} of {}) | "
+        NX1_LOGI_STATS("nx1_d3d9: PROF/stability {:<6} in-frame {:.2f}% unchanged ({} of {}) | "
                     "CROSS-FRAME {:.2f}% unchanged ({} changed of {})",
                     kKindName[k],
                     total ? 100.0 * double(prof_stable_ok_kind_[k]) / double(total) : 0.0,
@@ -1208,13 +1232,13 @@ void Renderer::Present() {
       }
       prof_gap_before_first_ns_ = prof_gap_between_ns_ = prof_gap_after_last_ns_ = 0;
       prof_stable_ok_ = prof_stable_changed_ = 0;
-      REXGPU_INFO("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
+      NX1_LOGI_STATS("nx1_d3d9: PROF/bind skipped {:.1f}% of {:.0f} texture binds/frame",
                   prof_bind_calls_ ? 100.0 * double(prof_bind_skips_) / double(prof_bind_calls_)
                                    : 0.0,
                   double(prof_bind_calls_) / prof_frames);
       prof_bind_skips_ = prof_bind_calls_ = 0;
       const double f = 1.0 / (1e6 * prof_frames);  // ns totals -> ms per frame
-      REXGPU_INFO("nx1_d3d9: PROF/frame draws={} | viewport={:.2f} shaders={:.2f} indices={:.2f} "
+      NX1_LOGI_STATS("nx1_d3d9: PROF/frame draws={} | viewport={:.2f} shaders={:.2f} indices={:.2f} "
                   "streams={:.2f} textures={:.2f} states={:.2f} draw={:.2f} present={:.2f} ms "
                   "samp/draw={:.1f} | FRAME={:.2f} outside={:.2f}",
                   prof_draws_ / prof_frames, prof_viewport_ns_ * f, prof_shaders_ns_ * f,
@@ -1540,7 +1564,7 @@ void Renderer::ResolveCopy(const uint8_t* base, const RecordedCommand& c) {
     static std::atomic<uint64_t> flag_only{0};
     const uint64_t k = flag_only.fetch_add(1, std::memory_order_relaxed) + 1;
     if (k <= 8 || (k % 5000) == 0) {
-      REXGPU_WARN("nx1_d3d9: RESOLVESRC flag says DEPTHSTENCIL while the destination format is {} "
+      NX1_LOGW_MISC("nx1_d3d9: RESOLVESRC flag says DEPTHSTENCIL while the destination format is {} "
                   "(a colour format) -- taking the depth path on the flag's word, which the format "
                   "heuristic alone would have missed. {} such resolves",
                   dest.format, k);
@@ -1552,7 +1576,7 @@ void Renderer::ResolveCopy(const uint8_t* base, const RecordedCommand& c) {
     static std::atomic<uint64_t> mrt{0};
     const uint64_t k = mrt.fetch_add(1, std::memory_order_relaxed) + 1;
     if (k <= 4 || (k % 5000) == 0) {
-      REXGPU_WARN("nx1_d3d9: RESOLVESRC asked for RENDERTARGET{} but only target 0 is bound -- "
+      NX1_LOGW_MISC("nx1_d3d9: RESOLVESRC asked for RENDERTARGET{} but only target 0 is bound -- "
                   "resolving target 0 instead ({} such resolves)",
                   source_select, k);
     }
@@ -2290,7 +2314,7 @@ void NoteRenderStateCensus(const uint8_t* base, uint32_t device) {
     blendfactor_seen.fetch_add(1, std::memory_order_relaxed);
   }
   if ((n.fetch_add(1, std::memory_order_relaxed) % 200000) == 0) {
-    REXGPU_WARN("nx1_d3d9: HWCENSUS state: stencil {}x | poly_offset {}x | alpha_to_mask {}x | "
+    NX1_LOGW_STATS("nx1_d3d9: HWCENSUS state: stencil {}x | poly_offset {}x | alpha_to_mask {}x | "
                 "const_blend_factor {}x | persp_corr_disable {}x | primitive_restart {}x | "
                 "vte_vtx_fmt mask 0x{:X} (bit0=VtxXyFmt bit1=VtxZFmt bit2=VtxW0Fmt) | fill bits "
                 "0x{:X} (0 = always plain solid, so our unconditional FILLMODE is harmless)",
@@ -2691,14 +2715,14 @@ void Renderer::ApplyRenderStates(const RecordedDraw& d) {
       } else if (ps_seen.size() < kMaxBlendPsMaterials) {
         ps_index = int32_t(ps_seen.size());
         ps_seen.push_back({d.ps_object, 1});
-        REXGPU_INFO("nx1_d3d9: BLENDPS #{} ps={:08X} vs={:08X} -- set nx1_d3d9_dbg_blend_ps to "
+        NX1_LOGI_MISC("nx1_d3d9: BLENDPS #{} ps={:08X} vs={:08X} -- set nx1_d3d9_dbg_blend_ps to "
                     "this ps value to isolate this material by itself",
                     ps_seen.size() - 1, d.ps_object, d.vs_object);
         // Say when the list is truncated. A capped list that does not announce itself reads as a
         // COMPLETE enumeration, and a search over it would silently exclude the answer -- the
         // same class of quiet-truncation error as an unarmed filter reading as a real negative.
         if (ps_seen.size() == kMaxBlendPsMaterials) {
-          REXGPU_INFO("nx1_d3d9: BLENDPS list FULL at {} -- more materials exist but are not "
+          NX1_LOGI_MISC("nx1_d3d9: BLENDPS list FULL at {} -- more materials exist but are not "
                       "listed; an INDEX search cannot reach them (they get no index) and a search "
                       "over this list is NOT exhaustive",
                       kMaxBlendPsMaterials);
@@ -2999,6 +3023,47 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // Decoded once here and handed to GetTexture: the sampler state below needs the same
     // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
     const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(sampler));
+
+    // DRAW->DECODE WINDOW, MEASURED. d.s0_fingerprint was taken on the guest thread when this draw
+    // was recorded; re-read the same bytes now, on the worker, immediately before the decode uses
+    // them. A mismatch is that slot being recycled inside the window -- the mechanism itself,
+    // counted, with async ON and the frame rate untouched. That matters because the async=false
+    // A/B is confounded: it also drops the frame rate, and frame time is separately known to be an
+    // input to the artifact.
+    if (sampler == 0 && REXCVAR_GET(nx1_d3d9_dbg_window) && d.s0_fingerprint && d.s0_addr &&
+        t.valid && t.base_address == d.s0_addr) {
+      static std::atomic<uint64_t> checked{0}, changed{0}, unreadable{0}, decode_stale{0};
+      const uint64_t now_fp = GuestTextureFingerprint(d.s0_addr, 64);
+      const uint64_t n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (!now_fp) {
+        unreadable.fetch_add(1, std::memory_order_relaxed);
+      } else if (now_fp != d.s0_fingerprint) {
+        changed.fetch_add(1, std::memory_order_relaxed);
+      }
+      // THE ONE THAT GRADES THE FIX. `changed` above compares LIVE bytes on both sides, so the
+      // draw-time prefetch cannot move it -- the prefetch changes what the DECODE reads, not what
+      // guest memory does. This compares what the decode will actually read (through the mirror)
+      // against what live memory held when the descriptor was captured. Equal = the decode is
+      // paired with the right bytes, which is the whole point of the fix.
+      if (const uint64_t mirror_fp = ResourceTracker::Get().MirrorFingerprint(d.s0_addr, 64);
+          mirror_fp && mirror_fp != d.s0_fingerprint) {
+        decode_stale.fetch_add(1, std::memory_order_relaxed);
+      }
+      // Unconditional on a cadence, INCLUDING zero, and carrying its denominator -- a bare zero
+      // would be indistinguishable from "never ran", which is this project's costliest mistake and
+      // which this very instrument already fell into once (the compare site was missing entirely
+      // and the silence read as a measurement).
+      if ((n % 500000) == 1) {
+        const uint64_t c = changed.load(std::memory_order_relaxed);
+        const uint64_t ds = decode_stale.load(std::memory_order_relaxed);
+        REXGPU_WARN("nx1_d3d9: WINDOW {} sampler-0 draws | guest memory CHANGED between draw and "
+                    "decode: {} ({:.3f}%) -- the diagnosis, unaffected by any fix | DECODE READS "
+                    "STALE BYTES: {} ({:.3f}%) -- THIS is what nx1_d3d9_prefetch_at_draw must drive "
+                    "to ~0, and the number to judge the fix by | {} unreadable",
+                    n, c, 100.0 * double(c) / double(n), ds, 100.0 * double(ds) / double(n),
+                    unreadable.load(std::memory_order_relaxed));
+      }
+    }
     // THE FLICKER, AT THE BINDING LEVEL.
     //
     // The decode-level detector is armed and reports a clean negative: 932 DECODECHANGE events,
@@ -3173,7 +3238,7 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
         // runs than any actual bug.
         if (reported < 40 || (total_swaps % 2000) == 0) {
           ++reported;
-          REXGPU_WARN("nx1_d3d9: TEXSWAP surface={:016X} s{} {:08X} -> {:08X} after {} frames "
+          NX1_LOGW_TEX("nx1_d3d9: TEXSWAP surface={:016X} s{} {:08X} -> {:08X} after {} frames "
                       "(swap #{} for this surface, {} total). The synthetic-texture colour is "
                       "keyed to base_address, so this is what makes a wall change colour. "
                       "{} same-frame collisions discarded. {} | old {}/1024 vs new {}/1024 "
@@ -3561,7 +3626,7 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
         track_n && dump_ps && d.ps_object == dump_ps && sampler == track_n - 1 && t.base_address &&
         REXCVAR_GET(nx1_d3d9_dbg_track_addr) != t.base_address) {
       REXCVAR_SET(nx1_d3d9_dbg_track_addr, t.base_address);
-      REXGPU_INFO("nx1_d3d9: TRACKFOLLOW ps={:08X} sampler={} -> {:08X} ({}x{} fmt={})",
+      NX1_LOGI_TEX("nx1_d3d9: TRACKFOLLOW ps={:08X} sampler={} -> {:08X} ({}x{} fmt={})",
                   dump_ps, sampler, t.base_address, t.width, t.height, t.format);
     }
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, t, sampler);
@@ -3796,6 +3861,29 @@ void Renderer::CaptureDrawState(const uint8_t* base, uint32_t guest_device, Reco
     }
   }
 
+  // DRAW->DECODE WINDOW: fingerprint sampler 0's texture bytes NOW, on the guest thread, so the
+  // worker can tell whether the slot was recycled before it decoded. Slot 0 only, and a short
+  // prefix, because this sits on the thread PROF/bound shows is the longer pole.
+  if (REXCVAR_GET(nx1_d3d9_dbg_window)) {
+    const TextureFetchConstant t0 =
+        DecodeTextureFetchConstant(reinterpret_cast<const uint8_t*>(d.fetch_constants));
+    if (t0.valid && t0.base_address) {
+      d.s0_addr = t0.base_address;
+      d.s0_fingerprint = GuestTextureFingerprint(t0.base_address, 64);
+    }
+  }
+  // THE FIX: capture the texture's bytes into the mirror NOW, on the guest thread, at the same
+  // instant the descriptor above was snapshotted. The decode reads through the mirror, so it then
+  // sees the bytes as of THIS moment rather than whatever occupies the slot when the worker gets
+  // to it. Separate cvar from the measurement so the two can be run independently -- and so
+  // dbg_window can verify the fix by reporting ~0 with async still ON.
+  if (REXCVAR_GET(nx1_d3d9_prefetch_at_draw)) {
+    const TextureFetchConstant tp =
+        DecodeTextureFetchConstant(reinterpret_cast<const uint8_t*>(d.fetch_constants));
+    if (tp.valid && tp.base_address) {
+      ResourceTracker::Get().PrefetchTextureAtDraw(tp);
+    }
+  }
   d.vs_object = BoundVertexShader(base, guest_device);
   d.ps_object = BoundPixelShader(base, guest_device);
   d.vs_pass = VertexShaderPass(base, d.vs_object, /*has_pixel_shader=*/d.ps_object != 0);

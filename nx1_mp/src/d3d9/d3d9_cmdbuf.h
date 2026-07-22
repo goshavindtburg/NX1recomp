@@ -217,6 +217,13 @@ struct RecordedDraw {
   /// note in ConstantBlock about what byte-swapping during capture costs.
   uint32_t fetch_constants[guest_device::kFetchConstantCount][6] = {};
 
+  /// Sampler-0 texture address and a fingerprint of its first bytes, taken AT DRAW TIME on the
+  /// guest thread. The decode happens later on the worker; comparing this against a fresh
+  /// fingerprint there counts how often the streamer recycled the slot inside that window. See
+  /// GuestTextureFingerprint. Zero address or zero fingerprint means "not captured".
+  uint32_t s0_addr = 0;
+  uint64_t s0_fingerprint = 0;
+
   /// The raw bytes of one texture slot's fetch constant (24 B), ready for
   /// DecodeTextureFetchConstant.
   const uint8_t* texture_fetch(uint32_t sampler) const {
