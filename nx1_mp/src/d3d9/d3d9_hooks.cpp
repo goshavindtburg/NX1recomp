@@ -1571,7 +1571,8 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
     if (REXCVAR_GET(nx1_d3d9_dbg_pageorigin)) {
       MarkDmaPageWritten(dst + off);
     }
-    nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange((dst + off) & 0x1FFFFFFF, chunk);
+    nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange(
+        (dst + off) & 0x1FFFFFFF, chunk, nx1::d3d9::DirtySource::kDma);
     ++copied;
   }
   return copied;

@@ -76,6 +76,19 @@ struct VertexLayout {
 };
 
 /// Owns the mirrored buffers and the vertex-declaration cache.
+/// Why a cached texture was marked for re-decode. See dirty_by_source_.
+enum class DirtySource : uint8_t {
+  kCpuWrite = 0,  ///< host page-protection fired: the guest stored to the texture's memory
+  kGpuWrite,      ///< the reference reported a GPU/memexport write (nx1_d3d9_gpu_write_watch)
+  kDma,           ///< our own image-cache DMA mirror wrote those pages
+  kProbe,         ///< nx1_d3d9_content_probe polled live memory and saw different content
+  kMipReloc,      ///< the guest moved this texture's mip tail
+  kRecheck,       ///< nx1_d3d9_redecode_delay scheduled re-examination
+  kPartial,       ///< decoded from a holey/empty source, retrying
+  kDebug,         ///< forced by a dump or a debug cvar
+  kCount
+};
+
 class ResourceTracker {
  public:
   static ResourceTracker& Get();
@@ -285,7 +298,7 @@ class ResourceTracker {
   /// write goes straight to host memory through GuestPointer -- it never touches guest page
   /// protection, so the write-watch does NOT fire and cached textures would keep serving their
   /// pre-write contents forever. Landing the right bytes is only half the job.
-  void InvalidateGuestRange(uint32_t phys, uint32_t bytes);
+  void InvalidateGuestRange(uint32_t phys, uint32_t bytes, DirtySource source);
 
   /// Drop the decode snapshot for a range WITHOUT recording a write. Use when we have observed
   /// that memory CHANGED but did not write it ourselves -- claiming a write here would corrupt
@@ -491,8 +504,27 @@ class ResourceTracker {
   /// Gates the capture so it cannot fill up in the menus, which render correctly.
   uint64_t scene_resolve_frame_ = 0;
 
+  /// Rebuilds attributed to each invalidation source, and how many of those actually changed the
+  /// decoded content. A source with many rebuilds but few content changes is re-reading memory that
+  /// did not really change; one with a high change rate is the one adopting new bytes -- which is
+  /// the candidate for adopting RECYCLED bytes the reference never sees.
+  uint64_t dirty_by_source_[size_t(DirtySource::kCount)] = {};
+  uint64_t changed_by_source_[size_t(DirtySource::kCount)] = {};
   std::mutex dirty_mu_;               ///< guards writes_pending_
-  std::vector<std::pair<uint32_t, uint32_t>> writes_pending_;  ///< (phys_addr, len) queued by callback
+  /// A queued invalidation, tagged with WHERE IT CAME FROM.
+  ///
+  /// The queue used to be a bare (addr, len) pair and its own comment conceded it "cannot separate
+  /// a DMA-origin write from a write-watch one". That matters now: the reference has been MEASURED
+  /// never re-reading a bad texture's memory (4.35M pages uploaded, zero in its range) while we do,
+  /// so the open question is precisely WHICH of our invalidation sources makes us go back and adopt
+  /// bytes the reference ignores. Untagged, every rebuild looked the same and the question was
+  /// unanswerable.
+  struct PendingWrite {
+    uint32_t addr;
+    uint32_t len;
+    DirtySource source;
+  };
+  std::vector<PendingWrite> writes_pending_;  ///< queued by the write-watch, GPU-write and DMA paths
   void DrainMemoryWrites();  ///< apply queued guest writes: invalidate mirror pages, dirty entries
   static std::pair<uint32_t, uint32_t> MemWatchThunk(void* ctx, uint32_t addr, uint32_t len,
                                                      bool exact);
@@ -924,6 +956,7 @@ class ResourceTracker {
   uint64_t mipfill_levels_ = 0;
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
   uint64_t prefetch_draws_ = 0;      ///< draw-time mirror prefetches (window fix)
+  uint64_t probe_refused_no_write_ = 0;  ///< probe changes refused by probe_needs_write
   uint64_t probe_rebuilds_ = 0;        ///< rebuilds forced by the content probe
   uint64_t forced_rechecks_ = 0;       ///< re-decodes forced by nx1_d3d9_redecode_delay
   /// Re-decodes refused by nx1_d3d9_keep_best for being poorer than the decode already held.

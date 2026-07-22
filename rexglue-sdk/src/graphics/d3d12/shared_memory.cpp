@@ -471,6 +471,24 @@ bool D3D12SharedMemory::UploadRanges(
       // The picker's watch SET is the normal path; nx1_refupload_addr remains as a manual override
       // for a single address typed by hand.
       if (upload_src) {
+        // ARMING COUNTER. Everything below is filtered to one watched address, so "no REFUPLOAD
+        // lines" is ambiguous by construction: it means either the reference RETAINED those pages
+        // (never re-uploaded them -- the interesting answer) or this path never ran at all. Those
+        // are opposite conclusions and the log could not tell them apart. Report the unfiltered
+        // totals so a zero in the filtered output is readable.
+        {
+          static std::atomic<uint64_t> calls{0}, pages{0};
+          const uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+          pages.fetch_add(upload_buffer_size >> 12, std::memory_order_relaxed);
+          if ((n % 2000) == 1) {
+            REXGPU_WARN("nx1: REFUPLOAD-ARMED UploadRanges ran {} times, {} pages uploaded in total "
+                        "(unfiltered). If this climbs while no REFUPLOAD lines appear for the "
+                        "watched address, the reference is genuinely NOT re-uploading that texture "
+                        "-- it is serving retained bytes. If this stays 0, the reference is not "
+                        "uploading at all and any 'no lines' reading is meaningless",
+                        n, pages.load(std::memory_order_relaxed));
+          }
+        }
         const uint32_t manual = REXCVAR_GET(nx1_refupload_addr);
         const uint32_t wlo = manual ? (manual & ~0xFFFu) : 0u;
         const uint32_t whi =

@@ -279,6 +279,11 @@ uint64_t ProbeGuestContent(const uint8_t* p, uint32_t bytes) {
   return h ? h : 1;
 }
 
+REXCVAR_DEFINE_BOOL(nx1_d3d9_probe_needs_write, false, "GPU",
+                    "Adopt a content-probe change only when a write was actually reported for "
+                    "that texture since its last decode -- the reference's rule, which never "
+                    "polls. Off by default: it can also block legitimate streaming-in");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_content_probe, true, "GPU",
                     "Re-check a cached texture's guest content once per frame and rebuild it if "
                     "the slot's occupant changed. Without this the pool can move a different "
@@ -1574,6 +1579,13 @@ struct TextureEntry {
   /// does eventually arrive is still picked up within ~1 second.
   uint32_t zero_retries = 0;
   uint64_t retry_frame = 0;
+  /// Which invalidation source last marked this entry dirty. Attributed at rebuild
+  /// time so we can see WHICH source makes us re-read memory the reference does not.
+  DirtySource dirty_source = DirtySource::kDebug;
+  /// Did any real write get reported for this entry since its last decode? Drives
+  /// nx1_d3d9_probe_needs_write: a probe-detected change with no reported write came
+  /// through a path the reference ignores.
+  bool write_seen_since_decode = false;
   /// PREMATURE-DECODE TEST. Frame at which to force one re-decode regardless of the write-watch,
   /// or 0 for none. The watch cannot help here: guest texture memory demonstrably changes through
   /// paths it never sees (thousands of DECODECHANGE entries, every one at "page writes 0 -> 0"),
@@ -3019,9 +3031,21 @@ void ResourceTracker::OnGpuWrite(uint32_t address_first, uint32_t address_last) 
   if (uint64_t(address_first) + len > (uint64_t(kMirrorPages) << 12)) {
     return;  // outside the window every other reader in this file respects
   }
+  // WHERE DO THEY ACTUALLY POINT? DRAINHIT says GPU-write ranges reach the drain (55,629) but
+  // match a texture's watch range 2 times. That is either an address-space mismatch or these
+  // writes genuinely targeting non-texture memory (memexport mostly writes vertex/stream-out
+  // buffers). Print a few real ranges beside a few live texture ranges; the two are directly
+  // comparable and settle it without further inference.
+  {
+    static std::atomic<uint32_t> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) < 8) {
+      REXGPU_WARN("nx1_d3d9: GPUWRITE-RANGE {:08X}..{:08X} ({} KB)", address_first, address_last,
+                  (address_last - address_first + 1) / 1024);
+    }
+  }
   ++gpu_write_ranges_;
   gpu_write_pages_ += (address_last >> 12) - (address_first >> 12) + 1;
-  InvalidateGuestRange(address_first, uint32_t(len));
+  InvalidateGuestRange(address_first, uint32_t(len), DirtySource::kGpuWrite);
 }
 
 void ResourceTracker::Shutdown() {
@@ -3633,6 +3657,33 @@ void ResourceTracker::LogCacheStats() {
               "with the DECODECHANGE count: rechecks that found DIFFERENT bytes are decodes that "
               "had been taken before the data landed",
               forced_rechecks_, REXCVAR_GET(nx1_d3d9_redecode_delay));
+  // ARMING FOR THE GPU-WRITE WATCH. REBUILDSRC shows gpu_write=0/0, but that counts REBUILDS
+  // ATTRIBUTED, so a zero there cannot distinguish "the reference never reports GPU writes",
+  // "it reports them but they never overlap a texture" and "the subscription is dead". These
+  // counters have existed all along and were never printed anywhere, which is why the mechanism
+  // looked inert without anyone being able to say so.
+  NX1_LOGI_STATS("nx1_d3d9: PROBEGATE {} probe-detected changes REFUSED for want of a "
+                 "reported write (nx1_d3d9_probe_needs_write={})",
+                 probe_refused_no_write_, REXCVAR_GET(nx1_d3d9_probe_needs_write) ? 1 : 0);
+  REXGPU_WARN("nx1_d3d9: GPUWRITE ranges={} pages={} | blasts(whole-buffer, unusable)={} "
+              "dropped(over {} MB cap)={} -- ranges=0 means the reference never reported a GPU "
+              "write to us at all; ranges>0 with gpu_write=0/0 in REBUILDSRC means it reports them "
+              "but they never overlap a live texture's watched range",
+              gpu_write_ranges_, gpu_write_pages_, gpu_write_blasts_, 
+              REXCVAR_GET(nx1_d3d9_gpu_write_watch_max_mb), gpu_write_dropped_);
+  {
+    // Unconditional, including zeros, with both columns: rebuilds and how many changed content.
+    static const char* kSrc[] = {"cpu_write", "gpu_write", "dma", "probe",
+                                 "mip_reloc", "recheck",   "partial", "debug"};
+    std::string line;
+    for (size_t i = 0; i < size_t(DirtySource::kCount); ++i) {
+      line += fmt::format("{}={}/{} ", kSrc[i], changed_by_source_[i], dirty_by_source_[i]);
+    }
+    REXGPU_WARN("nx1_d3d9: REBUILDSRC changed/total per invalidation source: {}-- the source with "
+                "the high CHANGED rate is the one adopting new bytes, which is where we diverge "
+                "from the reference (it never re-reads at all)",
+                line);
+  }
   REXGPU_INFO("nx1_d3d9: CONTENTPROBE {} rebuilds forced by a changed slot occupant -- each one "
               "is a surface that would otherwise have rendered another texture's bytes",
               probe_rebuilds_);
@@ -3774,7 +3825,7 @@ std::pair<uint32_t, uint32_t> ResourceTracker::MemWatchThunk(void* ctx, uint32_t
 std::pair<uint32_t, uint32_t> ResourceTracker::OnMemoryWrite(uint32_t addr, uint32_t len, bool) {
   {
     std::lock_guard<std::mutex> lk(dirty_mu_);
-    writes_pending_.emplace_back(addr, len);
+    writes_pending_.push_back({addr, len, DirtySource::kCpuWrite});
   }
   const uint32_t p0 = addr & ~0xFFFu;
   const uint32_t p1 = (addr + len + 0xFFFu) & ~0xFFFu;
@@ -3830,12 +3881,12 @@ uint32_t ResourceTracker::PageWriteCount(uint32_t phys) const {
 ///
 /// Routing through writes_pending_ also picks up work this function never did: DrainMemoryWrites
 /// dirties entries by their MIP watch range as well as the base range.
-void ResourceTracker::InvalidateGuestRange(uint32_t phys, uint32_t bytes) {
+void ResourceTracker::InvalidateGuestRange(uint32_t phys, uint32_t bytes, DirtySource source) {
   if (!bytes) {
     return;
   }
   std::lock_guard<std::mutex> lk(dirty_mu_);
-  writes_pending_.emplace_back(phys, bytes);
+  writes_pending_.push_back({phys, bytes, source});
   // Counts RANGES QUEUED now, not entries dirtied -- the dirtying moved into DrainMemoryWrites,
   // which cannot separate a DMA-origin write from a write-watch one. Renamed in the log to match;
   // leaving it reading "textures re-decoded" would have made it report zero forever while
@@ -4456,14 +4507,47 @@ const uint8_t* ResourceTracker::MirrorSnapshot(uint32_t phys_addr, uint32_t len)
 // next MirrorSnapshot re-copies fresh bytes, and dirty any texture entry whose watched range
 // overlaps so it re-decodes. This is how a texture that legitimately reloads (or whose slot is
 // repurposed) picks up its new bytes, while an untouched texture is held from the churn.
+namespace { std::atomic<uint64_t>* g_drain_matched = nullptr; }
+
 void ResourceTracker::DrainMemoryWrites() {
-  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  std::vector<PendingWrite> writes;
   {
     std::lock_guard<std::mutex> lk(dirty_mu_);
     writes.swap(writes_pending_);
   }
   if (writes.empty()) return;
-  for (const auto& [addr, len] : writes) {
+  // THE GAP. gpu_write_ranges_ says the reference reported 49,379 GPU writes; REBUILDSRC says zero
+  // rebuilds came from them. Everything between those two numbers was unmeasured, so count it:
+  // how many ranges of each source reach the drain, and how many of them match ANY live texture.
+  // A source that arrives but never matches is an address-space or watch-range problem, not a
+  // "nothing to invalidate" one.
+  {
+    static std::atomic<uint64_t> drained[size_t(DirtySource::kCount)]{};
+    static std::atomic<uint64_t> matched[size_t(DirtySource::kCount)]{};
+    static std::atomic<uint64_t> reports{0};
+    for (const PendingWrite& w : writes) {
+      if (size_t(w.source) < size_t(DirtySource::kCount)) {
+        drained[size_t(w.source)].fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    g_drain_matched = matched;  // consumed by the match test below
+    if ((reports.fetch_add(1, std::memory_order_relaxed) % 600) == 1) {
+      static const char* kSrc[] = {"cpu", "gpu", "dma", "probe", "mip", "recheck", "partial", "dbg"};
+      std::string line;
+      for (size_t i = 0; i < size_t(DirtySource::kCount); ++i) {
+        line += fmt::format("{}={}/{} ", kSrc[i],
+                            matched[i].load(std::memory_order_relaxed),
+                            drained[i].load(std::memory_order_relaxed));
+      }
+      REXGPU_WARN("nx1_d3d9: DRAINHIT matched/drained ranges per source: {}-- a source with a large "
+                  "drained count and zero matched is arriving but never overlapping a live "
+                  "texture's watch range: an address-space or watch-range bug, not an absence of "
+                  "work",
+                  line);
+    }
+  }
+  for (const PendingWrite& w : writes) {
+    const uint32_t addr = w.addr, len = w.len;
     if (uint64_t(addr) + len > (uint64_t(kMirrorPages) << 12)) continue;
     const uint32_t p0 = addr >> 12;
     const uint32_t p1 = (addr + len - 1) >> 12;
@@ -4499,7 +4583,8 @@ void ResourceTracker::DrainMemoryWrites() {
         }
       }
     }
-    for (const auto& [addr, len] : writes) {
+    for (const PendingWrite& w : writes) {
+      const uint32_t addr = w.addr, len = w.len;
       if (addr < track + span && addr + len > track) {
         REXGPU_INFO("nx1_d3d9: TRACK {:08X} WRITE frame={} range={:08X}+{} (+{} into a {} byte "
                     "window, {})",
@@ -4520,7 +4605,8 @@ void ResourceTracker::DrainMemoryWrites() {
       }
     }
     if (!claimed) {
-      for (const auto& [addr, len] : writes) {
+      for (const PendingWrite& w : writes) {
+        const uint32_t addr = w.addr, len = w.len;
         if (addr <= track && track < addr + len) {
           REXGPU_INFO("nx1_d3d9: TRACK {:08X} WRITE with NO cache entry watching it (frame {})",
                       track, frame_);
@@ -4543,6 +4629,17 @@ void ResourceTracker::DrainMemoryWrites() {
     }
     MirrorInvalidateAll();
     REXGPU_INFO("nx1_d3d9: REDECODE forced {} cached textures to re-decode from current memory", n);
+  }
+  {
+    static std::atomic<uint32_t> shown{0};
+    if (shown.load(std::memory_order_relaxed) < 8) {
+      for (auto [k2, e2] : *textures) {
+        if (!e2.watch_size) continue;
+        if (shown.fetch_add(1, std::memory_order_relaxed) >= 8) break;
+        REXGPU_WARN("nx1_d3d9: TEXRANGE {:08X}..{:08X} ({} KB) -- compare against GPUWRITE-RANGE",
+                    e2.watch_addr, e2.watch_addr + e2.watch_size, e2.watch_size / 1024);
+      }
+    }
   }
   for (auto [key, entry] : *textures) {
     if (!entry.watch_size) continue;
@@ -4575,11 +4672,17 @@ void ResourceTracker::DrainMemoryWrites() {
     // real entries. Zero means the experiment did NOT run and a null visual result says nothing --
     // the failure mode that has already voided this test once.
     if (entry.committed) ++unfrozen_writes_;
-    for (const auto& [addr, len] : writes) {
+    for (const PendingWrite& w : writes) {
+      const uint32_t addr = w.addr, len = w.len;
       const bool hit_base = addr < a1 && addr + len > a0;
       const bool hit_mips = entry.mip_watch_size != 0 && addr < m1 && addr + len > m0;
       if (hit_base || hit_mips) {
+        if (g_drain_matched && size_t(w.source) < size_t(DirtySource::kCount)) {
+          g_drain_matched[size_t(w.source)].fetch_add(1, std::memory_order_relaxed);
+        }
         entry.dirty = true;
+        entry.dirty_source = w.source;
+        entry.write_seen_since_decode = true;
         if (const uint32_t track = TrackedMatch(entry.watch_addr); track) {
           REXGPU_INFO("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} ({} {}+{})",
                       track, frame_, addr, len, hit_base ? "watch" : "MIP watch",
@@ -5473,6 +5576,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // turns it into a rebuild storm; the counter in the periodic mipgen stats is how we would see.
   if (entry.tex && entry.mip_source == 3 && entry.mip_addr_seen != t.mip_address) {
     entry.dirty = true;
+    entry.dirty_source = DirtySource::kMipReloc;
     ++mip_relocs_;
   }
   // A dump budget armed while a MATERIAL filter is active means "dump what this draw binds,
@@ -5501,6 +5605,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // and the picture is the confirmation.
   if (entry.tex && entry.recheck_frame && frame_ >= entry.recheck_frame) {
     entry.dirty = true;
+    entry.dirty_source = DirtySource::kRecheck;
     entry.retry_frame = 0;
     ++forced_rechecks_;
     if (entry.rechecks_left) {
@@ -5572,7 +5677,26 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           ProbeTiledContent(TranslatePhysical(t.base_address), ex_p, bpb_p, t.tiled,
                             REXCVAR_GET(nx1_d3d9_probe_samples));
       if (now_hash && now_hash != entry.probe_hash) {
+        // THE REFERENCE'S RULE, OPTIONALLY. It never polls: a texture is re-read only when a write
+        // was actually reported for its memory. We poll, and REBUILDSRC shows the probe is
+        // responsible for 1308 of 1405 content-changing rebuilds -- 93% of every time we adopt new
+        // bytes -- while genuine guest writes account for 10. So the probe is where we diverge.
+        //
+        // With this on, a probe-detected change is adopted ONLY if a write was reported for this
+        // entry since its last decode. A change nobody reported came through a path the reference
+        // ignores, and it keeps its existing texture in exactly that case.
+        //
+        // THE RISK IS REAL AND THE OPPOSITE FAILURE IS LIKELY: the probe's changes are mostly
+        // LEGITIMATE (a texture finishing streaming in), which is why enabling the probe was this
+        // investigation's only confirmed improvement. If writes are rarely reported, this gate
+        // blocks the good adoptions too and regresses toward the pre-probe state. Judge it on
+        // REBUILDSRC (probe's changed count should fall) AND on the screen -- if the picture gets
+        // worse, the rule is too strict and the discriminator has to come from somewhere else.
+        if (REXCVAR_GET(nx1_d3d9_probe_needs_write) && !entry.write_seen_since_decode) {
+          ++probe_refused_no_write_;
+        } else {
         entry.dirty = true;
+        entry.dirty_source = DirtySource::kProbe;
         entry.retry_frame = 0;
         ++probe_rebuilds_;
         // THE REBUILD MUST RE-READ THE SLOT. The probe reads LIVE memory; the rebuild reads
@@ -5581,6 +5705,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         // image -- which is exactly why the probe took SLOTREUSE 156 -> 0 while the speckle was
         // completely unmoved.
         InvalidateMirrorPages(PhysicalAddress(t.base_address), probe_bytes);
+        }
       }
     }
   }
@@ -6379,6 +6504,21 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                         it->second.h, it->second.fmt);
           }
         }
+      }
+    }
+    // ATTRIBUTE THIS REBUILD TO THE SOURCE THAT CAUSED IT.
+    //
+    // The reference has been measured never re-reading a bad texture's memory (4.35M pages
+    // uploaded, zero in its range) while we do -- so the open question is which of OUR
+    // invalidation sources sends us back to guest RAM to adopt bytes it ignores. Counting rebuilds
+    // per source is not enough on its own: a source that re-reads memory which turns out unchanged
+    // costs time but cannot corrupt anything. What matters is the source whose rebuilds actually
+    // CHANGE the decoded content, because that is the one adopting new bytes.
+    {
+      const size_t si = size_t(entry.dirty_source);
+      if (si < size_t(DirtySource::kCount)) {
+        ++dirty_by_source_[si];
+        if (prev.hash && prev.hash != h) ++changed_by_source_[si];
       }
     }
     if (prev.hash && prev.hash != h) {
@@ -7338,6 +7478,9 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     const uint32_t probe_bytes = extent.block_pitch_h * extent.block_pitch_v * bpb;
     const bool probe_in_range =
         uint64_t(PhysicalAddress(t.base_address)) + probe_bytes <= (uint64_t(kMirrorPages) << 12);
+  // The decode has now consumed whatever write was reported; require a NEW one before a
+  // probe-detected change is adopted again (see nx1_d3d9_probe_needs_write).
+  entry.write_seen_since_decode = false;
     entry.probe_hash = probe_in_range
                            ? ProbeTiledContent(TranslatePhysical(t.base_address), extent, bpb,
                                                t.tiled, REXCVAR_GET(nx1_d3d9_probe_samples))
@@ -7612,6 +7755,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   const bool partial = partial_pages != 0 && REXCVAR_GET(nx1_d3d9_retry_partial);
   if (swizzle_all_zero || partial) {
     entry.dirty = true;
+    entry.dirty_source = DirtySource::kPartial;
     entry.good_frames = 0;
     entry.committed = false;
     // 2, 4, 8 ... 64 frames between attempts. Deliberately not reset by DrainMemoryWrites: the
