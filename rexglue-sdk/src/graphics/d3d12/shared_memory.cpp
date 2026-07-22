@@ -14,12 +14,83 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <cstdio>
+
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+/// REFERENCE-SIDE UPLOAD WATCH.
+///
+/// The one comparison this speckle investigation has never made: what bytes does the REFERENCE
+/// feed its decoder, and WHEN did it capture them, for a texture the native renderer draws wrong?
+///
+/// It matters because the reference renders these surfaces correctly from the SAME CPU RAM the
+/// native renderer decodes (this function's own memcpy below is that read). The difference cannot
+/// be the address, so it is the MOMENT: the reference uploads a page when it first becomes valid
+/// and re-reads only on invalidation, holding that copy in buffer_, while the native renderer
+/// re-decodes constantly. Logging the hash here, with the submission it happened in, makes the two
+/// directly comparable against the native side's TRACK POLL/DECODE lines for the same address.
+///
+/// ONLY MEANINGFUL WITH nx1_skip_reference_raster = false. With the skip on, IssueDraw returns at
+/// command_processor.cpp:3851 BEFORE texture_cache_->RequestTextures() at :4034, so the reference
+/// never requests texture ranges and this never fires for a texture -- which is exactly why the
+/// earlier attempt to hook this path was abandoned.
+namespace rex::graphics {
+namespace {
+/// The watched set. Written from the UI thread (the F3 picker), read on the upload path from the
+/// GPU thread -- atomics rather than a lock, since a reader only needs a consistent view of one
+/// entry and a torn read at worst logs or misses one debug line.
+std::array<std::atomic<uint32_t>, kRefUploadWatchMax> g_ru_addr{};
+std::array<std::atomic<uint32_t>, kRefUploadWatchMax> g_ru_span{};
+std::atomic<uint32_t> g_ru_count{0};
+}  // namespace
+
+void SetRefUploadWatch(const uint32_t* addrs, const uint32_t* spans, uint32_t count) {
+  count = std::min(count, kRefUploadWatchMax);
+  for (uint32_t i = 0; i < kRefUploadWatchMax; ++i) {
+    g_ru_addr[i].store(i < count ? (addrs[i] & 0x1FFFFFFF) : 0u, std::memory_order_relaxed);
+    g_ru_span[i].store(i < count ? std::max(spans[i], 4096u) : 0u, std::memory_order_relaxed);
+  }
+  g_ru_count.store(count, std::memory_order_release);
+}
+
+bool RefUploadWatched(uint32_t page_addr) {
+  const uint32_t a = page_addr & 0x1FFFFFFF;
+  const uint32_t n = g_ru_count.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t base = g_ru_addr[i].load(std::memory_order_relaxed);
+    if (base && a >= base && a < base + g_ru_span[i].load(std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace rex::graphics
+
+REXCVAR_DEFINE_UINT32(nx1_refupload_addr, 0, "GPU/D3D12",
+                      "Physical address whose reference-side shared-memory uploads to log "
+                      "(0 = off)");
+REXCVAR_DEFINE_UINT32(nx1_refupload_bytes, 65536, "GPU/D3D12",
+                      "Byte span from nx1_refupload_addr to watch for reference-side uploads");
+/// Dump the reference's uploaded BYTES, not just their hash.
+///
+/// The reference builds its texture with a compute shader from the shared-memory BUFFER, and that
+/// buffer holds each page as of that page's LAST UPLOAD -- a patchwork across time, not a snapshot
+/// of live memory. So the bytes it decodes cannot be reconstructed by reading guest RAM later; they
+/// have to be captured here, as they are handed over.
+///
+/// Writes texdump/refup_<page>_s<submission>.bin, one file per uploaded page. Reassembling the
+/// latest file per page and decoding it offline (tools/texture_analysis) gives the REFERENCE'S view
+/// of the texture, which can be put beside our own decode of the same texture. That is the
+/// comparison this investigation has never made, and after REFUPLOAD showed both backends reading
+/// the same degraded bytes it is the only thing left that can localise the fault.
+REXCVAR_DEFINE_BOOL(nx1_refupload_dump, false, "GPU/D3D12",
+                    "Write the reference's uploaded page bytes to texdump/refup_*.bin as well as "
+                    "logging their hash");
 
 REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
@@ -390,9 +461,54 @@ bool D3D12SharedMemory::UploadRanges(
         return false;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      const uint8_t* upload_src = reinterpret_cast<const uint8_t*>(
+          memory().TranslatePhysical(upload_range_start << page_size_log2()));
+      // See nx1_refupload_addr. Hash what the reference is about to hand its decoder, per page,
+      // so it can be lined up against the native renderer's TRACK lines for the same address.
+      // Note this is a snapshot at UPLOAD time -- reading these bytes later compares live memory
+      // against itself and proves nothing, which is how the first version of this idea was null
+      // by construction.
+      // The picker's watch SET is the normal path; nx1_refupload_addr remains as a manual override
+      // for a single address typed by hand.
+      if (upload_src) {
+        const uint32_t manual = REXCVAR_GET(nx1_refupload_addr);
+        const uint32_t wlo = manual ? (manual & ~0xFFFu) : 0u;
+        const uint32_t whi =
+            manual ? wlo + std::max(REXCVAR_GET(nx1_refupload_bytes), 4096u) : 0u;
+        const uint32_t ulo = upload_range_start << page_size_log2();
+        const uint32_t uhi = ulo + uint32_t(upload_buffer_size);
+        {
+          for (uint32_t a = ulo; a < uhi; a += 4096) {
+            const bool in_manual = manual && a >= wlo && a < whi;
+            if (!in_manual && !rex::graphics::RefUploadWatched(a)) {
+              continue;
+            }
+            const uint8_t* p = upload_src + (a - ulo);
+            uint32_t nz = 0;
+            uint64_t hash = 1469598103934665603ull;
+            for (uint32_t i = 0; i < 4096; ++i) {
+              nz += p[i] != 0 ? 1 : 0;
+              hash = (hash ^ p[i]) * 1099511628211ull;
+            }
+            REXGPU_WARN("nx1: REFUPLOAD page {:08X} submission={} nonzero={}/4096 hash={:016X} "
+                        "-- bytes the REFERENCE captured for its decoder at this moment",
+                        a, command_processor_.GetCurrentSubmission(), nz, hash);
+            if (REXCVAR_GET(nx1_refupload_dump)) {
+              // One file per page per upload. Keyed by submission so the LATEST capture of each
+              // page can be picked offline -- which is exactly what the reference's buffer holds.
+              char path[256];
+              std::snprintf(path, sizeof(path), "texdump/refup_%08X_s%llu.bin", a,
+                            static_cast<unsigned long long>(
+                                command_processor_.GetCurrentSubmission()));
+              if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(p, 1, 4096, f);
+                std::fclose(f);
+              }
+            }
+          }
+        }
+      }
+      std::memcpy(upload_buffer_mapping, upload_src, upload_buffer_size);
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));

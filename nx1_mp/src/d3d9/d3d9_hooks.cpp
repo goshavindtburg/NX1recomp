@@ -1165,6 +1165,15 @@ struct DmaRetry {
 };
 std::mutex g_dma_retry_m;
 std::deque<DmaRetry> g_dma_retry;
+/// Destination pages overwritten with ZEROS by verbatim copying. Hoisted out of the copy loop so
+/// the periodic report can print it UNCONDITIONALLY -- it was a function-local static that only
+/// logged every 20,000 blanks, so any count below that was invisible. That mattered the moment
+/// verbatim became the default: the pool-watch comparison (Xenia vs native) shows native carrying
+/// 3x more PARTIALLY populated pages, and "we blank live texels" is the first explanation to test.
+std::atomic<uint64_t> g_dma_blanked{0};
+/// Copies refused by the density guard. Reported unconditionally, including zero -- a guard that
+/// never fires must be distinguishable from a guard that is switched off.
+std::atomic<uint64_t> g_dma_density_refused{0};
 std::unordered_map<uint32_t, uint32_t> g_dma_dest_seq;  // destination page -> latest copy seq
 std::atomic<uint32_t> g_dma_seq{1};
 
@@ -1331,6 +1340,21 @@ bool SourceHasAnyData(const uint8_t* base, uint32_t src, uint32_t bytes) {
 ///
 /// NOTE the old help text was also wrong: this does not widen the copy's RANGE. The range is the
 /// `bytes` argument either way; verbatim only stops SKIPPING all-zero source pages within it.
+/// Refuse a mirrored copy that would leave a destination page emptier than it already is. See the
+/// DENSITY GUARD block in CopyLiveSourcePages for why, and for why it never applies to a move.
+/// Bucket the population of every source page the mirror reads, at the moment it reads it.
+/// Answers why the mirror lands partial pages -- see the census in CopyLiveSourcePages.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_srccensus, false, "GPU",
+                    "Census the populated fraction of each source page the image-cache mirror "
+                    "copies, to find why it lands partial data");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_density_guard, false, "GPU",
+                    "Refuse a mirrored image-cache copy whose source is markedly less populated "
+                    "than the destination it would overwrite");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dma_density_drop_pct, 25, "GPU",
+                      "How much less populated (percent) a source must be than its destination "
+                      "before nx1_d3d9_dma_density_guard refuses the copy");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_verbatim, true, "GPU",
                     "Copy every page of an image-cache copy, including all-zero source pages, as "
                     "the GPU blit does. Off skips empty source pages, which leaves the previous "
@@ -1384,6 +1408,49 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
     if (!d || !s) {
       break;
     }
+    // DENSITY GUARD -- refuse a copy that would make the destination page EMPTIER than it is.
+    //
+    // On the console a DmaCopy moves GPU-side data, which is complete. Our mirror moves the
+    // CPU-side VIEW of that source, and if that view is only partly populated we memcpy the gap
+    // over a destination that may have been more complete. The copy is semantically correct
+    // ("make dst equal src") and still destroys information, because our source is a poorer copy
+    // than the GPU's.
+    //
+    // That is what the pool watch measures: on the same map with matched copy volume, native
+    // carries 3x the partially-populated pages Xenia does (full/partial 6915/8074 against
+    // 11650/2564) and degrades ~2.4x more per unit of streaming. MirrorDmaCopy is the only thing
+    // writing guest pool memory in native that does not in Xenia, and it is neither blanking
+    // (DMABLANK total 0) nor the retry queue (measured, both ruled out).
+    //
+    // NEVER APPLIED TO A MOVE. A pool compaction must be verbatim and ordered; refusing pages
+    // inside one reintroduces exactly the page-granular displacement that overlapping-move
+    // handling was added to fix.
+    //
+    // THIS IS A CONTENT HEURISTIC, which this project has been burned by repeatedly. Two things
+    // make it defensible: it compares one specific source against its own specific destination at
+    // copy time rather than judging whether a texture "looks corrupt", and it has a measured
+    // target to be judged against (native's full/partial split moving toward Xenia's). It is off
+    // by default until those numbers vouch for it. Its known failure mode is refusing a LEGITIMATE
+    // erase, which would leave stale data -- the same risk the old zero-page skip carried, so
+    // watch DMADENSITY against the pool figures rather than trusting it.
+    if (!is_move && REXCVAR_GET(nx1_d3d9_dma_density_guard)) {
+      uint32_t snz = 0, dnz = 0;
+      for (uint32_t i = 0; i < chunk; i += 8) {  // sampled: a density ratio, not a checksum
+        snz += s[i] != 0 ? 1 : 0;
+        dnz += d[i] != 0 ? 1 : 0;
+      }
+      const uint32_t drop = std::min(REXCVAR_GET(nx1_d3d9_dma_density_drop_pct), 100u);
+      if (dnz && snz * 100u < dnz * (100u - drop)) {
+        const uint64_t r = g_dma_density_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (r <= 8 || (r % 20000) == 0) {
+          REXGPU_WARN("nx1_d3d9: DMADENSITY #{} refused a copy into {:08X}+{:X}: source is {}/{} "
+                      "populated where the destination is {}/{} -- our CPU view of the source is "
+                      "poorer than what the slot already holds, so landing it would destroy data",
+                      r, dst, off, snz, chunk / 8, dnz, chunk / 8);
+        }
+        continue;
+      }
+    }
     bool any = false;
     for (uint32_t i = 0; i < chunk && !any; ++i) {
       any = s[i] != 0;
@@ -1417,13 +1484,50 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
       // effect measured earlier as a tracked texture going 8134/8192 nonzero -> 2033/8192. It
       // shows on screen as solid black banding, which is visibly worse in the verbatim
       // screenshots than the skipping ones. Counted so the harm is a number, not an impression.
-      static std::atomic<uint64_t> blanked{0};
-      const uint64_t k = blanked.fetch_add(1, std::memory_order_relaxed) + 1;
+      const uint64_t k = g_dma_blanked.fetch_add(1, std::memory_order_relaxed) + 1;
       if ((k % 20000) == 0) {
         REXGPU_WARN("nx1_d3d9: DMABLANK {} destination pages overwritten with ZEROS by verbatim "
                     "copying (empty source page). Each one erases whatever texels the slot already "
                     "held -- this is the black banding",
                     k);
+      }
+    }
+    // WHY DO WE LAND PARTIAL PAGES? Measure the SOURCE at copy time.
+    //
+    // The three-run pool census showed our mirror converting ~13,000 pages from full-or-empty into
+    // PARTIAL (6072 -> 19377) and multiplying degradation events 13x, while Xenia and
+    // native-without-mirror are indistinguishable. So we land incomplete data at scale -- but the
+    // copy itself is a plain memcpy, so the incompleteness must already be in the SOURCE.
+    //
+    // Bucketing the source page's population at the moment we read it says which story is true:
+    //   sources mostly FULL      -> the copy is fine and the damage is in WHERE we land it
+    //                               (wrong destination, overlap, ordering)
+    //   sources frequently PART  -> we are reading staging before it is filled, and the
+    //                               "fill is a synchronous blocking CPU write, complete before the
+    //                               copy is enqueued" reading from the recomp does not hold for
+    //                               whatever path these copies take
+    // Note this is NOT about the speckle -- that predates the mirror entirely and is settled as a
+    // separate bug. This is about the mirror's own correctness.
+    if (REXCVAR_GET(nx1_d3d9_dbg_srccensus)) {
+      uint32_t snz = 0;
+      for (uint32_t i = 0; i < chunk; i += 8) snz += s[i] != 0 ? 1 : 0;
+      const uint32_t samples = (chunk + 7) / 8;
+      static std::atomic<uint64_t> b_empty{0}, b_part{0}, b_full{0}, pages{0};
+      if (snz == 0) {
+        b_empty.fetch_add(1, std::memory_order_relaxed);
+      } else if (snz * 100u >= samples * 90u) {
+        b_full.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        b_part.fetch_add(1, std::memory_order_relaxed);
+      }
+      const uint64_t n = pages.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((n % 100000) == 1) {
+        REXGPU_WARN("nx1_d3d9: SRCCENSUS {} source pages read: {} EMPTY, {} PARTIAL, {} FULL "
+                    "(>=90%). Partial-heavy means we copy staging before it is filled; full-heavy "
+                    "means the sources are fine and the damage is in where we land them",
+                    n, b_empty.load(std::memory_order_relaxed),
+                    b_part.load(std::memory_order_relaxed),
+                    b_full.load(std::memory_order_relaxed));
       }
     }
     std::memcpy(d, s, chunk);
@@ -1576,6 +1680,18 @@ void DrainDmaRetries(uint8_t* base) {
                 clobbered.load(),
                 REXCVAR_GET(nx1_d3d9_dma_drop_clobbered) ? "DROPPED" : "applied anyway",
                 filled.load());
+    // Unconditional, including zero: with nx1_d3d9_dma_verbatim on we copy EVERY source page,
+    // zeros included, so this is the count of destination pages we ourselves emptied. Compare it
+    // against POOLWATCH's degraded/partial figures -- if it is large, verbatim is trading the
+    // page-duplication artifact for a blanking one.
+    REXGPU_WARN("nx1_d3d9: DMABLANK total {} destination pages overwritten with ZEROS by verbatim "
+                "copying (verbatim={})",
+                g_dma_blanked.load(), REXCVAR_GET(nx1_d3d9_dma_verbatim) ? "on" : "off");
+    REXGPU_WARN("nx1_d3d9: DMADENSITY total {} copies refused as less populated than their "
+                "destination (guard={}). Judge this against POOLWATCH full/partial, not the "
+                "screen: the target is native approaching Xenia's 11650/2564",
+                g_dma_density_refused.load(),
+                REXCVAR_GET(nx1_d3d9_dma_density_guard) ? "on" : "off");
     REXGPU_WARN("nx1_d3d9: DMARETRY {} deferred copies LANDED (mean {} us late), {} abandoned "
                 "still-empty, {} dropped as stale, {} still queued. Landed>0 means the source "
                 "was simply NOT YET FILLED at call time and we now recover it",
@@ -1591,7 +1707,13 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
   // destinations are logged as 0xA/0xB-window EAs (B4789000) while textures are keyed physically
   // (12526000), and 0xB2526000 & 0x1FFFFFFF is exactly 12526000 -- the same memory. Compare
   // physically or the match can never happen.
-  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track && bytes) {
+  // EVERY tracked texture, not just the primary -- a surface binds up to 8 and we do not know
+  // which one is broken, so watching them together is the difference between one guess and the
+  // whole set. Each carries its own span; see nx1::d3d9::TrackedTex.
+  nx1::d3d9::TrackedTex tracked[nx1::d3d9::kTrackSetMax + 1];
+  const uint32_t tracked_n = bytes ? nx1::d3d9::TrackedList(tracked, nx1::d3d9::kTrackSetMax + 1) : 0;
+  for (uint32_t ti = 0; ti < tracked_n; ++ti) {
+    const uint32_t track = tracked[ti].addr;
     const uint32_t tphys = track & 0x1FFFFFFF;
     const uint32_t dphys = dst & 0x1FFFFFFF;
     // RANGE OVERLAP, not "does the base address fall inside this copy".
@@ -1612,7 +1734,10 @@ void MirrorDmaCopy(uint8_t* base, uint32_t dst, uint32_t src, uint32_t bytes) {
     // log prints the copy's offset RELATIVE to the tracked base, because that offset is the
     // measurement: 0/4096/8192... means the copies tile the texture, and anything not a multiple
     // of 4096 -- or a repeat of an offset already seen -- is the bug, visible directly in the log.
-    const uint32_t tspan = std::max(REXCVAR_GET(nx1_d3d9_dbg_track_bytes), 1u);
+    // Each tracked entry carries its own level-0 size, so the window matches that texture rather
+    // than a single global guess that is too small for one and too wide for the next.
+    const uint32_t tspan =
+        std::max(tracked[ti].span ? tracked[ti].span : REXCVAR_GET(nx1_d3d9_dbg_track_bytes), 1u);
     if (dphys < tphys + tspan && tphys < dphys + bytes) {
       const int64_t rel = int64_t(dphys) - int64_t(tphys);
       REXGPU_WARN("nx1_d3d9: TRACK {:08X} DMACOPY dst={:08X} (phys {:08X}) src={:08X} {} bytes "
@@ -1749,6 +1874,10 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, a5 = ctx.r5.u32, a6 = ctx.r6.u32;
   __imp__rex_ImageCache_DmaCopy(ctx, base);
 #ifdef _WIN32
+  // BEFORE the mirror-mode gate, and before any nx1_d3d9 check: the pool watch must run in
+  // PURE-XENIA mode too, since comparing the two runs is its whole purpose. This hook fires in
+  // both configurations, which is why the start-up call lives here.
+  nx1::d3d9::EnsurePoolWatchStarted();
   RecordPendingDma(base, dst, src, a5);  // independent of the mirror mode
   const uint32_t mode = REXCVAR_GET(nx1_d3d9_dmacopy_mirror);
   if (!mode) {

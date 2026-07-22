@@ -39,6 +39,7 @@ set(NX1MP_SOURCES
     src/d3d9/d3d9_renderer.cpp
     src/d3d9/d3d9_constants.cpp
     src/d3d9/d3d9_hooks.cpp
+    src/d3d9/pool_watch.cpp
     src/d3d9/d3d9_resources.cpp
     src/d3d9/d3d9_shaders.cpp
     src/d3d9/d3d9_cmdbuf.cpp

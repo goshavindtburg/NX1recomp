@@ -220,6 +220,36 @@ bool DmaCoverageFor(uint32_t phys, uint32_t* base_out, uint32_t* bytes_out, uint
 /// question from the one the provenance report prints answers to.
 uint32_t DmaPageVerdictFor(uint32_t phys);
 
+/// Start the guest-memory pool watch (pool_watch.cpp) if it is not already running. Safe to call
+/// from anywhere and as often as you like; only the first call starts the thread. Called from the
+/// image-cache DMA hook because that fires in BOTH renderer configurations, which is the entire
+/// point of the watch -- it must observe pure-Xenia runs as well as native ones.
+void EnsurePoolWatchStarted();
+
+//--- Multi-texture tracking ---------------------------------------------------
+//
+// A surface binds up to 8 textures and there is no way to know from the screen WHICH one is
+// speckled. Tracking them one at a time means guessing, and guessing wrong costs a whole run --
+// the picker's tooltip already warns that an fmt=18 diffuse can be perfectly clean while the
+// fmt=20 at sampler 7 is the broken one. So track the whole set at once and let the log say which
+// one moved.
+//
+// nx1_d3d9_dbg_track_addr remains the PRIMARY slot, so single-address tracking, the overlay's
+// manual entry and autotrack all keep working unchanged; the set is consulted in addition to it.
+struct TrackedTex {
+  uint32_t addr = 0;
+  uint32_t span = 0;  ///< level-0 guest bytes, so a DMA watch window matches the texture exactly
+};
+constexpr uint32_t kTrackSetMax = 8;
+/// Replace the tracked set (main thread). Pass count 0 to clear.
+void SetTrackSet(const TrackedTex* list, uint32_t count);
+/// Does `addr` match the primary tracked address or any set entry? Returns the matching tracked
+/// address (never 0 on a hit) so existing log lines can keep printing "which texture is this".
+uint32_t TrackedMatch(uint32_t addr);
+/// Snapshot of the tracked set INCLUDING the primary, for callers that must iterate (the frame
+/// poll, and the DMA watch which needs each entry's span). Returns how many were written.
+uint32_t TrackedList(TrackedTex* out, uint32_t max);
+
 /// Host pointer to a raw GPU *physical* address (< 0x20000000): a vertex-fetch base, or a
 /// shader's literal-constant payload. Not the same translation as the 0xA0000000+ mirrors
 /// above -- passing one of those through `base + addr` faults.

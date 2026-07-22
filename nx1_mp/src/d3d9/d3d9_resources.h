@@ -216,10 +216,23 @@ class ResourceTracker {
   /// `base_address` is the guest allocation this binding names. It is what distinguishes a
   /// texture updating in place from the streaming pool swapping in a different allocation at
   /// the same declared size -- see the equal-area branch.
+  /// `src_permille` is how populated the guest source of `tex` was at decode (0 = unknown).
+  /// See BestTexture::src_permille -- retention keyed on size alone could not tell a complete
+  /// texture from a barely streamed one, which is why substituting it never helped before.
   IDirect3DBaseTexture9* PreferLargestForSurface(uint64_t surface_key, uint32_t sampler,
                                                  uint32_t format, IDirect3DBaseTexture9* tex,
                                                  uint32_t width, uint32_t height,
-                                                 uint32_t base_address);
+                                                 uint32_t base_address, uint32_t src_permille);
+  /// Populated permille of the last decode for this guest address, or 0 if unknown. Reads the
+  /// per-entry figure the decode already records; no extra scanning.
+  uint32_t SourcePermilleFor(uint32_t base_address);
+  /// Populated permille of the last decode, keyed by GUEST ADDRESS.
+  ///
+  /// A side map because the texture cache is keyed by MixKey(MixKey(base, sampler), layout_key),
+  /// not by address -- looking the entry up by base_address alone always missed, so the population
+  /// gate silently never fired. Address is the right key here: the question is "how complete was
+  /// the data at this allocation", which does not depend on which sampler or layout read it.
+  std::unordered_map<uint32_t, uint32_t> src_permille_;
 
   /// Untile + upload a 3D (volume) texture. The composite's colour-grading LUT is one, and an
   /// unbound sampler reads black -- which blacks out the entire composited frame.
@@ -870,14 +883,38 @@ class ResourceTracker {
   uint64_t placeholder_binds_ = 0;  ///< binds of the engine's not-resident buffer
   uint64_t mips_guest_ = 0;            ///< chain decoded from the guest's mip_address
   uint64_t mips_basemap_ = 0;          ///< kBaseMap: level 0 only, no chain wanted at all
+  /// Levels actually overwritten by nx1_d3d9_dbg_mipfill. ARMING COUNTER, and the reason this
+  /// exists: mipfill is an A/B judged entirely by eye ("do distant surfaces show colour bands"),
+  /// which is exactly the shape that has produced seventeen silent instruments here. Reported
+  /// beside mips_built_ so the pair separates the three outcomes -- built=0 means the CPU chain
+  /// never ran at all, built>0 with fill=0 means the cvar is not reaching the fill site, and
+  /// fill>0 means a "still speckles" reading is real evidence rather than an unarmed no-op.
+  uint64_t mipfill_levels_ = 0;
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
   uint64_t probe_rebuilds_ = 0;        ///< rebuilds forced by the content probe
   uint64_t forced_rechecks_ = 0;       ///< re-decodes forced by nx1_d3d9_redecode_delay
+  /// Re-decodes refused by nx1_d3d9_keep_best for being poorer than the decode already held.
+  /// Reported unconditionally: a gate that never fires must be distinguishable from one switched
+  /// off, and "the instrument could not fire" has been this investigation's most repeated failure.
+  uint64_t keepbest_refused_ = 0;
   /// Autotrack hand-off. Decodes run on the async worker and MUST NOT write cvars from there --
   /// doing so crashed the game with a near-null read fault inside the cvar machinery. The decode
   /// posts a request here; AdvanceFrame (main thread) applies it.
   static constexpr uint32_t kAutotrackRelease = 0xFFFFFFFFu;
   std::atomic<uint32_t> autotrack_request_{0};
+  /// The address autotrack currently holds, or 0. Distinct from nx1_d3d9_dbg_track_addr, which the
+  /// operator may also set by hand from the overlay -- the frame poll must only release a latch
+  /// AUTOTRACK took, never one a human aimed. Main thread only.
+  uint32_t autotrack_latched_ = 0;
+  /// Byte span of the texture autotrack latched, posted alongside the address so the DMA watch
+  /// window matches the texture exactly.
+  ///
+  /// A fixed span cannot work for both ends of the range. 65536 (the old default) covered only the
+  /// first QUARTER of the 512x512 BC base that run 066 caught, so a copy landing past +64 KB was
+  /// invisible and "zero DMACOPY landed on it" was unsafe to believe. Widening the default instead
+  /// would over-match in the other direction: a 256x256 DXT1 base is 32768 bytes, so a 262144-byte
+  /// window would swallow copies belonging to the seven textures after it.
+  std::atomic<uint32_t> autotrack_span_{0};
   uint64_t decodes_total_ = 0;         ///< texture decodes performed (speckle baseline)
   uint64_t partial_decodes_ = 0;       ///< of those, decoded with one or more empty source pages
   uint64_t decode_pages_sum_ = 0;      ///< source pages examined across all decodes

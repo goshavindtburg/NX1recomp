@@ -49,6 +49,15 @@
 ///   3 = the `adopt`/`fresh` path (largest yet seen -> becomes retained)
 /// Back away from a surface until it speckles; whichever mode turns it white is the branch
 /// that produced it. Off (0) by default.
+/// Keep showing a surface's better-populated texture rather than adopting a much sparser one.
+/// See BestTexture::src_permille for why size-based retention could not do this.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_prefer_populated, false, "GPU",
+                    "Hold a surface on its best-populated texture instead of adopting a "
+                    "drastically sparser one (the incomplete-texture speckle)");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_prefer_populated_drop, 400, "GPU",
+                      "Permille by which a new texture's source must be sparser than the retained "
+                      "one before nx1_d3d9_prefer_populated refuses it (400 = 40%)");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_prefer_largest, true, "GPU",
                     "Substitute the highest-resolution texture a surface has shown when the "
                     "engine swaps a sampler to a smaller (often unstreamed) LOD. Turn OFF to "
@@ -295,6 +304,68 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_partial_src, 0, "GPU",
                       "the decoded result. A texture that decodes to garbage only while its "
                       "surface speckles is not a decode bug -- it is being decoded from data that "
                       "is not all there yet, and this says so directly");
+
+/// KEEP-BEST DECODE RETENTION.
+///
+/// Texture pool slots never settle. Tracking four of them while the camera did not move once
+/// (run 006) shows every one churning in both directions and none reaching a stable full state:
+///   11F66000: 118897 -> 123347 -> 116307 -> 92300 -> 88612 -> 77807 -> 82819 (of 262144)
+///   11F26000: 138292 -> 126673 -> 120224 -> 201899 -> 203393
+///   118AC000:  88396 ->  94909 -> 150232 -> 231695
+/// We re-decode on every write notification, so every dip in those curves reaches the screen. That
+/// is why merely turning the camera makes distant buildings speckle: the streamer reprioritises on
+/// what is visible, the slot churns, and we sample the bottom of the curve.
+///
+/// The reference is immune for a reason that is about SAMPLING RATE, not about bytes: it uploads a
+/// page when it first becomes valid and keeps that copy until something invalidates it -- one
+/// coherent snapshot, where we take dozens.
+///
+/// So refuse a re-decode whose source is markedly POORER than the source behind the decode we
+/// already hold. Note this is NOT capture-first, which memory records as tried and failed
+/// ("commit_textures = true ... the FIRST decode is already bad") -- the first sample is already
+/// mid-churn. Capture-BEST is a different rule and on the numbers above would hold 11F26000 at
+/// 203k rather than showing 120k.
+///
+/// It is a content heuristic, and this project has been burned by those. What makes it defensible:
+/// it compares a texture against ITS OWN previous decode rather than judging whether art looks
+/// corrupt, it mutates NO guest memory (unlike the density guard, which refused copies), and the
+/// churn data above gives it a predicted effect to be falsified against.
+///
+/// ESCAPES, so a slot that legitimately becomes sparser is not frozen forever: a layout change
+/// always wins (different texture entirely), and after nx1_d3d9_keep_best_max refusals the entry
+/// accepts whatever it is given. Without those this would be the commit-freeze bug again, which
+/// froze textures as garbage for a whole session.
+/// SYNTHETIC TEXTURE TEST -- replace every decoded texture with a known pattern.
+///
+/// Everything upstream of the host texture is now measured clean: the reference reads byte-
+/// identical degraded data (REFUPLOAD), our descriptors match the PM4 register file exactly
+/// (FETCHCMP: 0 mismatches over 14.6M valid comparisons with the reference synchronised), the
+/// decode is byte-verified against two independent implementations, and the mip chain is
+/// exonerated (nomips still speckles). The only untested segment left is
+///   staging surface -> UpdateTexture -> D3DPOOL_DEFAULT texture -> sampler -> shader
+/// and D3D9 cannot read a DEFAULT-pool BC texture back, so it cannot be inspected directly.
+///
+/// So push a KNOWN pattern through it instead. A checkerboard whose colour is derived from the
+/// texture's base address means each texture is visually distinct, which also shows whether
+/// neighbouring surfaces really receive different textures.
+///   pattern renders CLEANLY  -> upload and sampling are sound; whatever we hand them is bad, and
+///                               the decode verification is measuring a buffer that is not what
+///                               reaches the GPU.
+///   pattern SPECKLES too     -> the corruption happens AFTER the texture is filled, and no amount
+///                               of byte work upstream could ever have fixed it.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_synthetic_tex, false, "GPU",
+                    "Replace every decoded texture with a synthetic checkerboard keyed to its "
+                    "address, to test the upload/sampling half of the path");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_keep_best, false, "GPU",
+                    "Refuse a re-decode whose guest source is markedly less populated than the "
+                    "source behind the decode already held (keep the better decode)");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_keep_best_drop_pct, 20, "GPU",
+                      "How much less populated (percent) a re-decode's source must be before "
+                      "nx1_d3d9_keep_best refuses it");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_keep_best_max, 240, "GPU",
+                      "Consecutive re-decodes nx1_d3d9_keep_best may refuse for one entry before "
+                      "accepting anyway, so a slot that legitimately got sparser is not frozen");
 
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_texdump, 0, "GPU",
                       "Debug: dump the next N texture decodes (fetch constant + image)");
@@ -621,8 +692,24 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_redecode_delay, 0, "GPU",
 /// tracking at the exact moment it goes bad, capturing the DMACOPY / WRITE / POLL history from
 /// first bind rather than from whenever a human noticed.
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_autotrack_partial, false, "GPU",
-                    "Point dbg_track_addr at the first <=128x128 fmt=18 texture that decodes with "
-                    "empty source pages, and log why it qualified");
+                    "Point dbg_track_addr at the first texture that decodes with empty source "
+                    "pages, log why it qualified, and flag it when its guest mip chain looks "
+                    "delivered while its base does not. Releases when it decodes cleanly");
+
+/// Size bound for autotrack candidates. This was a hardcoded 128 alongside a fmt==18 test, which
+/// excluded every 256x256 specimen the speckle investigation ever chased -- so autotrack could
+/// never have fired for one, and its silence read as "nothing to track". 512 covers the world
+/// textures; raise it to catch a larger one, lower it to narrow a noisy hunt.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_autotrack_max_dim, 512, "GPU",
+                      "Largest texture dimension autotrack will latch onto (see "
+                      "nx1_d3d9_dbg_autotrack_partial)");
+
+/// Per-page zero percentage at or above which autotrack calls a page STARVED. The decode's own
+/// `partial_pages` cannot be used for this: it counts a page only when it is ENTIRELY zero AND
+/// never written, and the specimens are 76-89% zero, so they never qualified and two hunts found
+/// nothing. 75 sits between the observed starved bases (76-89%) and delivered art (0-3%).
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_autotrack_zero_pct, 75, "GPU",
+                      "Percent of a page that must be zero for autotrack to call it starved");
 
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_framediff, 0, "GPU",
                       "Debug: dump the next N resolves as a PAIR -- our rendered target and "
@@ -651,6 +738,21 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_mipsrc, 0, "GPU",
 REXCVAR_DEFINE_BOOL(nx1_d3d9_bc_mips, true, "GPU",
                     "Build mip chains for block-compressed textures on the CPU (diagnostic: "
                     "set false to leave BC textures unmipped while keeping driver auto-mips)");
+
+/// Fit BC1 endpoints along the block's PRINCIPAL AXIS instead of its bounding box.
+///
+/// MEASURED, on the first mip chains ever dumped from a user-picked speckling surface: the
+/// bounding-box fit this replaces injects mean|diff| 29.1 (13D6E000) and 12.0 (1361E000) per
+/// channel into EVERY generated level, and loses 21% of the image's contrast in one re-encode.
+/// A principal-axis fit on the identical input scores 19.0 and 9.8 -- 34.8% and 18.1% less error
+/// -- and restores most of that contrast. Level 0 is never re-encoded, so all of this lands
+/// exclusively on the distant LODs, which is the shape of the artifact.
+///
+/// Set false to A/B against the old fit. NOTE it does not rebuild textures already resident, so
+/// a surface keeps its old mips until something dirties it.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_bc_pca, true, "GPU",
+                    "Fit BC1 mip endpoints along the block's principal axis rather than its "
+                    "bounding box (false = the old min/max fit, for A/B)");
 
 /// Decode the guest's own mip chain from mip_address instead of generating one from level 0.
 ///
@@ -685,6 +787,69 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_mips, true, "GPU",
 #ifdef _WIN32
 
 namespace nx1::d3d9 {
+
+//--- Multi-texture tracking (see guest_d3d.h) ---------------------------------
+namespace {
+/// The set, plus its live count. Written from the main thread (overlay button), read from the
+/// render thread, the async decode worker and the guest DMA thread -- hence atomics rather than a
+/// lock: every reader only needs a consistent view of one entry, and a torn read at worst logs or
+/// misses one line of debug output. A mutex here would sit on the DMA hook's hot path.
+std::array<std::atomic<uint32_t>, kTrackSetMax> g_track_addr{};
+std::array<std::atomic<uint32_t>, kTrackSetMax> g_track_span{};
+std::atomic<uint32_t> g_track_count{0};
+}  // namespace
+
+void SetTrackSet(const TrackedTex* list, uint32_t count) {
+  count = std::min(count, kTrackSetMax);
+  for (uint32_t i = 0; i < kTrackSetMax; ++i) {
+    g_track_addr[i].store(i < count ? list[i].addr : 0u, std::memory_order_relaxed);
+    g_track_span[i].store(i < count ? list[i].span : 0u, std::memory_order_relaxed);
+  }
+  g_track_count.store(count, std::memory_order_release);
+}
+
+uint32_t TrackedMatch(uint32_t addr) {
+  if (!addr) {
+    return 0;
+  }
+  // PHYSICAL comparison. Texture base addresses arrive already physical, but resolve destinations
+  // are 0xA/0xB-window EAs, and the resolve call sites used to normalise BOTH sides themselves.
+  // Masking here keeps that behaviour for every caller instead of leaving it to each one -- the
+  // "compare physically or the match can never happen" trap that MirrorDmaCopy documents.
+  const uint32_t want = addr & 0x1FFFFFFF;
+  if ((REXCVAR_GET(nx1_d3d9_dbg_track_addr) & 0x1FFFFFFF) == want) {
+    return addr;
+  }
+  const uint32_t n = g_track_count.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t a = g_track_addr[i].load(std::memory_order_relaxed);
+    if (a && (a & 0x1FFFFFFF) == want) {
+      return addr;
+    }
+  }
+  return 0;
+}
+
+uint32_t TrackedList(TrackedTex* out, uint32_t max) {
+  uint32_t written = 0;
+  // The primary comes first and is never duplicated by a set entry.
+  if (const uint32_t primary = REXCVAR_GET(nx1_d3d9_dbg_track_addr); primary && written < max) {
+    out[written++] = {primary, REXCVAR_GET(nx1_d3d9_dbg_track_bytes)};
+  }
+  const uint32_t n = g_track_count.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n && written < max; ++i) {
+    const uint32_t a = g_track_addr[i].load(std::memory_order_relaxed);
+    if (!a) {
+      continue;
+    }
+    bool dup = false;
+    for (uint32_t k = 0; k < written; ++k) dup = dup || out[k].addr == a;
+    if (!dup) {
+      out[written++] = {a, g_track_span[i].load(std::memory_order_relaxed)};
+    }
+  }
+  return written;
+}
 
 namespace {
 
@@ -1097,6 +1262,98 @@ void SwapDwords(uint8_t* dst, const uint8_t* src, size_t bytes) {
   }
 }
 
+/// Overwrite a staging surface's level 0 with a known checkerboard. See nx1_d3d9_dbg_synthetic_tex.
+///
+/// Writes real BC blocks rather than raw bytes: a DXT1/DXT5 block whose two endpoints are EQUAL
+/// decodes to a solid colour whatever the index bits say, so a constant-colour block is trivial to
+/// synthesise and cannot be mistaken for a decode artifact. Formats other than BC1/BC2/BC3 and
+/// A8R8G8B8 are left alone -- a pattern this test cannot synthesise correctly would be
+/// indistinguishable from the corruption it is meant to detect.
+void FillSyntheticLevel(IDirect3DTexture9* staging, uint32_t level, uint32_t width,
+                        uint32_t height, D3DFORMAT fmt, uint32_t seed);
+
+void FillSyntheticPattern(IDirect3DTexture9* staging, uint32_t width, uint32_t height,
+                          D3DFORMAT fmt, uint32_t seed) {
+  if (!staging) {
+    return;
+  }
+  // EVERY LEVEL, not just level 0.
+  //
+  // The first version filled level 0 only, and the result was the most informative accident of the
+  // investigation: up close (level 0) the pattern was pixel-perfect, and at distance (levels 1+,
+  // still holding the decode) it broke up. That localises the fault to the mip chain -- which we
+  // GENERATE on the host -- and it directly contradicts the earlier "nomips still speckles, so the
+  // chain is exonerated" reading. That reading was void: nx1_d3d9_dbg_nomips never armed in any of
+  // 26 logs (its NOMIPS counter, which prints on the first forced application, never appeared).
+  //
+  // Filling every level makes the test decisive: if the pattern is then clean at ALL distances,
+  // upload and sampling are sound at every level and our mip GENERATION is the bug. If it still
+  // breaks at range with every level synthetic, the fault is in level selection or sampling, not
+  // in the data.
+  const DWORD level_count = staging->GetLevelCount();
+  for (DWORD level = 0; level < level_count; ++level) {
+    const uint32_t lw = std::max(width >> level, 1u);
+    const uint32_t lh = std::max(height >> level, 1u);
+    FillSyntheticLevel(staging, level, lw, lh, fmt, seed);
+  }
+}
+
+/// One mip level of the synthetic pattern. Split out so the loop above reads plainly.
+void FillSyntheticLevel(IDirect3DTexture9* staging, uint32_t level, uint32_t width, uint32_t height,
+                        D3DFORMAT fmt, uint32_t seed) {
+  D3DLOCKED_RECT lr{};
+  if (FAILED(staging->LockRect(level, &lr, nullptr, 0))) {
+    return;
+  }
+  // Two distinct colours per texture, derived from its address, so different textures are visibly
+  // different on screen.
+  auto rgb565 = [](uint32_t r, uint32_t g, uint32_t b) -> uint16_t {
+    return uint16_t(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+  };
+  const uint32_t h = seed >> 12;
+  const uint16_t ca = rgb565((h * 37) & 0xFF, (h * 91) & 0xFF, (h * 151) & 0xFF);
+  const uint16_t cb = rgb565(255 - ((h * 37) & 0xFF), 255 - ((h * 91) & 0xFF), 60);
+  const uint32_t bw = (width + 3) / 4, bh = (height + 3) / 4;
+  auto* base = static_cast<uint8_t*>(lr.pBits);
+  const bool bc1 = fmt == D3DFMT_DXT1;
+  const bool bc23 = fmt == D3DFMT_DXT2 || fmt == D3DFMT_DXT3 || fmt == D3DFMT_DXT4 ||
+                    fmt == D3DFMT_DXT5;
+  if (bc1 || bc23) {
+    const uint32_t stride = bc1 ? 8 : 16;
+    for (uint32_t by = 0; by < bh; ++by) {
+      uint8_t* row = base + size_t(by) * lr.Pitch;
+      for (uint32_t bx = 0; bx < bw; ++bx) {
+        uint8_t* blk = row + size_t(bx) * stride;
+        // 4x4-block checkerboard: 8 blocks (32 texels) per square, large enough to read at range.
+        const uint16_t c = (((bx >> 3) + (by >> 3)) & 1) ? ca : cb;
+        if (bc23) {
+          blk[0] = 0xFF;  // BC4 alpha: a0 = a1 = 255 -> fully opaque regardless of the index bits
+          blk[1] = 0xFF;
+          std::memset(blk + 2, 0, 6);
+          blk += 8;
+        }
+        // Equal endpoints -> every palette entry is the same colour -> solid block.
+        blk[0] = uint8_t(c & 0xFF);
+        blk[1] = uint8_t(c >> 8);
+        blk[2] = uint8_t(c & 0xFF);
+        blk[3] = uint8_t(c >> 8);
+        std::memset(blk + 4, 0, 4);
+      }
+    }
+  } else if (fmt == D3DFMT_A8R8G8B8 || fmt == D3DFMT_X8R8G8B8) {
+    for (uint32_t y = 0; y < height; ++y) {
+      auto* row = reinterpret_cast<uint32_t*>(base + size_t(y) * lr.Pitch);
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint16_t c = (((x >> 5) + (y >> 5)) & 1) ? ca : cb;
+        const uint32_t r = ((c >> 11) & 0x1F) << 3, g = ((c >> 5) & 0x3F) << 2,
+                       b = (c & 0x1F) << 3;
+        row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+      }
+    }
+  }
+  staging->UnlockRect(level);
+}
+
 const uint8_t* TranslatePhysical(uint32_t guest_physical) {
   auto* memory = rex::system::kernel_state()->memory();
   return memory->TranslatePhysical<const uint8_t*>(guest_physical);
@@ -1213,6 +1470,27 @@ struct TextureEntry {
   /// exactly that -- source went 0 -> 8121/8192 nonzero AFTER the entry committed, and it then
   /// reported dirty=0 committed=1 on every subsequent frame and never re-decoded.
   bool decoded_from_partial = false;
+  /// Populated (non-zero) source bytes behind the decode this entry currently holds, and how many
+  /// re-decodes have been REFUSED for being poorer than it. See nx1_d3d9_keep_best.
+  uint32_t decoded_nonzero = 0;
+  uint32_t decoded_sampled = 0;
+  uint32_t keepbest_refusals = 0;
+  /// HIGH-WATER MARK: the best source population ever seen for this slot, with the sample count it
+  /// was measured over. Only ever rises; cleared when layout_key changes (a different texture).
+  ///
+  /// The first keep-best compared against `decoded_nonzero` -- the population of whatever decode we
+  /// last ACCEPTED -- and that is why it did nothing (2129 refusals, speckle unchanged). When the
+  /// escape hatch fired we accepted a trough decode AND reset the baseline to that trough, so the
+  /// ratchet collapsed and everything after passed. It was a comparison against the last thing we
+  /// happened to take, which is exactly the trap a churning slot sets.
+  ///
+  /// Measured justification (run 010, texture 10DD4000, from the reference's own upload dumps): the
+  /// SAME pages read ~99% populated at submissions 11623/12591/12945 and 12-49% at 12075/15363/
+  /// 15364. The complete texture genuinely exists and recurs, so waiting for it is not a judgement
+  /// about what art should look like. Per-slot for that reason -- a global "reject below 90%" would
+  /// freeze legitimately sparse alpha-masked art forever.
+  uint32_t best_nonzero = 0;
+  uint32_t best_sampled = 0;
   /// Cheap content fingerprint of the guest source, taken at decode and re-checked once per
   /// frame on bind. layout_key cannot distinguish two textures when the pool moves a different
   /// image of the SAME dimensions and format into this address -- measured 156 times in one run
@@ -1291,6 +1569,18 @@ struct BestTexture {
   /// content: the streaming pool rebinds a different allocation at the same declared size, and
   /// comparing addresses is what separates that from a texture updating in place.
   uint32_t base_address = 0;
+  /// How POPULATED the guest source of the retained texture was, as a permille of sampled bytes.
+  ///
+  /// Area is the wrong axis on its own, and the note in PreferLargestForSurface records why:
+  /// substituting the retained texture was tried and did nothing, "which means the retained
+  /// texture carries the same bad texels". Of course it did -- retention was keyed on SIZE, so a
+  /// sparse texture could be retained and then serve a different sparse texture.
+  ///
+  /// The census (run 023, first-of-frame filtered) says the axis that matters is population: every
+  /// real surface->texture swap went from a 12-23% populated source to an 83-99% one. So retain
+  /// the best-POPULATED source this surface has shown, and refuse to fall back to a much sparser
+  /// one. That is new evidence, which is what that note asked for.
+  uint32_t src_permille = 0;
 };
 using BestTextureMap = FlatMap<BestTexture>;
 
@@ -2012,8 +2302,9 @@ uint16_t Pack565(Rgba8 c) {
   return uint16_t(((c.r >> 3) << 11) | ((c.g >> 2) << 5) | (c.b >> 3));
 }
 
-/// Fit a BC1 colour block: the endpoints are the per-channel min and max of the 16 texels,
-/// and each texel takes the nearest of the four palette entries. Endpoints are forced into
+/// Fit a BC1 colour block: the endpoints are the extremes along the block's principal colour
+/// axis (or its per-channel min and max with nx1_d3d9_bc_pca off -- see the fit below for what
+/// that costs), and each texel takes the nearest of the four palette entries. Endpoints are forced into
 /// c0 >= c1 so the block always decodes in 4-colour mode -- a 3-colour block would introduce
 /// transparent texels that were never in the source.
 /// `allow_punchthrough` must be true ONLY for real DXT1. BC1 encodes its 1-bit alpha in the
@@ -2040,8 +2331,108 @@ void EncodeBc1Color(const Rgba8 in[16], uint8_t* dst, bool allow_punchthrough) {
   // Fit the endpoints over the OPAQUE texels only. A transparent texel's colour is meaningless
   // (the decoder emits {0,0,0,0} for it), so letting it into the min/max drags both endpoints
   // toward black and greys out the texels that are actually visible.
+  // Which texels get a vote. In punch-through mode a transparent texel's colour is meaningless
+  // (the decoder emits {0,0,0,0} for it), so it must not drag the fit.
+  const bool skip_transparent = punchthrough && any_opaque;
   Rgba8 lo{255, 255, 255, 255}, hi{0, 0, 0, 0};
-  if (punchthrough && any_opaque) {
+
+  if (REXCVAR_GET(nx1_d3d9_bc_pca)) {
+    // PRINCIPAL-AXIS FIT.
+    //
+    // BC1's four palette entries are colinear in RGB: they lie on the segment from c0 to c1. The
+    // bounding-box fit below picks the corners of the block's axis-aligned box, and that diagonal
+    // only coincides with the block's real colour axis when the channels vary together. Where they
+    // are anticorrelated -- one channel rising as another falls -- the box diagonal points somewhere
+    // the data never goes, every texel projects onto it badly, and the block comes back with its
+    // contrast flattened and its HUE SHIFTED. That is a coloured error, and it lands only on the
+    // levels we generate.
+    //
+    // So take the direction the colours actually vary in: the dominant eigenvector of the block's
+    // covariance, by power iteration. Eight iterations of a 3x3 symmetric product is a few dozen
+    // flops per block -- this runs on every block of every generated level of every texture, so a
+    // real eigendecomposition is out of the question.
+    float mean[3] = {0, 0, 0};
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (skip_transparent && in[i].a < 128) continue;
+      mean[0] += in[i].r; mean[1] += in[i].g; mean[2] += in[i].b;
+      ++n;
+    }
+    if (n == 0) {  // every texel transparent: nothing to fit, any endpoints decode the same
+      n = 1;
+      mean[0] = in[0].r; mean[1] = in[0].g; mean[2] = in[0].b;
+    }
+    mean[0] /= float(n); mean[1] /= float(n); mean[2] /= float(n);
+
+    // Upper triangle of the covariance; it is symmetric so six accumulators cover it.
+    float crr = 0, crg = 0, crb = 0, cgg = 0, cgb = 0, cbb = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (skip_transparent && in[i].a < 128) continue;
+      const float dr = float(in[i].r) - mean[0];
+      const float dg = float(in[i].g) - mean[1];
+      const float db = float(in[i].b) - mean[2];
+      crr += dr * dr; crg += dr * dg; crb += dr * db;
+      cgg += dg * dg; cgb += dg * db; cbb += db * db;
+    }
+
+    // SEED WITH THE LARGEST COVARIANCE ROW, not a per-channel guess. A row of a symmetric matrix
+    // cannot be orthogonal to its dominant eigenvector unless the matrix is degenerate (the flat
+    // block, handled by the length test below), so this always has something to converge from.
+    // Measured over 6000 synthetic blocks against an exact eigendecomposition: seeding from the
+    // largest-variance CHANNEL instead left 210/6000 blocks fitting more than 1 unit worse (worst
+    // 15.96), because that seed can sit nearly orthogonal to the true axis and eight iterations
+    // cannot recover. Row seeding: 88/6000, worst 8.06, and a mean gap of -0.003 -- i.e. no worse
+    // than the exact solve on average. Sixteen iterations only reaches 51/6000, which is not worth
+    // double the cost; the residue is blocks whose top two eigenvalues are nearly equal, where the
+    // axis is genuinely ambiguous and either choice fits about as well.
+    const float row_r = crr * crr + crg * crg + crb * crb;
+    const float row_g = crg * crg + cgg * cgg + cgb * cgb;
+    const float row_b = crb * crb + cgb * cgb + cbb * cbb;
+    float ax, ay, az;
+    if (row_r >= row_g && row_r >= row_b) {
+      ax = crr; ay = crg; az = crb;
+    } else if (row_g >= row_b) {
+      ax = crg; ay = cgg; az = cgb;
+    } else {
+      ax = crb; ay = cgb; az = cbb;
+    }
+    if (const float seed_len = std::sqrt(ax * ax + ay * ay + az * az); seed_len > 1e-6f) {
+      ax /= seed_len; ay /= seed_len; az /= seed_len;
+    } else {
+      ax = 1.0f; ay = 0.0f; az = 0.0f;  // degenerate: flat block, endpoints collapse to the mean
+    }
+    for (uint32_t it = 0; it < 8; ++it) {
+      const float nx = crr * ax + crg * ay + crb * az;
+      const float ny = crg * ax + cgg * ay + cgb * az;
+      const float nz = crb * ax + cgb * ay + cbb * az;
+      const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+      if (len < 1e-6f) {
+        break;  // flat (or near-flat) block: the axis is arbitrary, and lo == hi == mean is exact
+      }
+      ax = nx / len; ay = ny / len; az = nz / len;
+    }
+
+    // Project onto the axis and take the extremes as the endpoints.
+    float tmin = 3.4e38f, tmax = -3.4e38f;
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (skip_transparent && in[i].a < 128) continue;
+      const float t = (float(in[i].r) - mean[0]) * ax + (float(in[i].g) - mean[1]) * ay +
+                      (float(in[i].b) - mean[2]) * az;
+      tmin = std::min(tmin, t);
+      tmax = std::max(tmax, t);
+    }
+    if (tmin > tmax) {  // no participating texels (guarded above, but keep the fit total)
+      tmin = tmax = 0.0f;
+    }
+    const auto at = [&](float t) {
+      const auto ch = [](float v) {
+        return uint8_t(std::lround(std::clamp(v, 0.0f, 255.0f)));
+      };
+      return Rgba8{ch(mean[0] + ax * t), ch(mean[1] + ay * t), ch(mean[2] + az * t), 255};
+    };
+    lo = at(tmin);
+    hi = at(tmax);
+  } else if (skip_transparent) {
     for (uint32_t i = 0; i < 16; ++i) {
       if (in[i].a < 128) continue;
       lo.r = std::min(lo.r, in[i].r); hi.r = std::max(hi.r, in[i].r);
@@ -3108,6 +3499,13 @@ void ResourceTracker::LogCacheStats() {
   REXGPU_INFO("nx1_d3d9: CONTENTPROBE {} rebuilds forced by a changed slot occupant -- each one "
               "is a surface that would otherwise have rendered another texture's bytes",
               probe_rebuilds_);
+  // Unconditional, including zero. Zero with the gate ON is a real result: it would mean re-decodes
+  // are never poorer than what they replace, so the churn seen in the POLL trajectories is not
+  // reaching the decode path and keep-best cannot be the answer.
+  REXGPU_WARN("nx1_d3d9: KEEPBEST {} re-decodes refused as poorer than the decode already held "
+              "(gate={}, drop>={}%, max {} consecutive per entry)",
+              keepbest_refused_, REXCVAR_GET(nx1_d3d9_keep_best) ? "on" : "off",
+              REXCVAR_GET(nx1_d3d9_keep_best_drop_pct), REXCVAR_GET(nx1_d3d9_keep_best_max));
   REXGPU_INFO("nx1_d3d9: PARTIALSRC {} of {} decodes had an incomplete source ({}%) | {} of {} "
               "source pages were still empty ({}%) -- the objective speckle baseline",
               partial_decodes_, decodes_total_,
@@ -3123,9 +3521,11 @@ void ResourceTracker::LogCacheStats() {
               "buffer {:08X}); a config that streams properly drives this toward zero",
               placeholder_binds_, DefaultPixelsAddress());
   REXGPU_INFO("nx1_d3d9: mipgen guest={} built={} auto={} basemap(level0 only)={} "
-              "skipped(no chain declared)={} skipped(fmt)={} mip_relocs={}",
+              "skipped(no chain declared)={} skipped(fmt)={} mip_relocs={} | mipfill mode={} "
+              "levels_overwritten={}",
               mips_guest_, mips_built_, mips_auto_, mips_basemap_, mips_skip_nochain_,
-              mips_skip_unsupported_, mip_relocs_);
+              mips_skip_unsupported_, mip_relocs_, REXCVAR_GET(nx1_d3d9_dbg_mipfill),
+              mipfill_levels_);
   // MEMORY ACCOUNTING. A 33 GB runaway was observed twice; guessing at which container or
   // resource pool grows has already cost one wrong fix (the dump force-rebuild was a real
   // pathology but not the cause -- the leak reproduced at the same size without it). Report the
@@ -3996,8 +4396,7 @@ void ResourceTracker::DrainMemoryWrites() {
       const bool hit_mips = entry.mip_watch_size != 0 && addr < m1 && addr + len > m0;
       if (hit_base || hit_mips) {
         entry.dirty = true;
-        if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
-            track && entry.watch_addr == track) {
+        if (const uint32_t track = TrackedMatch(entry.watch_addr); track) {
           REXGPU_INFO("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} ({} {}+{})",
                       track, frame_, addr, len, hit_base ? "watch" : "MIP watch",
                       hit_base ? entry.watch_addr : entry.mip_watch_addr,
@@ -4108,10 +4507,23 @@ void ResourceTracker::AdvanceFrame() {
   if (const uint32_t req = autotrack_request_.exchange(0, std::memory_order_relaxed); req) {
     if (req == kAutotrackRelease) {
       REXCVAR_SET(nx1_d3d9_dbg_track_addr, 0u);
+      autotrack_latched_ = 0;
       REXGPU_WARN("nx1_d3d9: AUTOTRACK released -- that texture decoded COMPLETE, so it healed "
                   "and is not the permanent case. Hunting the next candidate");
     } else {
       REXCVAR_SET(nx1_d3d9_dbg_track_addr, req);
+      // Remember that AUTOTRACK owns this latch, so the frame poll may release it. A latch the
+      // operator set by hand from the overlay must stay put.
+      autotrack_latched_ = req;
+      // Size the DMA watch window to THIS texture -- see autotrack_span_ for why neither a small
+      // nor a large fixed span works.
+      if (const uint32_t span = autotrack_span_.exchange(0, std::memory_order_relaxed)) {
+        REXCVAR_SET(nx1_d3d9_dbg_track_bytes, span);
+        REXGPU_WARN("nx1_d3d9: AUTOTRACK watch window set to {} bytes to match the texture, so a "
+                    "copy landing anywhere in its base is visible (a fixed 64 KB window covered "
+                    "only the first quarter of a 512x512 BC base)",
+                    span);
+      }
     }
   }
 
@@ -4121,17 +4533,109 @@ void ResourceTracker::AdvanceFrame() {
   // between binds, a snapshot at bind time cannot tell that apart from "never written", and
   // the reference backend -- which holds its own GPU-side copy of guest memory -- would keep
   // whatever it captured while the data was live.
-  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr); track) {
+  // Poll EVERY tracked texture, not just the primary. A surface binds up to 8 and there is no way
+  // to tell from the screen which one speckles, so the set is polled together and the log says
+  // which address moved. Per-address history is kept in a small ring rather than a single static,
+  // which is what confined the old poll to one texture.
+  TrackedTex tracked[kTrackSetMax + 1];
+  const uint32_t tracked_n = TrackedList(tracked, kTrackSetMax + 1);
+  for (uint32_t ti = 0; ti < tracked_n; ++ti) {
+    const uint32_t track = tracked[ti].addr;
     if (const uint8_t* p = TranslatePhysical(track)) {
-      uint32_t nz = 0;
-      for (uint32_t i = 0; i < 8192; ++i) {
-        nz += p[i] != 0 ? 1 : 0;
+      // POLL THE WHOLE TRACKED TEXTURE, AND HASH IT.
+      //
+      // Two defects, both of which blunt the experiment this exists for -- track a surface while
+      // it is CLEAN, walk up to it, and see what changes when it speckles:
+      //   - it sampled a fixed 8192 bytes, 3% of a 262144-byte base, so a change anywhere else
+      //     was invisible.
+      //   - it keyed on the NONZERO COUNT alone, so an overwrite that swaps one texture's bytes
+      //     for another's of similar density registers as no change at all. That is precisely the
+      //     event we are hunting: content replaced, not content erased.
+      // Hash as well as count, over the tracked span, and report on either changing.
+      // Each entry carries its own span (its level-0 size), so a 32 KB DXT1 and a 256 KB DXT5
+      // bound by the same surface are each polled over exactly their own extent.
+      const uint32_t span = std::min(
+          std::max(tracked[ti].span ? tracked[ti].span : REXCVAR_GET(nx1_d3d9_dbg_track_bytes),
+                   4096u),
+          1u << 20);
+      uint32_t nz = 0, empty_pages = 0, pages = 0;
+      uint64_t hash = 1469598103934665603ull;
+      for (uint32_t off = 0; off < span; off += 4096) {
+        const uint32_t end = std::min(off + 4096u, span);
+        uint32_t page_nz = 0;
+        for (uint32_t i = off; i < end; ++i) {
+          page_nz += p[i] != 0 ? 1 : 0;
+          hash = (hash ^ p[i]) * 1099511628211ull;
+        }
+        nz += page_nz;
+        ++pages;
+        empty_pages += page_nz == 0 ? 1 : 0;
       }
-      static uint32_t last_nz = 0xFFFFFFFFu;
-      if (nz != last_nz) {
-        REXGPU_INFO("nx1_d3d9: TRACK {:08X} POLL frame={} nonzero={}/8192 (was {})", track, frame_,
-                    nz, last_nz == 0xFFFFFFFFu ? 0 : last_nz);
+      // Per-ADDRESS history. A single static pair could only ever describe one texture, so with a
+      // set every entry would look changed on every frame as the statics ping-ponged between them.
+      struct PollHist {
+        uint32_t addr = 0;
+        uint32_t nz = 0xFFFFFFFFu;
+        uint64_t hash = 0;
+      };
+      static PollHist hist[kTrackSetMax + 1];
+      PollHist* h = nullptr;
+      for (auto& e : hist) {
+        if (e.addr == track) {
+          h = &e;
+          break;
+        }
+      }
+      if (!h) {  // first sight of this address: claim a free or stale slot
+        for (auto& e : hist) {
+          if (!e.addr || !TrackedMatch(e.addr)) {
+            e = PollHist{track, 0xFFFFFFFFu, 0};
+            h = &e;
+            break;
+          }
+        }
+        if (!h) {
+          continue;
+        }
+      }
+      uint32_t& last_nz = h->nz;
+      uint64_t& last_hash = h->hash;
+      if (nz != last_nz || hash != last_hash) {
+        // Same count with a different hash is the interesting case and is called out, because it
+        // means the texture was REPLACED rather than filled -- invisible to the old poll.
+        REXGPU_WARN("nx1_d3d9: TRACK {:08X} POLL frame={} nonzero={}/{} ({} empty of {} pages) "
+                    "hash={:016X}{}",
+                    track, frame_, nz, span, empty_pages, pages, hash,
+                    (nz == last_nz && last_nz != 0xFFFFFFFFu)
+                        ? "  *** SAME nonzero count, DIFFERENT bytes -- this slot was REPLACED,"
+                          " not filled ***"
+                        : "");
         last_nz = nz;
+        last_hash = hash;
+      }
+      // RELEASE AN AUTOTRACK LATCH THAT HAS HEALED. The decode-path release could not do this:
+      // it only runs when the texture is DECODED again, and run 065's catch was served from cache
+      // for its whole life (57 binds, 57 CACHED, zero decodes), so the latch stuck on a texture
+      // that had long since filled.
+      //
+      // And it HAD filled -- 1A4C1000 polled 512/8192 nonzero when autotrack latched at frame
+      // 1358 and 6977/8192 by frame 2023. It was caught MID-STREAM, not stuck. That is the real
+      // lesson from that run: the guest lands a texture's MIP CHAIN BEFORE ITS BASE LEVEL, so
+      // "starved base, delivered mips" is a normal transient of streaming and is only a fault when
+      // it PERSISTS. Compare 16EE0000, which held the same decode across 580 frames.
+      //
+      // Polling is the right place for this because it observes the memory directly and needs no
+      // decode. Releasing re-arms the hunt for the next candidate.
+      // Threshold is against the SPAN now that the poll covers the whole texture; it used to be
+      // against a fixed 8192 and would have fired ~32x too easily on a 256 KB base.
+      if (autotrack_latched_ == track && uint64_t(nz) * 100 >= uint64_t(span) * 50u) {
+        REXGPU_WARN("nx1_d3d9: AUTOTRACK {:08X} RELEASED at frame {} -- it FILLED ({}/{} "
+                    "nonzero), so it was caught mid-stream rather than stuck. The mip chain "
+                    "landing before the base level is normal streaming order; only a texture "
+                    "that STAYS starved is the specimen. Re-arming the hunt",
+                    track, frame_, nz, span);
+        autotrack_latched_ = 0;
+        REXCVAR_SET(nx1_d3d9_dbg_track_addr, 0u);
       }
     }
   }
@@ -4724,8 +5228,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                            : MixKey(t.base_address, sampler);
   auto* map = static_cast<TextureMap*>(textures_);
   auto& entry = (*map)[key];
-  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
-      track && t.base_address == track && entry.tex && entry.layout_key != layout_key) {
+  if (const uint32_t track = TrackedMatch(t.base_address);
+      track && entry.tex && entry.layout_key != layout_key) {
     REXGPU_INFO("nx1_d3d9: TRACK {:08X} LAYOUT CHANGED frame={} sampler={} {}x{} fmt={} -- the "
                 "pool handed this address to a different texture",
                 t.base_address, frame_, sampler, t.width, height, t.format);
@@ -4896,12 +5400,49 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       }
     }
   }
+  // KEEP-BEST: is this rebuild an improvement, or are we about to adopt a worse moment of a
+  // churning slot? Evaluated only when we ALREADY hold a decode of the SAME layout -- a layout
+  // change is a different texture and always wins. See nx1_d3d9_keep_best.
+  if (entry.tex && entry.dirty && entry.layout_key == layout_key && REXCVAR_GET(nx1_d3d9_keep_best) &&
+      entry.best_sampled && entry.watch_size) {
+    // entry.watch_size, not guest_bytes: the latter is computed further down and is not in scope
+    // here. It is the byte span of the decode we are holding, which is the right basis anyway --
+    // this branch only runs when layout_key is unchanged, so the span is the same texture's.
+    if (const uint8_t* live = TranslatePhysical(t.base_address)) {
+      const uint32_t sample_cap = std::min<uint32_t>(entry.watch_size, 1u << 20);
+      uint32_t nz = 0, sampled = 0;
+      for (uint32_t i = 0; i < sample_cap; i += 8) {  // sampled: a ratio, not a checksum
+        nz += live[i] != 0 ? 1 : 0;
+        ++sampled;
+      }
+      // Compare as a RATIO: guest_bytes can differ from the decode we hold if the pool re-aimed
+      // the slot, and comparing raw counts across different sample sizes would be meaningless.
+      // Against the HIGH-WATER MARK, not the last accepted decode -- see Entry::best_nonzero.
+      const uint64_t have = uint64_t(entry.best_nonzero) * sampled;
+      const uint64_t now = uint64_t(nz) * entry.best_sampled;
+      const uint32_t drop = std::min(REXCVAR_GET(nx1_d3d9_keep_best_drop_pct), 100u);
+      if (have && now * 100u < have * (100u - drop) &&
+          entry.keepbest_refusals < REXCVAR_GET(nx1_d3d9_keep_best_max)) {
+        ++entry.keepbest_refusals;
+        ++keepbest_refused_;
+        entry.dirty = false;  // keep what we have; a later, better write can dirty it again
+        entry.last_frame = frame_;
+        if (const uint32_t track = TrackedMatch(t.base_address); track) {
+          REXGPU_WARN("nx1_d3d9: TRACK {:08X} KEEPBEST refused re-decode #{} frame={} -- source is "
+                      "{}/{} populated where the decode we hold came from {}/{}. Adopting it would "
+                      "show a poorer moment of a churning slot",
+                      track, entry.keepbest_refusals, frame_, nz, sampled, entry.best_nonzero,
+                      entry.best_sampled);
+        }
+        return entry.tex;
+      }
+    }
+  }
   if (entry.tex && entry.layout_key == layout_key && (!entry.dirty || frame_ < entry.retry_frame)) {
     entry.last_frame = frame_;
     // Painting the tracked address white answers "which surface is this texture?" without a
     // capture tool: set the cvar, look for the white thing.
-    if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
-        track && t.base_address == track) {
+    if (const uint32_t track = TrackedMatch(t.base_address); track) {
       // Why a bind took the cache early-out. If this reports dirty=1 the entry was invalidated
       // and we served the stale decode anyway, which would be the bug outright.
       static uint64_t last_logged = 0;
@@ -5711,8 +6252,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     }
   }
 
-  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
-      track && t.base_address == track) {
+  if (const uint32_t track = TrackedMatch(t.base_address); track) {
     // Whole-texture coverage, per 4 KB page. A texture can span 32 pages while the write
     // notification covers one, so "the first page has data" says nothing about the rest --
     // and a half-populated source is exactly what decodes to structured garbage.
@@ -6216,6 +6756,8 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                                                uint8_t(y * 255 / (height ? height : 1)), 128, 255};
         }
       }
+      // Counted on the same line as mode 1 so either mode's arming is visible in one place.
+      ++mipfill_levels_;
     }
     for (uint32_t level = 1; level < levels; ++level) {
       const uint32_t lw = std::max(1u, t.width >> level);
@@ -6234,6 +6776,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         for (auto& px : next) {
           px = c;
         }
+        ++mipfill_levels_;
       }
       if (dump_left) {
         std::snprintf(dump_path, sizeof(dump_path), "texdump/mip_%08X_f%llu_L%u.bmp",
@@ -6395,6 +6938,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ++tex_failures_;
     return nullptr;
   }
+  // Known pattern instead of the decode, when armed. Placed here so it overwrites whatever the
+  // decode produced but still travels the ENTIRE remaining path -- UpdateTexture, the DEFAULT-pool
+  // texture, the sampler and the shader -- which is exactly the segment under test.
+  if (REXCVAR_GET(nx1_d3d9_dbg_synthetic_tex)) {
+    FillSyntheticPattern(staging, t.width, height, host.d3d, t.base_address);
+  }
   if (FAILED(device_->UpdateTexture(staging, entry.tex))) {
     REXGPU_ERROR("nx1_d3d9: UpdateTexture({}x{}, fmt {}) failed", t.width, height, t.format);
     staging->Release();
@@ -6412,6 +6961,14 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // Approximate host footprint: the level-0 surface plus a full chain is ~4/3 of level 0.
   entry.host_bytes =
       uint32_t(size_t(dst_row_bytes) * extent.block_height * (levels > 1 ? 4 : 3) / 3);
+  // A layout change means a DIFFERENT texture in this slot, so the high-water mark from the
+  // previous occupant must not gate it -- otherwise a small or sparse successor could never
+  // satisfy a mark set by a large dense predecessor and would be frozen out permanently.
+  if (entry.layout_key != layout_key) {
+    entry.best_nonzero = 0;
+    entry.best_sampled = 0;
+    entry.keepbest_refusals = 0;
+  }
   entry.layout_key = layout_key;
   entry.dirty = false;
   {
@@ -6454,6 +7011,88 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // is: the pages have not all arrived. Keeping it caches a permanently speckled texture.
   // Independent of the retry cvar: even without retrying, a partial decode must not be frozen.
   entry.decoded_from_partial = partial_pages != 0;
+  // Record what this decode was made from, so a later rebuild can be judged against it. Sampled
+  // the same way keep-best samples, or the two are not comparable.
+  if (src && guest_bytes) {
+    const uint32_t sample_cap = std::min<uint32_t>(uint32_t(guest_bytes), 1u << 20);
+    uint32_t nz = 0, sampled = 0;
+    for (uint32_t i = 0; i < sample_cap; i += 8) {
+      nz += src[i] != 0 ? 1 : 0;
+      ++sampled;
+    }
+    entry.decoded_nonzero = nz;
+    entry.decoded_sampled = sampled;
+    // Keyed by ADDRESS for the population gate -- see ResourceTracker::src_permille_.
+    if (sampled) {
+      src_permille_[t.base_address] = uint32_t(uint64_t(nz) * 1000u / sampled);
+      // *** GUEST RESIDENCY CLASSIFIER ***
+      //
+      // Read straight off the fetch constant, using the guest's OWN address arithmetic -- not a
+      // content heuristic. Load_Texture (recomp nx1_mp_recomp.36.cpp:10707) computes one boolean
+      // from ImageCache_GetImageBasePixels and uses it to pick between two address fixups:
+      //
+      //   RESIDENT     XGOffsetBaseTextureAddress -> base = basePixels (image-cache memory),
+      //                                              mip  = pixels (fastfile blob)
+      //                                              set INDEPENDENTLY, so the delta is arbitrary
+      //   NOT RESIDENT XGOffsetResourceAddress    -> base = pixels,
+      //                                              mip  = pixels + align(baseSize, 4096)
+      //
+      // So `mip == base + align(base_size, 4096)` identifies the non-resident path exactly. There
+      // the base level lives in the FASTFILE BLOB rather than the cache, which is fine once the
+      // blob has been read from disk and empty before that -- which is what a 12-23% populated
+      // source looks like.
+      //
+      // The guest never clamps mips for either case: SetSamplerState_MaxMipLevel has ZERO call
+      // sites in the recomp, SetTextureHeader_D3D writes only mip_max_level, and Load_Texture
+      // always passes the full levelCount. So residency changes ADDRESSES ONLY, and a host that
+      // samples level 0 of a non-resident image reads whatever that blob region currently holds.
+      const uint32_t aligned_base = (uint32_t(guest_bytes) + 4095u) & ~4095u;
+      const bool nonresident =
+          t.mip_address && aligned_base && t.mip_address == t.base_address + aligned_base;
+      const uint32_t permille = uint32_t(uint64_t(nz) * 1000u / sampled);
+      {
+        static std::atomic<uint64_t> res_n{0}, res_pm{0}, non_n{0}, non_pm{0}, nomip_n{0};
+        if (!t.mip_address) {
+          nomip_n.fetch_add(1, std::memory_order_relaxed);
+        } else if (nonresident) {
+          non_n.fetch_add(1, std::memory_order_relaxed);
+          non_pm.fetch_add(permille, std::memory_order_relaxed);
+        } else {
+          res_n.fetch_add(1, std::memory_order_relaxed);
+          res_pm.fetch_add(permille, std::memory_order_relaxed);
+        }
+        const uint64_t total = res_n.load(std::memory_order_relaxed) +
+                               non_n.load(std::memory_order_relaxed) +
+                               nomip_n.load(std::memory_order_relaxed);
+        // Every 2000, not 20000. At the wider cadence the FIRST report landed at decode #1 with
+        // every counter still zero, and the second needed 20,001 decodes -- a run doing 13,758
+        // produced exactly one useless line reading "resident=0 NOT-resident=0". A report whose
+        // first sample is size one is worse than none: it looks like a measured zero.
+        if ((total % 2000) == 1) {
+          const uint64_t r = res_n.load(std::memory_order_relaxed);
+          const uint64_t nr = non_n.load(std::memory_order_relaxed);
+          // Unconditional, including zeros: if one class never appears the classifier is wrong,
+          // and a "non-resident textures are the bad ones" reading would be unfalsifiable.
+          REXGPU_WARN("nx1_d3d9: RESIDENCY resident={} decodes (mean {} permille populated) | "
+                      "NOT-resident={} decodes (mean {} permille) | no-mip-chain={}. "
+                      "Non-resident means base_address points into the FASTFILE BLOB "
+                      "(mip == base + align(baseSize,4096)); a low mean there is a blob that has "
+                      "not been read from disk yet",
+                      r, r ? res_pm.load(std::memory_order_relaxed) / r : 0, nr,
+                      nr ? non_pm.load(std::memory_order_relaxed) / nr : 0,
+                      nomip_n.load(std::memory_order_relaxed));
+        }
+      }
+    }
+    // RAISE ONLY. A forced accept (escape hatch) must not drag the mark down to the trough it just
+    // let through -- that is the exact defect that made the first keep-best inert.
+    if (uint64_t(nz) * std::max(entry.best_sampled, 1u) >
+        uint64_t(entry.best_nonzero) * std::max(sampled, 1u)) {
+      entry.best_nonzero = nz;
+      entry.best_sampled = sampled;
+    }
+  }
+  entry.keepbest_refusals = 0;
   // RELEASE the latch when the tracked texture decodes CLEANLY, so the hunt moves on. The first
   // catch healed: data arrived progressively (nonzero 0 -> 1359 -> 7239 -> 7380), the guest wrote
   // it, DIRTIED fired correctly. Partial-at-first-decode is NORMAL -- a texture caught mid-stream
@@ -6467,13 +7106,139 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
       REXCVAR_GET(nx1_d3d9_dbg_track_addr) == t.base_address) {
     autotrack_request_.store(kAutotrackRelease, std::memory_order_relaxed);
   }
-  if (partial_pages && REXCVAR_GET(nx1_d3d9_dbg_autotrack_partial) &&
-      !REXCVAR_GET(nx1_d3d9_dbg_track_addr) && t.format == 18 && t.width <= 128 && height <= 128) {
-    autotrack_request_.store(t.base_address, std::memory_order_relaxed);
-    REXGPU_WARN("nx1_d3d9: AUTOTRACK {:08X} {}x{} fmt={} decoded with {} of {} source pages EMPTY "
-                "-- tracking from here. Watch for a DMACOPY landing on it (and what its source "
-                "held), and for a WRITE arriving AFTER this decode",
-                t.base_address, t.width, height, t.format, partial_pages, src_pages_total);
+  // THE FILTER USED TO BE `t.format == 18 && t.width <= 128 && height <= 128`, which made this
+  // structurally incapable of catching anything we were actually chasing: every specimen in the
+  // 2026-07-21 investigation is 256x256 (0505C000, 11BF9000, 10FAD000, 16EE0000, 12D18000). It
+  // never fired for them, which read as "no partial decodes worth tracking" and meant only "none
+  // at or below 128x128". Bounded by a cvar now instead of a literal.
+  // NOT GATED ON `partial_pages` -- that was the defect that made two runs find nothing.
+  //
+  // partial_pages counts a page only when it is ENTIRELY zero AND was never written (:5702). The
+  // specimen does not look like that: 16EE0000's base pages were 76-89% zero, so nz != 0, so
+  // partial_pages was 0 and the texture could never become a candidate. Run 064 confirmed it --
+  // zero specimens, and the only candidate all run was one mip-less texture. A gate that cannot
+  // select the thing being hunted reports absence indistinguishably from success.
+  //
+  // Candidacy is now a per-page zero FRACTION on both regions, which is what "starved" actually
+  // looks like in these captures.
+  if (REXCVAR_GET(nx1_d3d9_dbg_autotrack_partial) && !REXCVAR_GET(nx1_d3d9_dbg_track_addr) &&
+      t.width <= REXCVAR_GET(nx1_d3d9_dbg_autotrack_max_dim) &&
+      height <= REXCVAR_GET(nx1_d3d9_dbg_autotrack_max_dim)) {
+    // IS THIS THE "EMPTY BASE, GOOD MIPS" SPECIMEN? That pairing is the sharpest open question
+    // left: 16EE0000's base was 76-89% zero while its guest mip 1 decoded as a perfect, complete,
+    // 100%-nonzero image. Same texture, same allocation, one region delivered and the other not.
+    // Scanning the mip region here says so at the moment of decode, while the address is still
+    // live -- which is the only time it is useful, because the pool reassigns addresses every
+    // launch and a specimen identified from an offline dump can no longer be tracked.
+    //
+    // This is a RELATIVE test within one texture, not a content judgement. A legitimately dark or
+    // sparse texture has an equally dark mip chain, because a mip is a downsample of the base and
+    // downsampling preserves the mean. A base that is mostly zero while its OWN half-size copy is
+    // mostly non-zero is an internal inconsistency, not art. That distinction is why this is not
+    // the sixth repeat of "inferred badness from texture content" -- but it is close enough to it
+    // that the log prints both figures, so the call can be checked rather than trusted.
+    // A page counts as STARVED when it is mostly zeros -- not when it is entirely zero. The
+    // threshold is a cvar because it is the one number here that is a judgement rather than a
+    // measurement; 75% separates the observed specimens (76-89% zero) from delivered art
+    // (0-3% zero) with a wide margin either side.
+    const uint32_t zero_pct = std::min(100u, REXCVAR_GET(nx1_d3d9_dbg_autotrack_zero_pct));
+    // UNDELIVERED MEMORY IS EXACTLY ZERO. SPARSE ART IS PARTIALLY ZERO.
+    //
+    // Counting a page as starved at >=75% zero conflates the two, and run 066 proved it: this
+    // latched 07B7B000 claiming "16 of 16 base pages starved", while that texture's own BIND line
+    // reported `0 of 64 pages EMPTY` for the base and `15 of 64` for the MIP -- the opposite
+    // reading. Both were true. Mine counted mostly-zero pages, BIND counted entirely-zero ones,
+    // and a mostly-zero page is what transparent art looks like.
+    //
+    // Two compounding errors, both mine:
+    //   - the scan capped at 64 KB, the first QUARTER of a 512x512 base, and generalised from it.
+    //     In tiled layout that quarter is a specific spatial region, so a texture with a
+    //     transparent top -- a sign, a window, a decal -- trips it by construction.
+    //   - >=75% zero was calibrated against 16EE0000's 76-89% figures without asking what ELSE
+    //     produces them. That is the sixth time this investigation would have inferred badness
+    //     from texture content.
+    //
+    // So count both, over the WHOLE extent, and make the latch depend on the exactly-zero count.
+    const uint32_t kScanCap = 1u << 20;
+    const auto starved_scan = [zero_pct, kScanCap](const uint8_t* p, uint32_t bytes,
+                                                   uint32_t* empty, uint32_t* starved,
+                                                   uint32_t* total) {
+      *empty = *starved = *total = 0;
+      if (!p || !bytes) {
+        return;
+      }
+      const uint32_t scan_bytes = std::min<uint32_t>(bytes, kScanCap);
+      for (uint32_t off = 0; off < scan_bytes; off += 4096) {
+        const uint32_t end = std::min(off + 4096u, scan_bytes);
+        uint32_t zeros = 0;
+        for (uint32_t i = off; i < end; ++i) zeros += p[i] == 0 ? 1 : 0;
+        ++*total;
+        *empty += (zeros == end - off) ? 1 : 0;
+        *starved += (zeros * 100 >= (end - off) * zero_pct) ? 1 : 0;
+      }
+    };
+    // Base is scanned from `src` -- the bytes this decode actually used -- while the mip region is
+    // read live. They can differ in principle; MIRRORSTALE measured that divergence at 0.29% of
+    // pages, so it does not move this comparison.
+    uint32_t base_empty = 0, base_starved = 0, base_total = 0;
+    uint32_t mip_empty = 0, mip_starved = 0, mip_total_pages = 0;
+    starved_scan(src, uint32_t(guest_bytes), &base_empty, &base_starved, &base_total);
+    if (t.mip_address && guest_bytes) {
+      starved_scan(TranslatePhysical(t.mip_address), uint32_t(guest_bytes), &mip_empty,
+                   &mip_starved, &mip_total_pages);
+    }
+    const uint32_t mip_nonzero_pages = mip_total_pages - mip_empty;
+    // THE CONTRAST, which is the whole test: this texture's base is mostly starved while its own
+    // mip chain is mostly delivered. Both halves are required -- a starved base alone is ordinary
+    // mid-stream partial delivery, and it is the DISAGREEMENT between a texture and its own
+    // downsample that cannot be explained by dark art.
+    // Latch on EXACTLY-ZERO pages, not mostly-zero ones: undelivered memory reads as exact zeros,
+    // whereas transparent art is merely mostly zero. `base_starved` is still computed and logged
+    // beside it, because the gap between the two numbers is what tells sparse art apart from a
+    // delivery hole -- and a future reader must be able to see that rather than take it on trust.
+    const bool base_starved_mostly = base_total && base_empty * 2 > base_total;
+    const bool mips_look_delivered =
+        mip_total_pages && mip_nonzero_pages * 2 > mip_total_pages && base_starved_mostly;
+
+    // LATCH ONLY ON THE SPECIMEN. The first version latched on ANY partial decode, and the very
+    // first run proved why that fails: it caught 06248000, a 256x128 fmt=10 texture with
+    // mip_address=0 -- no mip chain at all, so it cannot be the empty-base/delivered-mips case --
+    // and then held the latch for the ENTIRE run (2745 TRACK lines, 1359 binds, never released,
+    // zero DMACOPY). One ineligible candidate blocks the hunt completely, because arming requires
+    // track_addr == 0 and the release only fires when THAT texture decodes cleanly.
+    //
+    // So the latch condition is now the specimen definition itself. Everything else is reported
+    // and passed over. Rejections are logged (bounded) rather than dropped silently: "autotrack
+    // never fired" has to be distinguishable from "autotrack fired and rejected 400 candidates",
+    // which is the ambiguity that made the old <=128x128 filter look like an absence of specimens.
+    if (!mips_look_delivered) {
+      static std::atomic<uint64_t> passed{0};
+      const uint64_t n = passed.fetch_add(1, std::memory_order_relaxed) + 1;
+      // Only report a pass-over that was ACTUALLY starved. Every decode reaches this branch now
+      // that the partial_pages gate is gone, so logging them all would bury the signal under
+      // every healthy texture in the scene.
+      if (base_starved_mostly && (n <= 8 || (n % 200) == 0)) {
+        REXGPU_WARN("nx1_d3d9: AUTOTRACK passed over {:08X} {}x{} fmt={} ({} of {} base pages "
+                    "EMPTY ({} also >={}% zero), mip_address={:08X} {} of {} pages delivered) "
+                    "-- {}. {} starved candidates passed over so far; still hunting",
+                    t.base_address, t.width, height, t.format, base_empty, base_total,
+                    base_starved, zero_pct, t.mip_address, mip_nonzero_pages, mip_total_pages,
+                    t.mip_address ? "its mip chain is as starved as its base, so this is ordinary "
+                                    "mid-stream partial delivery"
+                                  : "it has NO mip chain, so the base/mip contrast cannot apply",
+                    n);
+      }
+    } else {
+      autotrack_span_.store(uint32_t(guest_bytes), std::memory_order_relaxed);
+      autotrack_request_.store(t.base_address, std::memory_order_relaxed);
+      REXGPU_WARN("nx1_d3d9: AUTOTRACK {:08X} {}x{} fmt={} -- *** STARVED BASE, DELIVERED MIPS: "
+                  "{} of {} base pages ENTIRELY zero ({} also >={}% zero) while mip_address={:08X} "
+                  "has {} of {} pages delivered. *** Tracking from here. Watch for a DMACOPY "
+                  "landing on the BASE range (and what its source held), and for a WRITE arriving "
+                  "AFTER this decode",
+                  t.base_address, t.width, height, t.format, base_empty, base_total, base_starved,
+                  zero_pct, t.mip_address, mip_nonzero_pages, mip_total_pages);
+    }
   }
   // BASELINE METRIC for the speckle. partial_pages counts source pages that were entirely zero
   // at decode time -- texels the guest had not landed yet -- so a texture decoded with any of
@@ -6534,19 +7299,68 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                   t.packed_mips ? 1 : 0, guest_bytes, t.mip_address);
     }
   }
-  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
-      track && t.base_address == track && white_) {
+  if (const uint32_t track = TrackedMatch(t.base_address); track && white_) {
     return white_;
   }
   return entry.tex;
+}
+
+uint32_t ResourceTracker::SourcePermilleFor(uint32_t base_address) {
+  const auto it = src_permille_.find(base_address);
+  return it == src_permille_.end() ? 0u : it->second;
 }
 
 IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface_key,
                                                                 uint32_t sampler, uint32_t format,
                                                                 IDirect3DBaseTexture9* tex,
                                                                 uint32_t width, uint32_t height,
-                                                                uint32_t base_address) {
+                                                                uint32_t base_address,
+                                                                uint32_t src_permille) {
   if (prof_enabled_) ++prof_lod_.calls;
+  // POPULATION RETENTION RUNS FIRST, ABOVE the prefer_largest early-out below.
+  //
+  // It was originally placed after that check and was therefore DEAD: nx1_d3d9_prefer_largest is
+  // false (memory keeps it off, because it substitutes textures after the dump and makes dumps
+  // lie), so the function returned before ever reaching the gate -- not even its arming counter
+  // ran. The two features are independent; entangling them made a "no holds" reading meaningless.
+  if (REXCVAR_GET(nx1_d3d9_prefer_populated) && surface_key && tex && best_textures_) {
+    auto& bp = (*static_cast<BestTextureMap*>(best_textures_))[
+        MixKey(MixKey(surface_key, sampler), format)];
+    static std::atomic<uint64_t> evaluated{0}, had_both{0}, held{0};
+    const uint64_t e = evaluated.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (src_permille && bp.src_permille) {
+      had_both.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((e % 500000) == 1) {
+      REXGPU_WARN("nx1_d3d9: POPHOLD evaluated {} times, {} with BOTH populations known, {} held. "
+                  "If the second number is 0 the gate cannot fire and any 'no holds' reading "
+                  "is void",
+                  e, had_both.load(std::memory_order_relaxed),
+                  held.load(std::memory_order_relaxed));
+    }
+    if (bp.tex && src_permille && bp.src_permille &&
+        src_permille + REXCVAR_GET(nx1_d3d9_prefer_populated_drop) < bp.src_permille) {
+      const uint64_t h = held.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (h <= 8 || (h % 5000) == 0) {
+        REXGPU_WARN("nx1_d3d9: POPHOLD {} -- surface {:016X} s{} offered {:08X} at {} permille, "
+                    "holding retained {:08X} at {} permille instead",
+                    h, surface_key, sampler, base_address, src_permille, bp.base_address,
+                    bp.src_permille);
+      }
+      return bp.tex;
+    }
+    // Ratchet upward and retain the better-populated texture, independently of the area rule.
+    if (src_permille > bp.src_permille) {
+      if (bp.tex != tex) {
+        if (bp.tex) bp.tex->Release();
+        tex->AddRef();
+        bp.tex = tex;
+      }
+      bp.src_permille = src_permille;
+      bp.base_address = base_address;
+    }
+    bp.last_frame = frame_;
+  }
   // Master off switch. This function SUBSTITUTES a different texture than the one GetTexture
   // resolved, and it does so after the texture dump has already run -- so every dump taken to
   // investigate a surface shows the texture we looked up, not necessarily the one the GPU is
@@ -6565,6 +7379,45 @@ IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface
   // texture in its own lineage.
   auto& b = (*map)[MixKey(MixKey(surface_key, sampler), format)];
   b.last_frame = frame_;
+  // POPULATION RETENTION -- runs before the area logic, because a surface swapping to a barely
+  // streamed allocation is a different failure from a receding LOD and the area rule cannot see it.
+  //
+  // Measured (run 023): every real surface->texture swap went from a 12-23% populated source to an
+  // 83-99% one, i.e. the surface had been rendering an incomplete texture. Holding the better
+  // populated one until the new allocation fills is the direct answer to that.
+  if (REXCVAR_GET(nx1_d3d9_prefer_populated)) {
+    // ARMING. "POPHOLD 0" was previously unreadable: the first version looked the population up in
+    // a map keyed by MixKey(MixKey(base, sampler), layout_key) using base_address alone, so it
+    // always missed and the gate could never fire. Report how often it was EVALUATED and how often
+    // it had both figures, so a zero says which of those it is.
+    static std::atomic<uint64_t> evaluated{0}, had_both{0};
+    const uint64_t e = evaluated.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (src_permille && b.src_permille) {
+      had_both.fetch_add(1, std::memory_order_relaxed);
+    }
+    if ((e % 500000) == 1) {
+      REXGPU_WARN("nx1_d3d9: POPHOLD evaluated {} times, {} with BOTH populations known. If the "
+                  "second number is 0 the gate cannot fire and any 'no holds' reading is void",
+                  e, had_both.load(std::memory_order_relaxed));
+    }
+  }
+  if (REXCVAR_GET(nx1_d3d9_prefer_populated) && b.tex && src_permille && b.src_permille) {
+    const uint32_t drop = REXCVAR_GET(nx1_d3d9_prefer_populated_drop);
+    if (src_permille + drop < b.src_permille) {
+      static std::atomic<uint64_t> held{0};
+      const uint64_t h = held.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (h <= 8 || (h % 5000) == 0) {
+        REXGPU_WARN("nx1_d3d9: POPHOLD {} -- surface {:016X} s{} offered {:08X} at {} permille "
+                    "populated, holding its retained {:08X} at {} permille instead",
+                    h, surface_key, sampler, base_address, src_permille, b.base_address,
+                    b.src_permille);
+      }
+      return b.tex;
+    }
+  }
+  if (src_permille > b.src_permille) {
+    b.src_permille = src_permille;  // ratchet upward only
+  }
   const uint32_t area = width * height;
   const uint32_t dbg = REXCVAR_GET(nx1_d3d9_dbg_lod);
   if (prof_enabled_ && !b.tex) ++prof_lod_.fresh;
@@ -6578,6 +7431,7 @@ IDirect3DBaseTexture9* ResourceTracker::PreferLargestForSurface(uint64_t surface
     b.tex = tex;
     b.area = area;
     b.base_address = base_address;
+    b.src_permille = src_permille ? src_permille : b.src_permille;
     return dbg == 3 && white_ ? white_ : tex;
   }
   // Same size: a fresh binding at the largest resolution (a render target, or updated content). Keep
@@ -7045,8 +7899,7 @@ void ResourceTracker::ResolveDepth(uint32_t dest_address, uint32_t width, uint32
   }
 
   auto* map = static_cast<ResolveMap*>(resolves_);
-  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
-      track && PhysicalAddress(dest_address) == PhysicalAddress(track)) {
+  if (const uint32_t track = TrackedMatch(PhysicalAddress(dest_address)); track) {
     REXGPU_INFO("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
                 height);
   }
@@ -7507,8 +8360,7 @@ void ResourceTracker::ResolveColor(uint32_t dest_address, uint32_t width, uint32
     return;
   }
   auto* map = static_cast<ResolveMap*>(resolves_);
-  if (const uint32_t track = REXCVAR_GET(nx1_d3d9_dbg_track_addr);
-      track && PhysicalAddress(dest_address) == PhysicalAddress(track)) {
+  if (const uint32_t track = TrackedMatch(PhysicalAddress(dest_address)); track) {
     REXGPU_INFO("nx1_d3d9: TRACK {:08X} RESOLVE dest={:08X} {}x{}", track, dest_address, width,
                 height);
   }

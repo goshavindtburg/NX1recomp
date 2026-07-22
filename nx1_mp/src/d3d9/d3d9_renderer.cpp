@@ -8,6 +8,8 @@
 // Sleep macro otherwise mangles.
 #include <rex/cvar.h>
 #include <rex/graphics/graphics_system.h>
+// FormatInfo, for the level-0 guest size recorded with each picked texture (see PickTex).
+#include <rex/graphics/pipeline/texture/info.h>
 #include <rex/logging/macros.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
@@ -121,6 +123,45 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pick_ignore_lo32, 0, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_pick_size, 8, "GPU",
                       "Debug: side length in pixels of the picker box at the screen centre");
 
+/// PASSTHROUGH PIXEL SHADER -- separate "the texel is wrong" from "the shader is wrong".
+///
+/// The speckle has been present since the first COHERENT frames the renderer produced (2026-07-12,
+/// user screenshot), i.e. from the moment translated shaders started emitting legible output. Every
+/// experiment since has assumed the artifact is texture DATA, but a translated pixel shader that
+/// garbles certain pixels looks identical to bad texels -- and shader translation has already
+/// produced four separate visual bugs in this project (the cube() predicate, the Logc clamp, def
+/// constant corruption, the interpolator .w default).
+///
+/// The synthetic-texture test does NOT exonerate the shader, though it was read that way: it proves
+/// the path from staging surface to sampled texel, and the shader sits AFTER that. It also replaced
+/// every texture at once, so a shader that misbehaves on particular input values would not be
+/// exercised by a checkerboard.
+///
+/// This replaces the translated shader for one material with `texld oC0, v0, s0` -- the raw albedo
+/// sample, no lighting, no blending, no math. Set it to a ps_object from the F3 picker.
+///   surface still speckles -> the shader is exonerated; the sampled texels really are wrong
+///   speckle vanishes       -> the translated shader is the fault, and this is a different
+///                             subsystem from the one the whole week has been spent in
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_passthrough_ps, 0, "GPU",
+                      "Debug: draw this pixel-shader object with a passthrough shader that outputs "
+                      "the raw s0 sample, bypassing all translated shader math");
+/// WHICH passthrough. Mode 1 samples s0 with v0; mode 2 shows v0 ITSELF as colour.
+///
+/// Mode 2 exists because mode 1 alone cannot be trusted. It assumes the albedo's texture
+/// coordinate lives in v0, and if it does not -- v1, v2, or v0 carrying vertex colour or a packed
+/// normal -- then a perfectly good texture is sampled at garbage coordinates and the result is
+/// dense high-frequency noise: indistinguishable from the corrupt texels the test is looking for.
+/// The first run of mode 1 produced exactly that, AND turned the whole wall to noise where the
+/// real shader shows only patches, which is the signature of a wrong coordinate rather than a
+/// wrong texture.
+///
+/// So validate the coordinate before believing the sample:
+///   mode 2 shows a SMOOTH GRADIENT -> v0 really is a UV, and mode 1's result stands
+///   mode 2 shows NOISE             -> v0 is not the albedo UV and mode 1 measured nothing
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_passthrough_mode, 1, "GPU",
+                      "1 = sample s0 with v0; 2 = output v0 as colour to validate that v0 is "
+                      "really the texture coordinate");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_solo_ps, 0, "GPU",
                       "Debug: draw ONLY this pixel-shader object -- everything else is skipped. "
                       "Wireframe highlighting a large flat surface shows just an outline and one "
@@ -176,6 +217,26 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_surface_hi, 0, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_dump_surface_lo, 0, "GPU",
                       "Low 32 bits of the surface_key a texture dump is aimed at");
 
+/// SURFACE -> TEXTURE SWAP CENSUS.
+///
+/// With synthetic textures (colour keyed to base_address) and nomips, a wall's checkerboard was
+/// seen changing COLOUR on a small backward step. Since the fill is deterministic per address,
+/// a colour change can only mean the surface is now bound to a DIFFERENT texture address. And
+/// FETCHCMP (0 mismatches over 14.6M valid comparisons against the PM4 register file) says we bind
+/// exactly what the GPU was handed -- so the swap is the guest's own decision, not ours.
+///
+/// The open question is whether that is ordinary LOD behaviour or something pathological, and it
+/// should be a NUMBER rather than an impression: how often does a given surface change the texture
+/// bound to a given sampler, and how far apart are the changes? It matters because every swap
+/// lands on a pool slot that may be mid-stream -- and mid-stream is exactly what was measured
+/// (10CBA000 sat at 21% populated across 2600 binds).
+///
+/// surface_key is (index buffer, start, count, base vertex): stable per surface ACROSS LOD swaps,
+/// which is precisely what is needed to see a surface change its texture.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_texswap, false, "GPU",
+                    "Log when a surface changes the texture address bound to a sampler, with the "
+                    "frame gap since its last change");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_nomips, 0, "GPU",
                       "Debug: force MIPFILTER=NONE on every sampler, so only level 0 is ever "
                       "sampled. The confetti speckle is distance-dependent and level 0 is "
@@ -190,6 +251,20 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_fetchcmp, false, "GPU",
                     "read (the guest D3D shadow copy) against the PM4 register file the "
                     "reference backend uses (what the GPU was actually handed). A mismatch "
                     "means we bind a different texture than the guest asked for");
+
+/// Set-based half of FETCHCMP, and the only one that works in a NORMAL native run.
+///
+/// FETCHCMP compares our fetch constant against the register file PER DRAW, which requires
+/// nx1_skip_reference_raster=false to keep the two sides on the same draw -- an expensive config.
+/// The desync is positional only: the register file is written during PM4 parsing and its contents
+/// are live regardless. So compare SETS instead and the synchronisation requirement disappears.
+///
+/// Answers one question: do we ever bind a texture address the GPU's register file never held?
+/// Non-zero = we bind textures the guest never asked for (the stale-descriptor hypothesis).
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_fetchset, false, "GPU",
+                    "Accumulate the SET of texture addresses we bind and the set the PM4 register "
+                    "file holds, and report ours-not-in-theirs. Unlike dbg_fetchcmp this needs no "
+                    "reference rasterisation");
 
 REXCVAR_DEFINE_BOOL(nx1_d3d9_basemap, true, "GPU",
                     "Honour xenos mip_filter kBaseMap (MIPFILTER=NONE): the game's signal that "
@@ -583,7 +658,16 @@ IDirect3DQuery9* Renderer::PickBegin(const RecordedDraw& d) {
     if (!t.valid || !t.base_address) {
       continue;
     }
-    pe.tex[pe.tex_count++] = {si, t.base_address, t.width, t.height, t.format};
+    // Level-0 guest size, by the format's own block geometry -- the same arithmetic the decode
+    // uses, so TRACK's watch window ends up covering exactly what a decode would read.
+    uint32_t level0_bytes = 0;
+    if (const auto* fi = rex::graphics::FormatInfo::Get(t.format)) {
+      const uint32_t bw = (t.width + fi->block_width - 1) / fi->block_width;
+      const uint32_t th = t.dimension == 0 ? 1u : t.height;
+      const uint32_t bh = (th + fi->block_height - 1) / fi->block_height;
+      level0_bytes = bw * bh * fi->bytes_per_block();
+    }
+    pe.tex[pe.tex_count++] = {si, t.base_address, t.width, t.height, t.format, level0_bytes};
   }
   q->Issue(D3DISSUE_BEGIN);
   return q;
@@ -1858,11 +1942,21 @@ bool Renderer::BindShadersAndConstants(const RecordedDraw& d) {
   // Latch which sampler slots these shaders can actually read, so BindTextures skips the rest.
   // A draw with no pixel shader samples nothing at all (depth/shadow-only pass).
   active_sampler_mask_ = 0;
+  // Did we DERIVE this mask from the shader's declared texld registers, or fall back to "all 16"
+  // because the shader could not be walked? It decides whether an odd binding matters: on a
+  // derived mask the shader provably samples that slot, so a wrong texture there reaches the
+  // screen. On the fallback we bind slots the shader may never read, and a stale value in one is
+  // harmless. FETCHSET's orphan count is meaningless until the two are separated.
+  sampler_mask_fallback_ = false;
   if (ps) {
     active_sampler_mask_ |= ps->all_samplers ? 0xFFFFu : ps->sampler_mask;
+    sampler_mask_fallback_ = ps->all_samplers;
+  } else {
+    sampler_mask_fallback_ = true;  // no PS walked at all
   }
   if (vs->all_samplers) {
     active_sampler_mask_ = 0xFFFFu;  // unwalkable VS: cannot rule out vertex-texture fetch
+    sampler_mask_fallback_ = true;
   }
 
   // Material highlight: bind a purpose-built magenta shader for ONE material. Patching the
@@ -1887,6 +1981,51 @@ bool Renderer::BindShadersAndConstants(const RecordedDraw& d) {
     }
     if (magenta_ps_) {
       want_ps = magenta_ps_;
+    }
+  }
+  // Passthrough: raw s0 sample, no translated math. See nx1_d3d9_dbg_passthrough_ps.
+  if (const uint32_t pass_ps = REXCVAR_GET(nx1_d3d9_dbg_passthrough_ps);
+      pass_ps && d.ps_object && d.ps_object == pass_ps && want_ps) {
+    const uint32_t pass_mode = REXCVAR_GET(nx1_d3d9_dbg_passthrough_mode);
+    if (passthrough_mode_built_ != pass_mode && passthrough_ps_) {
+      passthrough_ps_->Release();
+      passthrough_ps_ = nullptr;
+    }
+    if (!passthrough_ps_) {
+      passthrough_mode_built_ = pass_mode;
+      // ps_3_0: dcl_texcoord v0 / dcl_2d s0 / texld oC0, v0, s0 / end.
+      static const DWORD kPassthrough[] = {
+          0xFFFF0300u,                            // ps_3_0
+          0x0200001Fu, 0x80000005u, 0x900F0000u,  // dcl_texcoord v0
+          0x0200001Fu, 0x90000000u, 0xA00F0800u,  // dcl_2d s0
+          0x03000042u, 0x800F0800u, 0x90E40000u, 0xA0E40800u,  // texld oC0, v0, s0
+          0x0000FFFFu,                            // end
+      };
+      // Mode 2: mov oC0, v0 -- the coordinate itself, as colour. A real UV is a smooth
+      // red/green gradient across the surface; anything else means v0 is not the albedo UV.
+      static const DWORD kShowUV[] = {
+          0xFFFF0300u,                            // ps_3_0
+          0x0200001Fu, 0x80000005u, 0x900F0000u,  // dcl_texcoord v0
+          0x02000001u, 0x800F0800u, 0x90E40000u,  // mov oC0, v0
+          0x0000FFFFu,                            // end
+      };
+      const DWORD* code = (pass_mode == 2) ? kShowUV : kPassthrough;
+      if (FAILED(device_->CreatePixelShader(code, &passthrough_ps_))) {
+        REXGPU_ERROR("nx1_d3d9: passthrough PS failed to create; the test cannot run");
+        passthrough_ps_ = nullptr;
+      } else {
+        REXGPU_WARN("nx1_d3d9: PASSTHROUGH mode {} bound for ps={:08X} -- {}",
+                    pass_mode, pass_ps,
+                    pass_mode == 2
+                        ? "showing v0 AS COLOUR. A smooth red/green gradient means v0 really is "
+                          "the texture coordinate and the mode-1 result is trustworthy; noise "
+                          "means v0 is not the albedo UV and mode 1 measured nothing"
+                        : "raw s0 sample, no translated math. Validate with mode 2 before "
+                          "believing it");
+      }
+    }
+    if (passthrough_ps_) {
+      want_ps = passthrough_ps_;
     }
   }
   if (want_ps != bound_ps_) {
@@ -2772,6 +2911,137 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // Decoded once here and handed to GetTexture: the sampler state below needs the same
     // constant, and decoding it twice per bound slot was six byte-swapped dwords of pure waste.
     const TextureFetchConstant t = DecodeTextureFetchConstant(d.texture_fetch(sampler));
+    // DOES THIS SURFACE KEEP SWAPPING ITS TEXTURE? See nx1_d3d9_dbg_texswap.
+    if (REXCVAR_GET(nx1_d3d9_dbg_texswap) && t.valid && t.base_address && d.surface_key) {
+      // KEY MUST INCLUDE THE MATERIAL, AND SWAPS MUST BE COUNTED ACROSS FRAMES.
+      //
+      // The first cut keyed on (surface_key, sampler) alone and reported 1,570,000 swaps, with one
+      // key at 513,184 and many lines reading "after 0 frames". A real LOD swap cannot happen twice
+      // in one frame: surface_key is (index buffer, start, count, base vertex), so every draw
+      // sharing an index range -- UI quads, particles, instanced geometry -- collided onto one key
+      // and their different textures looked like one surface thrashing. Adding ps_object separates
+      // materials, and ignoring same-frame changes discards what is left of the collision, because
+      // the question is whether a surface's texture differs BETWEEN FRAMES.
+      struct SwapState {
+        uint64_t surface = 0;
+        uint32_t ps = 0;
+        uint32_t sampler = 0;
+        uint32_t addr = 0;
+        uint64_t frame = 0;
+        uint32_t swaps = 0;
+        uint32_t same_frame = 0;  ///< collisions: different texture, same key, same frame
+      };
+      static std::mutex m;
+      static std::vector<SwapState> seen;
+      static uint64_t total_swaps = 0, total_same_frame = 0, reported = 0;
+      static uint64_t total_same_content = 0, total_diff_content = 0;
+      std::lock_guard<std::mutex> lk(m);
+      SwapState* st = nullptr;
+      for (auto& e : seen) {
+        if (e.surface == d.surface_key && e.ps == d.ps_object && e.sampler == sampler) {
+          st = &e;
+          break;
+        }
+      }
+      if (!st && seen.size() < 8192) {
+        seen.push_back({d.surface_key, d.ps_object, sampler, t.base_address, frames_presented_, 0,
+                        0});
+      } else if (st && st->frame == frames_presented_) {
+        // ALREADY SAW THIS KEY THIS FRAME. Ignore it entirely -- do not compare, do not record.
+        //
+        // Third iteration of this filter, because the first two both manufactured the artifact.
+        // The key (surface_key, ps_object, sampler) cannot separate INSTANCES: surface_key is
+        // (index buffer, start, count, base vertex), so two instances of one prop are identical,
+        // and they legitimately bind different textures. Comparing every draw meant instance A and
+        // instance B alternated in the record and produced a fake cross-frame swap every frame --
+        // 25,818 "differing" swaps on the first version, 35,204 on the second, both pure artifact.
+        //
+        // Comparing only the FIRST binding of each frame against the first binding of the previous
+        // frame is immune to instance count and to draw order, which is what the previous attempts
+        // were not.
+        if (st->addr != t.base_address) {
+          ++st->same_frame;
+          ++total_same_frame;
+        }
+      } else if (st && st->addr != t.base_address) {
+        const uint64_t gap = frames_presented_ - st->frame;
+        if (gap == 0) {
+          // Same key, same frame, different texture: a collision, not a swap.
+          //
+          // CRITICALLY, DO NOT UPDATE st->addr HERE. The first version did, and that manufactured
+          // the exact artifact it was built to detect: with two draws sharing a key (two instances
+          // of one prop), draw 1 sets A, draw 2 collides and overwrote the record to B, and then
+          // NEXT frame draw 1 binding A again looked like a genuine cross-frame swap with gap=1.
+          // Every frame, forever, between two different images -- which is indistinguishable from
+          // the flicker we are hunting. It reported 25,818 "differing" swaps against 182 identical
+          // on that bug alone.
+          //
+          // Comparing the FIRST address seen in each frame against the first address of the
+          // previous frame is immune: extra draws within a frame cannot disturb the record.
+          ++st->same_frame;
+          ++total_same_frame;
+          continue;
+        }
+        ++st->swaps;
+        ++total_swaps;
+        // DO THE TWO ADDRESSES HOLD THE SAME TEXTURE?
+        //
+        // A surface alternating between two addresses every frame is only a BUG if the two copies
+        // differ. If they are byte-identical it is harmless double-buffering, invisible in normal
+        // rendering (both copies look alike) and visible here only because the synthetic colour is
+        // keyed to the address -- a false alarm.
+        //
+        // If they DIFFER, one of the pair is stale or mid-relocation, and alternating between them
+        // every frame is a flicker between good and garbage. That matches the pool compaction
+        // caught earlier (copies with src == dst + 0x1000 firing repeatedly while stationary) and
+        // would explain why the artifact worsens with movement: more relocation traffic.
+        //
+        // Sampled over the first page only -- enough to tell "same image" from "different image",
+        // and this runs on the draw path.
+        const char* verdict = "content UNKNOWN (unmapped)";
+        uint32_t old_nz = 0, new_nz = 0;
+        if (auto* mem = rex::system::kernel_state()->memory()) {
+          const auto* pa = mem->TranslatePhysical<const uint8_t*>(st->addr & 0x1FFFFFFF);
+          const auto* pb = mem->TranslatePhysical<const uint8_t*>(t.base_address & 0x1FFFFFFF);
+          if (pa && pb) {
+            uint64_t ha = 1469598103934665603ull, hb = ha;
+            for (uint32_t i = 0; i < 4096; i += 4) {
+              old_nz += pa[i] != 0 ? 1 : 0;
+              new_nz += pb[i] != 0 ? 1 : 0;
+              ha = (ha ^ pa[i]) * 1099511628211ull;
+              hb = (hb ^ pb[i]) * 1099511628211ull;
+            }
+            verdict = (ha == hb) ? "content IDENTICAL (harmless double-buffering)"
+                                 : "content DIFFERS *** flicker between two different images ***";
+            if (ha == hb) {
+              ++total_same_content;
+            } else {
+              ++total_diff_content;
+            }
+          }
+        }
+        // Bounded detail plus an unconditional running total, so "no swaps" is distinguishable
+        // from "the census never ran" -- the failure mode that has cost this investigation more
+        // runs than any actual bug.
+        if (reported < 40 || (total_swaps % 2000) == 0) {
+          ++reported;
+          REXGPU_WARN("nx1_d3d9: TEXSWAP surface={:016X} s{} {:08X} -> {:08X} after {} frames "
+                      "(swap #{} for this surface, {} total). The synthetic-texture colour is "
+                      "keyed to base_address, so this is what makes a wall change colour. "
+                      "{} same-frame collisions discarded. {} | old {}/1024 vs new {}/1024 "
+                      "populated | TOTALS identical={} differing={}",
+                      d.surface_key, sampler, st->addr, t.base_address, gap, st->swaps,
+                      total_swaps, total_same_frame, verdict, old_nz, new_nz, total_same_content,
+                      total_diff_content);
+        }
+        st->addr = t.base_address;
+        st->frame = frames_presented_;
+      } else if (st) {
+        // First sighting this frame with an UNCHANGED address: stamp the frame so the next frame
+        // can tell "first draw" from "a later draw in the same frame".
+        st->frame = frames_presented_;
+      }
+    }
     // OUR FETCH CONSTANT vs THE GPU'S. We read the guest D3D device's shadow copy; the
     // reference backend reads the PM4 register file -- the state the GPU was actually handed.
     // If they disagree we bind a different texture than the guest asked for, which would be
@@ -2783,7 +3053,7 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
     // dbg_blend_ps meant it silently never ran, because that cvar is only set by the picker's
     // buttons. Mismatches are deduplicated by (ps_object, sampler) and capped, so a real
     // disagreement shows up in the first seconds without flooding the log.
-    if (REXCVAR_GET(nx1_d3d9_dbg_fetchcmp)) {
+    if (REXCVAR_GET(nx1_d3d9_dbg_fetchcmp) || REXCVAR_GET(nx1_d3d9_dbg_fetchset)) {
       if (auto* gs = rex::graphics::GraphicsSystem::Nx1Current()) {
         const auto ref = gs->register_file()->GetTextureFetch(sampler);
         const uint32_t* ours = reinterpret_cast<const uint32_t*>(d.texture_fetch(sampler));
@@ -2835,6 +3105,160 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
         // geom is tested INDEPENDENTLY of addr: it used to be gated behind !addr_bad, and since
         // addr_bad is ~always true under that desync, the geometry test never actually ran and
         // reported a meaningless geom=0.
+        // ARMING TOTAL, printed unconditionally.
+        //
+        // The first run of this under a synchronised reference produced ZERO log lines, and zero
+        // was unreadable: it could mean "no mismatches" (the result we want) or "the comparison
+        // never executed" -- register_file() null, or rt/t never both valid. Every reporting path
+        // here lived inside the mismatch branch, so a silent instrument was indistinguishable from
+        // a clean one. That ambiguity has cost this investigation more runs than any single bug,
+        // so the comparison now reports how many times it actually RAN.
+        {
+          static std::atomic<uint64_t> cmps{0}, valid_cmps{0};
+          const uint64_t n = cmps.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (rt.valid && t.valid) {
+            valid_cmps.fetch_add(1, std::memory_order_relaxed);
+          }
+          if ((n % 200000) == 1) {
+            REXGPU_WARN("nx1_d3d9: FETCHCMP ran {} times ({} with BOTH sides valid). If the valid "
+                        "count is 0 the comparison is not executing and any 'no mismatch' reading "
+                        "is meaningless",
+                        n, valid_cmps.load(std::memory_order_relaxed));
+          }
+        }
+        // SET COMPARISON -- the position-free half, and the ONLY one valid without the reference
+        // rasterising.
+        //
+        // The per-draw test below needs nx1_skip_reference_raster=false, and its own comment says
+        // why: we execute draws at hook time on the guest thread while the ring is processed
+        // independently, so "the current draw" means different things on each side. That is a
+        // POSITIONAL problem, not a staleness one -- the register file is written during PM4
+        // parsing, which happens before IssueDraw's skip returns, so its CONTENTS are live either
+        // way. Comparing SETS rather than positions therefore needs no synchronisation at all, and
+        // no expensive reference raster. Same argument the D9TEX/REFTEX census already makes
+        // (d3d9_resources.cpp:5868).
+        //
+        // THE QUESTION IT ANSWERS: is a bound texture one the guest ever actually asked for?
+        // Accumulate every base_address we bind, and every base_address the register file is ever
+        // seen holding (ANY sampler -- deliberately, see below). An address we bind that the GPU's
+        // own register file NEVER held, on any slot, at any moment in the run, is a texture the
+        // guest never asked for. That is the "stale/wrong descriptor" hypothesis, decided.
+        //
+        // WHY "ANY SAMPLER" AND NOT PER-SLOT: we only sample the register file at OUR draw times,
+        // so our view of it is a subsample of its history. Testing per-slot membership would call a
+        // legitimate address a mismatch merely because we never sampled the instant it sat in that
+        // slot -- false positives by construction. Union-over-all-slots is the conservative form:
+        // it can only UNDER-report, so a non-zero result is real and a zero is weak. Read it in
+        // that direction and no other.
+        if (REXCVAR_GET(nx1_d3d9_dbg_fetchset)) {
+          static std::mutex sm;
+          static std::unordered_set<uint32_t> ours_seen, ref_seen;
+          static std::vector<uint32_t> orphan_examples;
+          static uint64_t draws = 0;
+          // WHAT the orphan binding was, captured at bind time. Knowing that 10% of addresses are
+          // orphans does not say WHY; these fields separate the candidate mechanisms:
+          //   - ours and the register file describing the SAME dims/format but different
+          //     addresses => a stale descriptor, or a recycled pool slot.
+          //   - a systematic sampler offset (ours[n] matching the register file's [n+k])
+          //     => an index mapping error, not staleness.
+          //   - ours describing geometry the register file never carries at all => neither.
+          // Kept per ADDRESS and printed only for addresses that are STILL orphans at report time,
+          // because an address can enter ref_seen after we first bind it and treating that as an
+          // orphan forever would manufacture the result.
+          // CAPTURE DETAIL FOR EVERY DISTINCT ADDRESS, NOT JUST THE ONES THAT LOOK ORPHANED NOW.
+          //
+          // The first version only recorded an address if it was absent from ref_seen AT BIND TIME,
+          // capped at 256. ref_seen is nearly empty early in a run, so that cap filled entirely
+          // with early-run addresses and the sample was biased to the first few seconds -- it
+          // reported 15 details against a population of 432 orphans and made one shader look
+          // responsible for everything. Capture unconditionally and filter at REPORT time, when
+          // ref_seen is complete; then the sample is the population.
+          struct Bind {
+            uint32_t ps, sampler, w, h, fmt, pitch;
+            bool fallback;  ///< mask was "all 16", so the shader may not sample this slot at all
+          };
+          static std::unordered_map<uint32_t, Bind> addr_detail;
+          std::lock_guard<std::mutex> lk(sm);
+          ++draws;
+          if (t.valid && t.base_address && addr_detail.size() < 16384) {
+            addr_detail.try_emplace(t.base_address,
+                                    Bind{d.ps_object, sampler, t.width, t.height, t.format,
+                                         t.pitch_pixels, sampler_mask_fallback_});
+          }
+          // Cap so a pathological run cannot grow these without bound; the pool holds a few
+          // thousand distinct addresses, so this never binds in practice.
+          if (rt.valid && rt.base_address && ref_seen.size() < 65536) {
+            ref_seen.insert(rt.base_address);
+          }
+          if (t.valid && t.base_address && ours_seen.size() < 65536) {
+            ours_seen.insert(t.base_address);
+          }
+          // Reported UNCONDITIONALLY on a fixed cadence, including zeros, and including how many
+          // draws fed it -- so "0 orphans" is distinguishable from "never ran". Recount each time
+          // rather than tracking incrementally: an address can enter ref_seen AFTER we bind it,
+          // and treating that as an orphan forever would manufacture the result.
+          if ((draws % 300000) == 1) {
+            uint32_t orphans = 0;
+            orphan_examples.clear();
+            for (const uint32_t a : ours_seen) {
+              if (!ref_seen.count(a)) {
+                ++orphans;
+                if (orphan_examples.size() < 8) orphan_examples.push_back(a);
+              }
+            }
+            std::string ex;
+            for (const uint32_t a : orphan_examples) {
+              if (!ex.empty()) ex += ' ';
+              ex += fmt::format("{:08X}", a);
+            }
+            REXGPU_WARN("nx1_d3d9: FETCHSET draws={} | ours={} distinct addresses, gpu register "
+                        "file={} | bound-but-NEVER-in-register-file={} [{}] -- non-zero means we "
+                        "bind textures the guest never asked for (zero is weak evidence, the "
+                        "register file is subsampled)",
+                        draws, ours_seen.size(), ref_seen.size(), orphans, ex);
+            // TALLY THE WHOLE ORPHAN POPULATION rather than printing a window of it. Which SHADERS
+            // bind orphans is the question that decides whether this is a world-surface problem or
+            // a 2D/UI one, and eyeballing twelve lines cannot answer it.
+            std::unordered_map<uint32_t, uint32_t> by_ps, by_fmt;
+            uint32_t detailed = 0, from_fallback = 0, from_declared = 0;
+            for (const uint32_t a : ours_seen) {
+              if (ref_seen.count(a)) continue;
+              const auto it = addr_detail.find(a);
+              if (it == addr_detail.end()) continue;
+              ++detailed;
+              (it->second.fallback ? from_fallback : from_declared)++;
+              ++by_ps[it->second.ps];
+              ++by_fmt[it->second.fmt];
+            }
+            std::vector<std::pair<uint32_t, uint32_t>> ps_rank(by_ps.begin(), by_ps.end());
+            std::sort(ps_rank.begin(), ps_rank.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string ps_s;
+            for (size_t i = 0; i < ps_rank.size() && i < 8; ++i) {
+              ps_s += fmt::format("{:08X}x{} ", ps_rank[i].first, ps_rank[i].second);
+            }
+            std::string fmt_s;
+            for (const auto& [f, n] : by_fmt) fmt_s += fmt::format("f{}x{} ", f, n);
+            REXGPU_WARN("nx1_d3d9: FETCHSET-BYPS {} of {} orphans have detail | DECLARED-slot={} "
+                        "fallback-slot={} | shaders: {}| formats: {}",
+                        detailed, orphans, from_declared, from_fallback, ps_s, fmt_s);
+            REXGPU_WARN("nx1_d3d9: FETCHSET-VERDICT declared={} -- these are slots the shader "
+                        "PROVABLY samples, so a texture the GPU never received is reaching the "
+                        "screen. fallback={} is the unwalkable-shader 'bind all 16' path, where an "
+                        "unsampled stale slot is harmless. Only the DECLARED count is the bug.",
+                        from_declared, from_fallback);
+            uint32_t shown = 0;
+            for (const uint32_t a : ours_seen) {
+              if (ref_seen.count(a) || shown >= 16) continue;
+              const auto it = addr_detail.find(a);
+              if (it == addr_detail.end()) continue;
+              ++shown;
+              const Bind& b = it->second;
+              REXGPU_WARN("nx1_d3d9: FETCHSET-ORPHAN ps={:08X} s{} ours={:08X} {}x{} fmt={} pitch={}",
+                          b.ps, b.sampler, a, b.w, b.h, b.fmt, b.pitch);
+            }
+          }
+        }
         const bool addr_bad = rt.valid && t.valid && rt.base_address != t.base_address;
         const bool geom_bad = rt.valid && t.valid &&
                               (rt.width != t.width || rt.height != t.height ||
@@ -2897,7 +3321,8 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
       // substitute it when the engine swaps sampler to a receding (garbage) LOD -- see
       // PreferLargestForSurface. surface_key 0 (UI / inline draws) leaves the binding untouched.
       tex = tracker.PreferLargestForSurface(surface_key, sampler, t.format, tex, t.width, t.height,
-                                            t.base_address);
+                                            t.base_address,
+                                            tracker.SourcePermilleFor(t.base_address));
     }
     if (tex != sampler_texture_[sampler]) {
       device_->SetTexture(sampler, tex);

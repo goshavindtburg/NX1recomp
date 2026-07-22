@@ -263,4 +263,18 @@ class SharedMemory {
   void UnlinkWatchRange(WatchRange* range);
 };
 
+//--- Reference-side upload watch (see nx1_refupload_addr in d3d12/shared_memory.cpp) ----------
+//
+// A surface binds up to 8 textures and there is no way to tell from the screen which one is wrong,
+// so the watch takes the WHOLE SET the picker resolved rather than one address chosen by guessing.
+// The native renderer's F3 picker populates it from the same button that arms its own tracking, so
+// both sides of the comparison are aimed at once and cannot drift apart.
+//
+// Lives here rather than in the app because the upload path that must consult it is SDK-side.
+inline constexpr uint32_t kRefUploadWatchMax = 8;
+/// Replace the watched set. `count` 0 clears. Safe to call from the UI thread.
+void SetRefUploadWatch(const uint32_t* addrs, const uint32_t* spans, uint32_t count);
+/// Does `page_addr` fall inside any watched texture? Consulted on the upload hot path.
+bool RefUploadWatched(uint32_t page_addr);
+
 }  // namespace rex::graphics

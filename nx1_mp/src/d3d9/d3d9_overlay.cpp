@@ -42,13 +42,18 @@ REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_texdump);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_hide_matched);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_highlight_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_solo_ps);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_passthrough_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_solid_lo32);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_pick_ignore_lo32);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_blend_ps);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_pick_size);
 REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_ox);
 REXCVAR_DECLARE(int32_t, nx1_d3d9_dbg_pick_oy);
+// SetRefUploadWatch: aim the reference-side upload log from the same picker click.
+#include <rex/graphics/shared_memory.h>
+
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_addr);
+REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_track_bytes);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_mipdump);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_dump_surface_hi);
 REXCVAR_DECLARE(uint32_t, nx1_d3d9_dbg_dump_surface_lo);
@@ -578,6 +583,22 @@ void Overlay::DrawPicker() {
       if (ImGui::Button(lit ? "unhighlight" : "highlight")) {
         REXCVAR_SET(nx1_d3d9_dbg_highlight_ps, lit ? 0u : h.ps_object);
       }
+      // PASSTHROUGH: swap this material's translated pixel shader for `texld oC0, v0, s0` -- the
+      // raw albedo sample with no lighting, blending or translated math. Set from the picker
+      // because ps_object is hex and the cvar editor takes decimal; hand-converting it is exactly
+      // the kind of step that has produced wrong-target experiments here before.
+      //   still speckles -> the translated shader is exonerated, the texels really are wrong
+      //   speckle gone   -> the translated shader is the fault
+      ImGui::SameLine();
+      const bool passing = REXCVAR_GET(nx1_d3d9_dbg_passthrough_ps) == h.ps_object;
+      if (ImGui::Button(passing ? "un-passthru" : "PASSTHRU")) {
+        REXCVAR_SET(nx1_d3d9_dbg_passthrough_ps, passing ? 0u : h.ps_object);
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Draw this material with a passthrough shader: raw s0 sample, no "
+                          "translated math. It will look flat and unlit -- that is expected. "
+                          "Judge ONLY whether the speckle survives.");
+      }
       ImGui::SameLine();
       const bool magenta = REXCVAR_GET(nx1_d3d9_dbg_highlight_ps) == h.ps_object;
       if (ImGui::Button(magenta ? "unpaint" : "PAINT PINK")) {
@@ -661,6 +682,53 @@ void Overlay::DrawPicker() {
       // an fmt=18 diffuse and DXN normal both clean while the fmt=20 DXT5 at sampler 7 was half
       // black blocks and half a different image entirely. Tracking s0 there watches the one
       // texture that is fine and reports reassuringly full byte counts.
+      // TRACK ALL: watch every texture this surface binds at once.
+      //
+      // Picking one sampler is a guess, and guessing wrong costs a whole run -- the per-sampler
+      // tooltip below already warns that the diffuse can be pristine while the DXT5 at sampler 7
+      // is the broken one. With the set, the log reports which address actually moved instead of
+      // asking the operator to know in advance.
+      {
+        const bool any_set = nx1::d3d9::TrackedMatch(h.tex_count ? h.tex[0].addr : 0u) != 0;
+        if (ImGui::Button(any_set ? "untrack ALL" : "TRACK ALL samplers")) {
+          if (any_set) {
+            nx1::d3d9::SetTrackSet(nullptr, 0);
+            rex::graphics::SetRefUploadWatch(nullptr, nullptr, 0);
+            REXCVAR_SET(nx1_d3d9_dbg_track_addr, 0u);
+          } else {
+            nx1::d3d9::TrackedTex set[nx1::d3d9::kTrackSetMax];
+            uint32_t n = 0;
+            for (uint32_t k = 0; k < h.tex_count && n < nx1::d3d9::kTrackSetMax; ++k) {
+              set[n++] = {h.tex[k].addr, h.tex[k].guest_bytes};
+            }
+            nx1::d3d9::SetTrackSet(set, n);
+            // Aim the REFERENCE-side upload watch at the same textures in the same click. The two
+            // sides of the comparison must never be aimed separately -- picking one address by eye
+            // is what this button exists to eliminate, and aiming them apart would silently produce
+            // a REFUPLOAD log for a texture the native side is not tracking.
+            {
+              uint32_t ra[nx1::d3d9::kTrackSetMax], rs[nx1::d3d9::kTrackSetMax];
+              for (uint32_t j = 0; j < n; ++j) {
+                ra[j] = set[j].addr;
+                rs[j] = set[j].span;
+              }
+              rex::graphics::SetRefUploadWatch(ra, rs, n);
+            }
+            // Keep the primary pointed at sampler 0 so the white-paint identification and
+            // autotrack's release logic still have a single anchor.
+            if (h.tex_count) {
+              REXCVAR_SET(nx1_d3d9_dbg_track_addr, h.tex[0].addr);
+              REXCVAR_SET(nx1_d3d9_dbg_track_bytes, h.tex[0].guest_bytes);
+            }
+          }
+        }
+        if (ImGui::IsItemHovered()) {
+          ImGui::SetTooltip("Track every texture this surface binds, each over its own extent. "
+                            "Use this when you can SEE the surface is wrong but do not know which "
+                            "sampler carries the fault. TRACK BIND/DMACOPY/WRITE/POLL lines are "
+                            "tagged with the address, so the log says which one moved.");
+        }
+      }
       for (uint32_t k = 0; k < h.tex_count; ++k) {
         const auto& pt = h.tex[k];
         const bool tracking = REXCVAR_GET(nx1_d3d9_dbg_track_addr) == pt.addr;
@@ -669,6 +737,13 @@ void Overlay::DrawPicker() {
         ImGui::PushID(int(100 + k));
         if (ImGui::Button(buf)) {
           REXCVAR_SET(nx1_d3d9_dbg_track_addr, tracking ? 0u : pt.addr);
+          // Size the DMA watch window to THIS texture. The window is what decides whether a copy
+          // counts as "landing on the tracked texture", so leaving it at the default made a
+          // manual track blind past its first 64 KB -- which is how run 066 concluded "no copy
+          // ever landed on it" for a 262144-byte base.
+          if (!tracking && pt.guest_bytes) {
+            REXCVAR_SET(nx1_d3d9_dbg_track_bytes, pt.guest_bytes);
+          }
         }
         if (ImGui::IsItemHovered()) {
           ImGui::SetTooltip("Watch THIS texture's memory: TRACK BIND lines report its live bytes "

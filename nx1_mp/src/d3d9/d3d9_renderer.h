@@ -142,6 +142,11 @@ class Renderer {
     uint32_t sampler;
     uint32_t addr;
     uint32_t w, h, fmt;
+    /// Guest byte size of level 0, so the overlay's TRACK button can size the DMA watch window to
+    /// the texture. Without it a manual track inherits the default span, which covered only the
+    /// first quarter of a 512x512 BC base -- and "no copy landed on this texture" then means only
+    /// "none landed in its first 64 KB". Run 066 produced exactly that misreading.
+    uint32_t guest_bytes;
   };
   static constexpr uint32_t kPickTexMax = 8;
 
@@ -365,6 +370,9 @@ class Renderer {
   /// Sampler slots the currently bound shaders actually declare, latched by
   /// BindShadersAndConstants for BindTextures. 0xFFFF = "unknown, bind everything".
   uint32_t active_sampler_mask_ = 0xFFFFu;
+  /// True when active_sampler_mask_ is the "could not walk the shader, assume all 16" fallback
+  /// rather than the slots the shader actually declares. See the latch in BindTextures' caller.
+  bool sampler_mask_fallback_ = true;
 
   /// Signature of the last draw's texture binding: the raw fetch constants of the slots the
   /// shaders declare, plus the declared-slot mask and the LOD surface key. When a draw matches
@@ -388,6 +396,10 @@ class Renderer {
   uint32_t highlight_frame_ = 0;
   /// Tiny solid-magenta ps_3_0, built on first use, bound in place of ONE material's shader.
   IDirect3DPixelShader9* magenta_ps_ = nullptr;
+  /// Passthrough PS: samples s0 with the first interpolated texcoord and outputs it raw.
+  /// See nx1_d3d9_dbg_passthrough_ps -- separates "the texel is wrong" from "the shader is wrong".
+  IDirect3DPixelShader9* passthrough_ps_ = nullptr;
+  uint32_t passthrough_mode_built_ = 0;  ///< which passthrough variant passthrough_ps_ holds
   bool hide_draw_ = false;
   bool hide_reported_ = false;
 
