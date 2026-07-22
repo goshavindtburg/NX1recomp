@@ -266,6 +266,54 @@ REXCVAR_DEFINE_BOOL(nx1_d3d9_dbg_fetchset, false, "GPU",
                     "file holds, and report ours-not-in-theirs. Unlike dbg_fetchcmp this needs no "
                     "reference rasterisation");
 
+namespace {
+/// Shared by the FETCHSET census and the orphan PAINT test below, which has to answer the same
+/// membership question at bind time rather than at report time. File scope rather than a
+/// function-local static because the two live in different functions and must see one set.
+std::mutex g_fetchset_m;
+std::unordered_set<uint32_t> g_fetchset_ref_seen;  ///< every address the register file has held
+std::unordered_set<uint64_t> g_fetchset_ref_layouts;  ///< every full LAYOUT it has held
+uint64_t g_fetchset_draws = 0;
+
+/// The fields that decide WHICH BYTES a fetch reads and HOW they are interpreted.
+///
+/// Address alone is too narrow. A descriptor can carry a perfectly legitimate address and still be
+/// wrong: guest 11401000 holds a valid 128x256 DXT1 texture, a binding declared it 256x256, and the
+/// same bytes decode clean at 128x256 and clean-top-half-plus-garbage at 256x256 (see the FETCHCMP
+/// note above -- that one is PROVEN by reproduction). An address-set test cannot see it, because
+/// the address really was GPU state.
+///
+/// Filter, clamp and swizzle bits are deliberately EXCLUDED: they change how a texel is sampled,
+/// not which bytes are fetched, and folding them in would make legitimate re-binds look novel.
+uint64_t FetchLayoutKey(const nx1::d3d9::TextureFetchConstant& t) {
+  uint64_t k = t.base_address;
+  k = k * 0x100000001B3ull ^ (uint64_t(t.width) << 16 | t.height);
+  k = k * 0x100000001B3ull ^ (uint64_t(t.format) << 32 | t.pitch_pixels);
+  k = k * 0x100000001B3ull ^ (uint64_t(t.tiled ? 1 : 0) << 8 | t.endian);
+  return k;
+}
+}  // namespace
+
+/// PAINT THE ORPHANS. The step from "capable of causing the artifact" to "IS the artifact".
+///
+/// FETCHSET establishes that ~0.15% of bindings use a descriptor the GPU never received, on slots
+/// shaders provably sample, persisting 2-100 frames. That is capable of producing a wall wearing
+/// the wrong texture -- but capability is not causation, and correlating a statistic with a
+/// screenshot has already misled this investigation twice.
+///
+/// So make it VISIBLE. Substitute a flat white texture for any declared-slot binding whose address
+/// the register file has never held, once the set has warmed up. Then look at a speckling surface:
+///   speckle turns WHITE   -> the orphan bindings ARE the artifact, shown rather than inferred.
+///   speckle UNCHANGED     -> orphans are a real but SEPARATE bug; stop crediting them for this.
+///   scene mostly white    -> the membership test is over-firing; distrust the whole line.
+///
+/// Requires nx1_d3d9_dbg_fetchset (that is what populates the set). The warm-up matters: early in
+/// a run the register-file set is nearly empty and every address looks like an orphan.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_paint_orphans, 0, "GPU",
+                      "Draws >= this many before the orphan paint test arms (0 = off). Substitutes "
+                      "white for declared-slot bindings the PM4 register file never held, so a "
+                      "wrong-descriptor surface is visible on screen instead of inferred");
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_basemap, true, "GPU",
                     "Honour xenos mip_filter kBaseMap (MIPFILTER=NONE): the game's signal that "
                     "a texture's mips are not resident and level 0 is the only valid data. The "
@@ -3151,10 +3199,14 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
         // it can only UNDER-report, so a non-zero result is real and a zero is weak. Read it in
         // that direction and no other.
         if (REXCVAR_GET(nx1_d3d9_dbg_fetchset)) {
-          static std::mutex sm;
-          static std::unordered_set<uint32_t> ours_seen, ref_seen;
+          // The register-file set and the draw counter are FILE scope so the paint test can ask the
+          // same question at bind time; everything else stays local. One mutex covers both.
+          std::mutex& sm = g_fetchset_m;
+          std::unordered_set<uint32_t>& ref_seen = g_fetchset_ref_seen;
+          uint64_t& draws = g_fetchset_draws;
+          static std::unordered_set<uint32_t> ours_seen;
+          static std::unordered_set<uint64_t> ours_layouts;
           static std::vector<uint32_t> orphan_examples;
-          static uint64_t draws = 0;
           // WHAT the orphan binding was, captured at bind time. Knowing that 10% of addresses are
           // orphans does not say WHY; these fields separate the candidate mechanisms:
           //   - ours and the register file describing the SAME dims/format but different
@@ -3176,19 +3228,47 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
           struct Bind {
             uint32_t ps, sampler, w, h, fmt, pitch;
             bool fallback;  ///< mask was "all 16", so the shader may not sample this slot at all
+            // LIFETIME. A wrong descriptor that appears for ONE frame is a flicker; one bound
+            // across hundreds of consecutive frames is a surface wearing the wrong texture for
+            // seconds, which is what the screenshots actually show. The distinction decides
+            // whether the orphans explain the artifact or merely accompany it, and a count of
+            // bindings cannot express it.
+            uint64_t first_frame, last_frame;
+            uint32_t frames;  ///< distinct frames this address was bound in
           };
           static std::unordered_map<uint32_t, Bind> addr_detail;
+          // HOW OFTEN, not just how many DISTINCT. 820 orphan addresses says nothing about whether
+          // they are drawn constantly or once each, and the artifact is intermittent ("completely
+          // random what actually goes wrong"), so the per-BINDING rate is the number that has to
+          // match the symptom. Counted per address and per shader, then attributed at report time
+          // once the orphan set is known -- the same capture-then-filter discipline that fixed the
+          // biased sample.
+          static std::unordered_map<uint32_t, uint64_t> addr_binds;  // address -> times bound
+          static std::unordered_map<uint32_t, uint64_t> ps_binds;    // shader  -> times bound
           std::lock_guard<std::mutex> lk(sm);
           ++draws;
-          if (t.valid && t.base_address && addr_detail.size() < 16384) {
-            addr_detail.try_emplace(t.base_address,
-                                    Bind{d.ps_object, sampler, t.width, t.height, t.format,
-                                         t.pitch_pixels, sampler_mask_fallback_});
+          if (t.valid && t.base_address) {
+            if (addr_detail.size() < 16384) {
+              const auto [it, fresh] = addr_detail.try_emplace(
+                  t.base_address,
+                  Bind{d.ps_object, sampler, t.width, t.height, t.format, t.pitch_pixels,
+                       sampler_mask_fallback_, frames_presented_, frames_presented_, 1});
+              if (!fresh && it->second.last_frame != frames_presented_) {
+                it->second.last_frame = frames_presented_;
+                ++it->second.frames;
+              }
+            }
+            if (addr_binds.size() < 65536) ++addr_binds[t.base_address];
+            if (ps_binds.size() < 4096) ++ps_binds[d.ps_object];
           }
           // Cap so a pathological run cannot grow these without bound; the pool holds a few
           // thousand distinct addresses, so this never binds in practice.
           if (rt.valid && rt.base_address && ref_seen.size() < 65536) {
             ref_seen.insert(rt.base_address);
+            g_fetchset_ref_layouts.insert(FetchLayoutKey(rt));
+          }
+          if (t.valid && t.base_address && ours_layouts.size() < 65536) {
+            ours_layouts.insert(FetchLayoutKey(t));
           }
           if (t.valid && t.base_address && ours_seen.size() < 65536) {
             ours_seen.insert(t.base_address);
@@ -3247,6 +3327,76 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
                         "screen. fallback={} is the unwalkable-shader 'bind all 16' path, where an "
                         "unsampled stale slot is harmless. Only the DECLARED count is the bug.",
                         from_declared, from_fallback);
+            // RATE, and the always-vs-sometimes split. A shader binding orphans on EVERY bind is a
+            // class of draw we should not be rendering at all; one binding them occasionally is a
+            // timing or path problem inside a legitimate class. The two want different fixes, and
+            // the distinction is invisible in a count of distinct addresses.
+            uint64_t orphan_binds = 0, total_binds = 0;
+            std::unordered_map<uint32_t, uint64_t> ps_orphan_binds;
+            for (const auto& [a, n] : addr_binds) {
+              total_binds += n;
+              if (ref_seen.count(a)) continue;
+              const auto it = addr_detail.find(a);
+              if (it == addr_detail.end() || it->second.fallback) {
+                continue;  // count only DECLARED-slot orphans: the fallback ones are not the bug
+              }
+              orphan_binds += n;
+              ps_orphan_binds[it->second.ps] += n;
+            }
+            REXGPU_WARN("nx1_d3d9: FETCHSET-RATE {} of {} texture bindings ({:.3f}%) use a "
+                        "declared-slot descriptor the GPU never received",
+                        orphan_binds, total_binds,
+                        total_binds ? 100.0 * double(orphan_binds) / double(total_binds) : 0.0);
+            // LIFETIME HISTOGRAM over the declared-slot orphans. Persistent bindings are the ones
+            // that can produce a wall wearing the wrong texture for seconds; if every orphan lives
+            // exactly one frame, they are flickers and cannot be what the screenshots show.
+            uint32_t life_1 = 0, life_2_10 = 0, life_11_100 = 0, life_100p = 0;
+            uint64_t life_max = 0, span_max = 0;
+            for (const uint32_t a : ours_seen) {
+              if (ref_seen.count(a)) continue;
+              const auto it = addr_detail.find(a);
+              if (it == addr_detail.end() || it->second.fallback) continue;
+              const uint32_t f = it->second.frames;
+              if (f <= 1) ++life_1;
+              else if (f <= 10) ++life_2_10;
+              else if (f <= 100) ++life_11_100;
+              else ++life_100p;
+              life_max = std::max<uint64_t>(life_max, f);
+              span_max = std::max<uint64_t>(span_max,
+                                            it->second.last_frame - it->second.first_frame);
+            }
+            // THE WIDER TEST. Address-orphans are a subset of layout-orphans: a binding with a
+            // legitimate address but a size/format/pitch the GPU was never given reads the right
+            // memory the wrong way, which is a PROVEN speckle cause and invisible above.
+            uint32_t layout_orphans = 0;
+            for (const uint64_t k : ours_layouts) {
+              if (!g_fetchset_ref_layouts.count(k)) ++layout_orphans;
+            }
+            REXGPU_WARN("nx1_d3d9: FETCHSET-LAYOUT ours={} distinct layouts, register file={} | "
+                        "never-in-register-file={} (vs {} by ADDRESS alone) -- the difference is "
+                        "bindings whose address is legitimate but whose geometry the GPU never "
+                        "received",
+                        ours_layouts.size(), g_fetchset_ref_layouts.size(), layout_orphans,
+                        orphans);
+            REXGPU_WARN("nx1_d3d9: FETCHSET-LIFE declared-slot orphans by frames-bound: "
+                        "1 frame={} | 2-10={} | 11-100={} | >100={} | longest={} frames, widest "
+                        "first-to-last span={} frames. Many long-lived orphans = surfaces wearing "
+                        "the wrong texture for seconds; all 1-frame = flickers only",
+                        life_1, life_2_10, life_11_100, life_100p, life_max, span_max);
+            std::vector<std::pair<uint32_t, uint64_t>> rate_rank(ps_orphan_binds.begin(),
+                                                                 ps_orphan_binds.end());
+            std::sort(rate_rank.begin(), rate_rank.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            for (size_t i = 0; i < rate_rank.size() && i < 8; ++i) {
+              const uint64_t tot = ps_binds.count(rate_rank[i].first)
+                                       ? ps_binds[rate_rank[i].first]
+                                       : 0;
+              REXGPU_WARN("nx1_d3d9: FETCHSET-PS {:08X} orphan binds {} of {} ({:.1f}%) -- 100% "
+                          "means every draw of this shader is affected (a bad draw CLASS); a small "
+                          "fraction means a timing or path issue within a good class",
+                          rate_rank[i].first, rate_rank[i].second, tot,
+                          tot ? 100.0 * double(rate_rank[i].second) / double(tot) : 0.0);
+            }
             uint32_t shown = 0;
             for (const uint32_t a : ours_seen) {
               if (ref_seen.count(a) || shown >= 16) continue;
@@ -3295,6 +3445,34 @@ void Renderer::BindTextures(const uint8_t* base, const RecordedDraw& d,
                   dump_ps, sampler, t.base_address, t.width, t.height, t.format);
     }
     IDirect3DBaseTexture9* tex = tracker.GetTexture(base, t, sampler);
+    // ORPHAN PAINT TEST -- see nx1_d3d9_dbg_paint_orphans. Only DECLARED slots: a fallback-mask
+    // slot may not be sampled at all, and painting those would colour surfaces that are fine.
+    if (const uint32_t warm = REXCVAR_GET(nx1_d3d9_dbg_paint_orphans);
+        warm && !sampler_mask_fallback_ && t.valid && t.base_address) {
+      bool orphan = false;
+      bool warmed = false;
+      {
+        std::lock_guard<std::mutex> lk(g_fetchset_m);
+        warmed = g_fetchset_draws >= warm;
+        // LAYOUT membership, not address: the strict superset. The address-only version painted
+        // some speckling surfaces white and left others speckling, and a legitimate address
+        // carrying geometry the GPU never issued is exactly what that residue would look like.
+        orphan = warmed && !g_fetchset_ref_layouts.count(FetchLayoutKey(t));
+      }
+      if (orphan) {
+        tex = tracker.WhiteTexture();
+        // ARMING, printed unconditionally on a cadence including its zero, because "the scene
+        // looked unchanged" is exactly the reading a silently-inert test produces.
+        static std::atomic<uint64_t> painted{0};
+        const uint64_t n = painted.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n % 20000) == 1) {
+          REXGPU_WARN("nx1_d3d9: PAINTORPHAN substituted white {} times (warmup {} draws reached). "
+                      "Zero here with the cvar set means the test never fired and any 'no visible "
+                      "change' reading is meaningless",
+                      n, warm);
+        }
+      }
+    }
     // Debug: unbind chosen sampler slots for ONE material, so a sample that is suspected of
     // saturating the output can be removed and the result observed. A NULL texture reads as zero,
     // which is a value the shader's own maths cannot produce from a real texture -- so if the
