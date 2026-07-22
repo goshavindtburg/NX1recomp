@@ -1582,6 +1582,9 @@ struct TextureEntry {
   /// Which invalidation source last marked this entry dirty. Attributed at rebuild
   /// time so we can see WHICH source makes us re-read memory the reference does not.
   DirtySource dirty_source = DirtySource::kDebug;
+  /// Set once the first source claims this dirty cycle; cleared on rebuild. Without it
+  /// the last writer won and the per-frame probe masked every other cause.
+  bool dirty_claimed = false;
   /// Did any real write get reported for this entry since its last decode? Drives
   /// nx1_d3d9_probe_needs_write: a probe-detected change with no reported write came
   /// through a path the reference ignores.
@@ -3662,9 +3665,14 @@ void ResourceTracker::LogCacheStats() {
   // "it reports them but they never overlap a texture" and "the subscription is dead". These
   // counters have existed all along and were never printed anywhere, which is why the mechanism
   // looked inert without anyone being able to say so.
-  NX1_LOGI_STATS("nx1_d3d9: PROBEGATE {} probe-detected changes REFUSED for want of a "
+  // NOT category-gated. This is an experiment's own result, and hiding it behind a routine-logging
+  // switch meant an A/B ran twice with no way to tell which arm was which -- the same "one owner
+  // per log line" mistake the categories were introduced to avoid. Always print which arm ran.
+  REXGPU_WARN("nx1_d3d9: PROBEGATE {} probe-detected changes REFUSED for want of a "
                  "reported write (nx1_d3d9_probe_needs_write={})",
                  probe_refused_no_write_, REXCVAR_GET(nx1_d3d9_probe_needs_write) ? 1 : 0);
+  REXGPU_WARN("nx1_d3d9: REARM {} unconditional re-arm calls (nx1_d3d9_rearm_watch={}). Zero with the cvar on means the path is not running and any conclusion from it is void -- which is exactly what happened when this was wired only to the texture_mirror=false branch",
+              rearm_calls_, REXCVAR_GET(nx1_d3d9_rearm_watch) ? 1 : 0);
   REXGPU_WARN("nx1_d3d9: GPUWRITE ranges={} pages={} | blasts(whole-buffer, unusable)={} "
               "dropped(over {} MB cap)={} -- ranges=0 means the reference never reported a GPU "
               "write to us at all; ranges>0 with gpu_write=0/0 in REBUILDSRC means it reports them "
@@ -3676,8 +3684,24 @@ void ResourceTracker::LogCacheStats() {
     static const char* kSrc[] = {"cpu_write", "gpu_write", "dma",     "probe",
                                  "mip_reloc", "recheck",   "resolve", "partial", "debug"};
     std::string line;
+    uint64_t total_changed = 0;
     for (size_t i = 0; i < size_t(DirtySource::kCount); ++i) {
       line += fmt::format("{}={}/{} ", kSrc[i], changed_by_source_[i], dirty_by_source_[i]);
+      total_changed += changed_by_source_[i];
+    }
+    // NORMALISED, so two runs are comparable. Raw totals are not: they scale with how long you
+    // played and how much you moved, which is why an A/B where one run wandered more than the other
+    // could not be scored -- that has now cost several inconclusive comparisons. Per 1000 frames
+    // removes session length; per million texture binds removes how much of the scene was on
+    // screen. Quote the per-bind figure when comparing two runs.
+    {
+      const uint64_t binds = tex_binds_;
+      REXGPU_WARN("nx1_d3d9: CHURN {} content-changing rebuilds over {} frames, {} texture binds "
+                  "| {:.2f} per 1000 frames | {:.2f} per million binds -- THIS is the A/B number; "
+                  "raw totals scale with play time and movement and cannot be compared across runs",
+                  total_changed, frame_, binds,
+                  frame_ ? 1000.0 * double(total_changed) / double(frame_) : 0.0,
+                  binds ? 1e6 * double(total_changed) / double(binds) : 0.0);
     }
     REXGPU_WARN("nx1_d3d9: REBUILDSRC changed/total per invalidation source: {}-- the source with "
                 "the high CHANGED rate is the one adopting new bytes, which is where we diverge "
@@ -4420,6 +4444,27 @@ const uint8_t* ResourceTracker::MirrorSnapshot(uint32_t phys_addr, uint32_t len)
   }
   const uint32_t p0 = phys_addr >> 12;
   const uint32_t p1 = (phys_addr + len - 1) >> 12;
+  // RE-ARM EVEN THE PAGES WE ARE NOT COPYING.
+  //
+  // nx1_d3d9_rearm_watch existed but was wired only into ArmWriteWatch, which runs solely on the
+  // texture_mirror=false branch -- so with the mirror ON, which is how this is always run, the cvar
+  // was completely inert and the experiment it exists for had never actually been performed.
+  //
+  // It matters most exactly here. The loop below only touches INVALID pages; a page already valid
+  // in the mirror is never revisited, so it is never re-armed. We share host page protection with
+  // the reference's SharedMemory, which arms and unprotects the same pages on its own schedule, so
+  // once a page is unprotected by anything other than us we stop receiving writes to it forever --
+  // and the re-arm was gated on the very signal we stopped receiving. That is the deadlock, and it
+  // is why texture memory changes with no reported write while the sampled content probe is left as
+  // the only detector.
+  if (REXCVAR_GET(nx1_d3d9_rearm_watch)) {
+    if (auto* mem = rex::system::kernel_state()->memory()) {
+      for (uint32_t p = p0; p <= p1; ++p) {
+        mem->EnablePhysicalMemoryAccessCallbacks(p << 12, 4096, true, false);
+        ++rearm_calls_;
+      }
+    }
+  }
   for (uint32_t p = p0; p <= p1; ++p) {
     if (!(mirror_valid_[p >> 6] & (uint64_t(1) << (p & 63)))) {
       // VALIDATE AND ARM THE WATCH **BEFORE** THE COPY, NOT AFTER.
@@ -4681,7 +4726,7 @@ void ResourceTracker::DrainMemoryWrites() {
           g_drain_matched[size_t(w.source)].fetch_add(1, std::memory_order_relaxed);
         }
         entry.dirty = true;
-        entry.dirty_source = w.source;
+        if (!entry.dirty_claimed) { entry.dirty_source = w.source; entry.dirty_claimed = true; }
         entry.write_seen_since_decode = true;
         if (const uint32_t track = TrackedMatch(entry.watch_addr); track) {
           REXGPU_INFO("nx1_d3d9: TRACK {:08X} DIRTIED frame={} by write {:08X}+{} ({} {}+{})",
@@ -5233,6 +5278,11 @@ bool ResourceTracker::ConvertInlineIndices(uint32_t indices_addr, uint32_t index
 IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
                                                    const TextureFetchConstant& t,
                                                    uint32_t sampler) {
+  // Denominator for the normalised CHURN metric: EVERY texture serve, counted before any
+  // early-out. Placed after the cached-serve returns first time round, which counted
+  // rebuilds instead and produced 2.4 "binds" per frame -- a denominator wrong by three
+  // orders of magnitude, which would have made every normalised A/B meaningless.
+  ++tex_binds_;
   if (!device_ || !textures_) {
     return nullptr;
   }
@@ -5575,8 +5625,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // one surface cycling its mip_address every few frames, and if that churn is real this check
   // turns it into a rebuild storm; the counter in the periodic mipgen stats is how we would see.
   if (entry.tex && entry.mip_source == 3 && entry.mip_addr_seen != t.mip_address) {
+    // FIRST CAUSE WINS. dirty_source used to be overwritten by whichever source fired last
+    // before the rebuild, and the probe runs on every bind of every frame while the write and
+    // DMA drains run at frame boundaries -- so the probe stole the attribution for changes it
+    // did not cause. DRAINHIT showed DMA matching 7,776 ranges while REBUILDSRC credited it with
+    // 4 rebuilds, which is how the bias showed. Claim the entry only if nothing else has.
     entry.dirty = true;
-    entry.dirty_source = DirtySource::kMipReloc;
+    if (!entry.dirty_claimed) { entry.dirty_source = DirtySource::kMipReloc; entry.dirty_claimed = true; }
     ++mip_relocs_;
   }
   // A dump budget armed while a MATERIAL filter is active means "dump what this draw binds,
@@ -5604,8 +5659,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // which of these rechecks actually found different bytes -- that number is the measurement,
   // and the picture is the confirmation.
   if (entry.tex && entry.recheck_frame && frame_ >= entry.recheck_frame) {
+    // FIRST CAUSE WINS. dirty_source used to be overwritten by whichever source fired last
+    // before the rebuild, and the probe runs on every bind of every frame while the write and
+    // DMA drains run at frame boundaries -- so the probe stole the attribution for changes it
+    // did not cause. DRAINHIT showed DMA matching 7,776 ranges while REBUILDSRC credited it with
+    // 4 rebuilds, which is how the bias showed. Claim the entry only if nothing else has.
     entry.dirty = true;
-    entry.dirty_source = DirtySource::kRecheck;
+    if (!entry.dirty_claimed) { entry.dirty_source = DirtySource::kRecheck; entry.dirty_claimed = true; }
     entry.retry_frame = 0;
     ++forced_rechecks_;
     if (entry.rechecks_left) {
@@ -5695,8 +5755,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         if (REXCVAR_GET(nx1_d3d9_probe_needs_write) && !entry.write_seen_since_decode) {
           ++probe_refused_no_write_;
         } else {
+        // FIRST CAUSE WINS. dirty_source used to be overwritten by whichever source fired last
+        // before the rebuild, and the probe runs on every bind of every frame while the write and
+        // DMA drains run at frame boundaries -- so the probe stole the attribution for changes it
+        // did not cause. DRAINHIT showed DMA matching 7,776 ranges while REBUILDSRC credited it with
+        // 4 rebuilds, which is how the bias showed. Claim the entry only if nothing else has.
         entry.dirty = true;
-        entry.dirty_source = DirtySource::kProbe;
+        if (!entry.dirty_claimed) { entry.dirty_source = DirtySource::kProbe; entry.dirty_claimed = true; }
         entry.retry_frame = 0;
         ++probe_rebuilds_;
         // THE REBUILD MUST RE-READ THE SLOT. The probe reads LIVE memory; the rebuild reads
@@ -7481,6 +7546,7 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // The decode has now consumed whatever write was reported; require a NEW one before a
   // probe-detected change is adopted again (see nx1_d3d9_probe_needs_write).
   entry.write_seen_since_decode = false;
+  entry.dirty_claimed = false;
     entry.probe_hash = probe_in_range
                            ? ProbeTiledContent(TranslatePhysical(t.base_address), extent, bpb,
                                                t.tiled, REXCVAR_GET(nx1_d3d9_probe_samples))
@@ -7754,8 +7820,13 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   }
   const bool partial = partial_pages != 0 && REXCVAR_GET(nx1_d3d9_retry_partial);
   if (swizzle_all_zero || partial) {
+    // FIRST CAUSE WINS. dirty_source used to be overwritten by whichever source fired last
+    // before the rebuild, and the probe runs on every bind of every frame while the write and
+    // DMA drains run at frame boundaries -- so the probe stole the attribution for changes it
+    // did not cause. DRAINHIT showed DMA matching 7,776 ranges while REBUILDSRC credited it with
+    // 4 rebuilds, which is how the bias showed. Claim the entry only if nothing else has.
     entry.dirty = true;
-    entry.dirty_source = DirtySource::kPartial;
+    if (!entry.dirty_claimed) { entry.dirty_source = DirtySource::kPartial; entry.dirty_claimed = true; }
     entry.good_frames = 0;
     entry.committed = false;
     // 2, 4, 8 ... 64 frames between attempts. Deliberately not reset by DrainMemoryWrites: the

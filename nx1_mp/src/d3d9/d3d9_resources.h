@@ -957,6 +957,7 @@ class ResourceTracker {
   uint64_t mipfill_levels_ = 0;
   uint64_t mip_relocs_ = 0;            ///< re-decodes forced by a moved mip_address
   uint64_t prefetch_draws_ = 0;      ///< draw-time mirror prefetches (window fix)
+  uint64_t tex_binds_ = 0;               ///< texture serves, for normalising churn across runs
   uint64_t probe_refused_no_write_ = 0;  ///< probe changes refused by probe_needs_write
   uint64_t probe_rebuilds_ = 0;        ///< rebuilds forced by the content probe
   uint64_t forced_rechecks_ = 0;       ///< re-decodes forced by nx1_d3d9_redecode_delay
