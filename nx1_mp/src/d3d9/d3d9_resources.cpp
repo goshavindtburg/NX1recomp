@@ -248,6 +248,85 @@ uint64_t ProbeTiledContent(const uint8_t* base, const rex::graphics::TextureExte
   return h;
 }
 
+/// Sample a BC-compressed region into an NxN luminance thumbnail WITHOUT decoding it.
+///
+/// A BC block's two RGB565 endpoints bracket its colour range, so their mean approximates the
+/// block's mean colour -- which is all a correlation needs. DXT1 (bpb=8) keeps them at bytes 0-3;
+/// DXT3/DXT5 (bpb=16) put the colour block second, so they are at bytes 8-11. No BC decode and no
+/// detile: one 4-byte read per 16 texels, at the same GetTiledOffset2D addresses DetileMip2D uses.
+///
+/// SAMPLED ON NORMALISED COORDINATES so two regions of DIFFERENT SIZES come back directly
+/// comparable, element by element. That is what lets a base be correlated against its own half-size
+/// mip without an explicit downsample step, and it keeps the cost independent of texture size --
+/// N*N reads whether the texture is 32x32 or 1024x1024.
+/// ENDIAN. The guest data is big-endian; the decode swaps it (CopySwapBlock, :2116). Reading the
+/// RGB565 endpoints raw was a real bug, caught by validating the thumbnail against our own decode
+/// of the same texture offline: two specimens went 0.948 -> 0.997 and 0.887 -> 0.986 once the
+/// 16-bit swap was applied, and one went -0.067 -> 0.680. Without that check this would have
+/// shipped as a confident, meaningless census.
+/// PACKED TILE ORIGIN. A packed mip level does not start at block (0,0) of its storage -- it sits
+/// at an offset inside a shared tile, which is why DetileMip2D takes ox/oy. Ignoring them samples a
+/// sibling level's texels; this codebase already traced three long-standing symptoms to exactly
+/// that (:6490).
+bool SampleBcThumb(const uint8_t* base, const rex::graphics::TextureExtent& ex, uint32_t bpb,
+                   bool tiled, uint32_t n, std::vector<float>& out, bool swap16, uint32_t ox,
+                   uint32_t oy) {
+  if (!base || !ex.block_width || !ex.block_height || (bpb != 8 && bpb != 16) || !n) {
+    return false;
+  }
+  namespace tu = rex::graphics::texture_util;
+  const uint32_t bpb_log2 = uint32_t(__builtin_ctz(bpb));
+  const uint32_t colour_off = (bpb == 16) ? 8u : 0u;  // DXT3/5 keep the colour block second
+  out.resize(size_t(n) * n);
+  for (uint32_t j = 0; j < n; ++j) {
+    const uint32_t by = uint32_t(uint64_t(j) * ex.block_height / n) + oy;
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t bx = uint32_t(uint64_t(i) * ex.block_width / n) + ox;
+      const size_t off = tiled ? size_t(tu::GetTiledOffset2D(int32_t(bx), int32_t(by),
+                                                             ex.block_pitch_h, bpb_log2))
+                               : (size_t(by) * ex.block_pitch_h + bx) * bpb;
+      uint16_t c0 = 0, c1 = 0;
+      std::memcpy(&c0, base + off + colour_off, 2);
+      std::memcpy(&c1, base + off + colour_off + 2, 2);
+      if (swap16) {
+        c0 = uint16_t((c0 >> 8) | (c0 << 8));
+        c1 = uint16_t((c1 >> 8) | (c1 << 8));
+      }
+      // RGB565 -> luma, averaged over the two endpoints. Absolute scale is irrelevant; a Pearson
+      // correlation is invariant to both offset and gain, so no normalisation is needed here.
+      const auto luma = [](uint16_t c) {
+        return 0.299f * float((c >> 11) & 0x1F) * 2.0f + 0.587f * float((c >> 5) & 0x3F) +
+               0.114f * float(c & 0x1F) * 2.0f;
+      };
+      out[size_t(j) * n + i] = 0.5f * (luma(c0) + luma(c1));
+    }
+  }
+  return true;
+}
+
+/// Pearson correlation of two equal-length thumbnails. Returns 2.0f when undefined (either side
+/// constant -- a uniform or entirely-zero region has no variance to correlate), which callers must
+/// treat as NOT MEASURED rather than as disagreement. Reporting a flat region as "uncorrelated"
+/// would have made every empty mip chain look like a contaminated base.
+float ThumbCorrelation(const std::vector<float>& a, const std::vector<float>& b) {
+  if (a.size() != b.size() || a.size() < 16) {
+    return 2.0f;
+  }
+  const float n = float(a.size());
+  float ma = 0, mb = 0;
+  for (size_t i = 0; i < a.size(); ++i) { ma += a[i]; mb += b[i]; }
+  ma /= n; mb /= n;
+  float va = 0, vb = 0, cov = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const float da = a[i] - ma, db = b[i] - mb;
+    va += da * da; vb += db * db; cov += da * db;
+  }
+  if (va <= 1e-6f || vb <= 1e-6f) {
+    return 2.0f;
+  }
+  return cov / std::sqrt(va * vb);
+}
+
 uint64_t ProbeGuestContent(const uint8_t* p, uint32_t bytes) {
   if (!p || bytes < 8) {
     return 0;
@@ -728,6 +807,107 @@ REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_autotrack_max_dim, 512, "GPU",
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_autotrack_zero_pct, 75, "GPU",
                       "Percent of a page that must be zero for autotrack to call it starved");
 
+/// Percent of a source page that must be ZERO for the decode to call it STARVED.
+///
+/// 75 matches nx1_d3d9_dbg_autotrack_zero_pct deliberately -- the two must agree or the census and
+/// the hunt would disagree about what they are counting. It sits between the observed starved bases
+/// (76-91% zero across two independently captured specimens, 16EE0000 and 16B1E000) and delivered
+/// art (0-3%), so the gap it has to discriminate is wide and the exact value is not delicate.
+///
+/// This threshold only feeds REPORTING (the STARVEDSRC line). It changes no rendering decision, so
+/// a badly chosen value costs a misleading number, never a wrong picture.
+REXCVAR_DEFINE_UINT32(nx1_d3d9_starved_pct, 75, "GPU",
+                      "Percent of a source page that must be zero for the decode to count it "
+                      "STARVED (reporting only; see STARVEDSRC)");
+
+/// How many percentage points emptier than its own mip chain a base must be to count as a DELIVERY
+/// HOLE. 40 is deliberately wide: the confirmed specimen 16B1E000 sits at ~84 points (89% zero base
+/// against a mip chain that decodes as a complete brick wall), while legitimately sparse art scores
+/// near 0 because its mip chain is equally sparse. A wide margin keeps this a structural test
+/// rather than a content judgement -- see [[nx1-instruments-lie]] on the six content classifiers
+/// that have already lied in this investigation.
+/// Correlation thresholds for the contamination census, as percentages (cvars are integral).
+/// Calibrated on 10 offline-labelled pairs: healthy bases correlate 0.991 with their own mip chain,
+/// the contaminated roof scored -0.002. 70/30 leaves a wide dead band between them so neither
+/// threshold is delicate, and anything landing in the gap is counted in neither bucket.
+/// REPORTING ONLY -- no rendering decision reads these.
+/// *** THE MIP-CHAIN FALLBACK. A DELIBERATE DIVERGENCE FROM THE REFERENCE. ***
+///
+/// When a texture's BASE level is wrong but its guest mip chain is intact, decode level 0 from the
+/// CHAIN instead of from base_address. Xenia does not do this and does not need to: it banks pages
+/// when they are valid and never re-reads, so its copy of the base is still the original. We read
+/// live guest memory, so when the streamer empties or recycles that slot we render the hole. This
+/// trades sharpness for correctness on exactly the textures where the base is unusable.
+///
+/// GATED ON A DETECTOR VALIDATED OFFLINE ON 16 SPECIMENS with ZERO false positives:
+///   corr(mip1, mip2) >= agree   -- the chain is self-consistent, therefore REAL
+///   AND corr(base, mip1) <= disagree  -- the base disagrees with it
+/// Real chains measured 0.932-0.999, noise chains <=0.198; a fired texture's base measured
+/// -0.063..-0.012 against healthy >=0.979. Both margins are wide, so the thresholds are not
+/// delicate. Crucially the two-signal form separates "healthy texture with a NOISE chain" (never
+/// touch it -- acting would destroy good art) from "corrupt texture with a REAL chain" (fix it),
+/// which is the distinction every single-signal attempt failed to make.
+///
+/// DEFAULT OFF. It changes what is rendered, and the detector has only ever been run offline.
+/// *** RETENTION MODE: FOLLOW THE REFERENCE'S INVALIDATION MODEL. ***
+///
+/// The reference uploads a guest page into its shared-memory buffer ONCE, when first requested
+/// while invalid, and then HOLDS it. The only things that clear a page's valid bit are a trapped
+/// guest CPU store, an explicit GPU-write announcement, and a frame-end refresh that fires no
+/// watches. **It inspects texture CONTENT nowhere** -- no hash, no poll, no compare, no timer.
+/// Texture re-decode is likewise watch-driven and deferred, never content-driven.
+/// See [[nx1-reference-retention-model]] for the full map with citations.
+///
+/// We diverge on exactly that: our mirror is nominally a retention cache but is invalidated by the
+/// content probe (which polls every bind), by a timed recheck ladder and by partial-source retries,
+/// so in practice it never retains -- MIRRORSTALE measured 4 addresses ever stale and 0 still bound,
+/// i.e. it behaves like a live read. This mode turns those three off, leaving DrainMemoryWrites
+/// (CPU stores + DMA + GPU writes) as the only path that may drop a mirror page or dirty an entry,
+/// which is the reference's rule.
+///
+/// THE RISK IS REAL AND IS THE POINT OF THE EXPERIMENT: retaining means a texture first decoded
+/// from a recycled slot is held WRONG with nothing to correct it. The reference gets away with this
+/// because it captures pages early, while the data is resident. Whether we do too is exactly what
+/// this measures. Off by default; one toggle back.
+/// The LAST invalidation source, gated for the full-retention test. The reference honours trapped
+/// CPU stores (its one automatic source), so turning this off is a DELIBERATE over-shoot of the
+/// reference's model, not a copy of it -- it exists to answer one question: if NOTHING re-reads a
+/// texture after its first decode, does the church stop breaking on retreat? A yes means retention
+/// is the answer and the real fix is the gpu_written SHIELD (invalidate on CPU stores EXCEPT on
+/// pages that arrived via the image-cache DMA), which is what the reference actually does. A no
+/// means something re-reads regardless, and retention is not the fix. Default ON (faithful).
+REXCVAR_DEFINE_BOOL(nx1_d3d9_cpu_invalidate, true, "GPU",
+                    "Honour trapped guest CPU stores as texture invalidations (the reference's one "
+                    "automatic source). Off = full retention, nothing re-reads after first decode");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_retain_mirror, false, "GPU",
+                    "Follow the reference's retention model: only trapped CPU stores, DMA and GPU "
+                    "writes may invalidate: no content polling, no recheck ladder, no partial retry");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_eager_sweep, false, "GPU",
+                    "Proactively snapshot all 512 MB into the mirror over the first ~2 s at startup. "
+                    "The reference does NOT do this -- it captures each page lazily the first time a "
+                    "texture requests it (MirrorSnapshot), when the data is present. The eager sweep "
+                    "captures pages while still EMPTY and then depends on CPU-store invalidation to "
+                    "re-capture them once filled, which inverts the reference model and makes CPU "
+                    "invalidation our mirror-population path rather than a recycle detector. Off = "
+                    "pure lazy-on-use capture (reference-faithful); on = the old eager pre-population");
+
+REXCVAR_DEFINE_BOOL(nx1_d3d9_mip_fallback, false, "GPU",
+                    "When the base level is wrong but the guest mip chain is intact, build the "
+                    "texture from the chain instead of the base (see CHAINFIX)");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_corr_agree_pct, 70, "GPU",
+                      "Correlation (percent) at or above which the guest mip chain counts as "
+                      "self-consistent (see CONTAMINATED)");
+REXCVAR_DEFINE_UINT32(nx1_d3d9_corr_disagree_pct, 30, "GPU",
+                      "Correlation (percent) below which a base counts as disagreeing with its "
+                      "own mip chain (see CONTAMINATED)");
+
+REXCVAR_DEFINE_UINT32(nx1_d3d9_hole_margin_pct, 40, "GPU",
+                      "Percentage points by which a base's zero fraction must exceed its own mip "
+                      "chain's to count as a delivery hole (reporting only; see DELIVERYHOLE)");
+
 REXCVAR_DEFINE_UINT32(nx1_d3d9_dbg_framediff, 0, "GPU",
                       "Debug: dump the next N resolves as a PAIR -- our rendered target and "
                       "the guest-RAM contents at the same address -- for backend comparison");
@@ -1123,7 +1303,7 @@ enum : uint32_t {
 // RRRR fetch swizzle (replicate the one channel into all four) that we cannot
 // reproduce on a fixed-function D3D9 sampler, so we CPU-decode them to A8R8G8B8
 // with the value written into every channel -- then any shader swizzle reads it.
-enum class TexDecode { kNone, kDXT3A, kDXT5A, kDXN, kColorSwizzle };
+enum class TexDecode { kNone, kDXT3A, kDXT5A, kDXN, kColorSwizzle, kChainFallback };
 
 /// XE_GPU_TEXTURE_SWIZZLE with each component taken from its own source channel: x<-X, y<-Y,
 /// z<-Z, w<-W, i.e. 0 | 1<<3 | 2<<6 | 3<<9. Anything else means the fetch reorders, replicates
@@ -2341,6 +2521,72 @@ void DecodeBcImage(D3DFORMAT fmt, const uint8_t* src, uint32_t row_bytes, uint32
   }
 }
 
+/// Block-mean thumbnail of a TILED BC region, averaged into a g x g grid.
+///
+/// Per-block means are the right granularity here: a mip level IS an average of the level above,
+/// so the comparison has to average too. Point-sampling one block per cell was measured and it
+/// BREAKS the test -- chain correlations collapsed from 0.93-0.97 to 0.66-0.88 and every true
+/// positive stopped firing. Averaging every block into its cell restores them exactly.
+bool BcBlockMeanThumb(const uint8_t* src, const rex::graphics::TextureExtent& ex, uint32_t bpb,
+                      bool tiled, D3DFORMAT bc_fmt, uint32_t g, std::vector<float>& out) {
+  if (!src || !ex.block_width || !ex.block_height || !g) {
+    return false;
+  }
+  namespace tu = rex::graphics::texture_util;
+  const uint32_t bpb_log2 = uint32_t(__builtin_ctz(bpb));
+  std::vector<float> acc(size_t(g) * g, 0.0f);
+  std::vector<uint32_t> cnt(size_t(g) * g, 0u);
+  // STRIDE CAP. Cost is one block decode per base block, which is fine at 128x128 (1024) and
+  // heavy at 1024x1024 (65536). Striding still yields a good CELL AVERAGE because each cell
+  // aggregates many blocks -- unlike point sampling, which drops the averaging entirely.
+  const uint64_t total = uint64_t(ex.block_width) * ex.block_height;
+  const uint32_t step = uint32_t(std::max<uint64_t>(1, total / 16384));
+  for (uint32_t by = 0; by < ex.block_height; ++by) {
+    for (uint32_t bx = 0; bx < ex.block_width; bx += step) {
+      const size_t off = tiled ? size_t(tu::GetTiledOffset2D(int32_t(bx), int32_t(by),
+                                                             ex.block_pitch_h, bpb_log2))
+                               : (size_t(by) * ex.block_pitch_h + bx) * bpb;
+      Rgba8 tex[16];
+      DecodeBcBlock(bc_fmt, src + off, tex);
+      float m = 0.0f;
+      for (const Rgba8& c : tex) m += float(c.r) + float(c.g) + float(c.b);
+      const uint32_t i = std::min(g - 1, uint32_t(uint64_t(bx) * g / ex.block_width));
+      const uint32_t j = std::min(g - 1, uint32_t(uint64_t(by) * g / ex.block_height));
+      acc[size_t(j) * g + i] += m / 48.0f;
+      ++cnt[size_t(j) * g + i];
+    }
+  }
+  out.resize(size_t(g) * g);
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = cnt[i] ? acc[i] / float(cnt[i]) : 0.0f;
+  }
+  return true;
+}
+
+/// Box-average an already-decoded RGBA image down to a g x g thumbnail.
+bool Rgba8ThumbDown(const std::vector<Rgba8>& img, uint32_t w, uint32_t h, uint32_t g,
+                    std::vector<float>& out) {
+  if (img.size() < size_t(w) * h || !w || !h || !g) {
+    return false;
+  }
+  std::vector<float> acc(size_t(g) * g, 0.0f);
+  std::vector<uint32_t> cnt(size_t(g) * g, 0u);
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint32_t j = std::min(g - 1, uint32_t(uint64_t(y) * g / h));
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint32_t i = std::min(g - 1, uint32_t(uint64_t(x) * g / w));
+      const Rgba8& c = img[size_t(y) * w + x];
+      acc[size_t(j) * g + i] += (float(c.r) + float(c.g) + float(c.b)) / 3.0f;
+      ++cnt[size_t(j) * g + i];
+    }
+  }
+  out.resize(size_t(g) * g);
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = cnt[i] ? acc[i] / float(cnt[i]) : 0.0f;
+  }
+  return true;
+}
+
 /// Decode a block-compressed COLOUR texture (BC1/2/3) into A8R8G8B8 while applying the fetch
 /// constant's channel swizzle. A compressed host texture samples fixed RGBA, so it cannot honour a
 /// swizzle that broadcasts one channel to RGB -- which is how the smoke/effect sprites are stored
@@ -2809,6 +3055,125 @@ uint64_t ResourceTracker::MirrorFingerprint(uint32_t base_address, uint32_t byte
     h = (h ^ p[i]) * 0x100000001B3ull;
   }
   return h ? h : 1;
+}
+
+/// IS THE SNAPSHOT STALE? Every census this investigation has run reads LIVE guest memory, while
+/// the decode reads the mirror -- so a divergence between the two is precisely the blind spot none
+/// of them could report. Compare what we are about to decode against what guest RAM holds right
+/// now. Page-granular, because the corruption is: part of a texture correct, part foreign, split on
+/// 4 KB boundaries.
+///
+/// WHY THIS IS THE ONE MEASUREMENT NOTHING ELSE CAN MAKE. The content probe seeds entry.probe_hash
+/// from TranslatePhysical (LIVE) and re-checks against TranslatePhysical (LIVE) -- it is live-vs-live
+/// and is a sound change detector. But the pixels come from the MIRROR. So a decode taken from a
+/// stale snapshot displays bytes guest memory no longer holds while probe_hash still matches live on
+/// every subsequent poll: the probe is permanently satisfied and no rebuild is ever triggered. That
+/// is a decode which is wrong forever with no correcting trigger, and it matches the reported
+/// residual ("some surfaces do not resolve unless I am near them") exactly.
+///
+/// CALLED FROM BOTH MIRROR READS, deliberately. See the StaleSite comment in the header.
+void ResourceTracker::CheckMirrorStale(StaleSite site, const uint8_t* snapshot,
+                                       uint32_t base_address, size_t bytes,
+                                       const TextureFetchConstant& t, uint32_t height) {
+  if (!REXCVAR_GET(nx1_d3d9_dbg_mirrorstale) || !snapshot || !bytes) {
+    return;
+  }
+  // BOUNDS. Same 512 MB physical window every other reader in this file respects. A texture's
+  // declared dimensions can imply more bytes than the mapped region holds, and an unbounded read
+  // here has already crashed the game once (muzzle-flash sprites decode on the spot).
+  const uint32_t phys = PhysicalAddress(base_address);
+  constexpr uint64_t kPhysWindowBytes = 0x20000000ull;
+  if (!phys || uint64_t(phys) + bytes > kPhysWindowBytes) {
+    return;
+  }
+  const uint8_t* live = TranslatePhysical(base_address);
+  if (!live) {
+    return;
+  }
+  const size_t i = size_t(site);
+  const char* const what = site == StaleSite::kBase ? "base" : "mip";
+  uint32_t pages = 0, diff = 0;
+  for (size_t off = 0; off < bytes; off += 4096) {
+    const size_t len = std::min<size_t>(4096, bytes - off);
+    ++pages;
+    if (std::memcmp(snapshot + off, live + off, len) != 0) {
+      ++diff;
+    }
+  }
+  ++mirrorstale_decodes_[i];
+  mirrorstale_pages_[i] += pages;
+  if (diff) {
+    ++mirrorstale_stale_decodes_[i];
+    mirrorstale_stale_pages_[i] += diff;
+    // Capture unconditionally; liveness is decided at report time. Only the base site enters the
+    // census -- a mip-chain address is not what live_bases_ tracks, so judging it against that map
+    // would silently report every mip address as dead.
+    if (site == StaleSite::kBase) {
+      auto it = mirrorstale_addrs_.find(base_address);
+      if (it == mirrorstale_addrs_.end()) {
+        if (mirrorstale_addrs_.size() >= kStaleAddrMax) {
+          ++mirrorstale_addrs_dropped_;
+        } else {
+          StaleAddr& a = mirrorstale_addrs_[base_address];
+          a.first_frame = frame_;
+          it = mirrorstale_addrs_.find(base_address);
+        }
+      }
+      if (it != mirrorstale_addrs_.end()) {
+        StaleAddr& a = it->second;
+        a.last_frame = frame_;
+        ++a.decodes;
+        a.pages_stale += diff;
+        a.pages_total += pages;
+        a.width = t.width;
+        a.height = height;
+        a.format = t.format;
+      }
+    }
+    if (mirrorstale_stale_decodes_[i] <= 12) {
+      REXGPU_WARN("nx1_d3d9: MIRRORSTALE-{} {:08X} {}x{} fmt={} -- {} of {} snapshot pages DIFFER "
+                  "from live guest memory, so this decode is about to use bytes the slot no longer "
+                  "holds",
+                  what, base_address, t.width, height, t.format, diff, pages);
+    }
+  }
+  // Print BOTH sites every time either reaches the interval, and print totals unconditionally
+  // including zero. A site that never fires must still show its denominator, or its zero cannot be
+  // told apart from "that code path never ran" -- which is how the previous revision of this
+  // instrument would have reported a completely stale mip chain as silence.
+  if ((mirrorstale_decodes_[i] % 2000) == 0) {
+    for (size_t s = 0; s < 2; ++s) {
+      REXGPU_WARN("nx1_d3d9: MIRRORSTALE-{} {} of {} decodes read a STALE snapshot ({} of {} pages "
+                  "differed from live memory). THE RATE IS DILUTED -- re-decodes are preceded by "
+                  "InvalidateMirrorPages and are clean by construction; read the CENSUS below",
+                  s == 0 ? "base" : "mip", mirrorstale_stale_decodes_[s], mirrorstale_decodes_[s],
+                  mirrorstale_stale_pages_[s], mirrorstale_pages_[s]);
+    }
+    // THE CENSUS. How many distinct textures were ever decoded from a stale snapshot, and how many
+    // of those are STILL BOUND -- i.e. currently on screen showing bytes the slot no longer held.
+    // kLiveFrames matches the clamp_alloc liveness window in GetTexture so "still bound" means the
+    // same thing in both places.
+    constexpr uint64_t kLiveFrames = 4;
+    uint32_t still_live = 0;
+    std::string live_list;
+    for (const auto& [addr, a] : mirrorstale_addrs_) {
+      const auto lb = live_bases_.find(addr);
+      if (lb == live_bases_.end() || frame_ - lb->second > kLiveFrames) {
+        continue;
+      }
+      ++still_live;
+      if (live_list.size() < 900) {
+        live_list += fmt::format("{:08X}({}x{} f{} {}/{}pg x{}) ", addr, a.width, a.height,
+                                 a.format, a.pages_stale, a.pages_total, a.decodes);
+      }
+    }
+    REXGPU_WARN("nx1_d3d9: MIRRORSTALE-CENSUS {} distinct addresses ever decoded from a stale "
+                "snapshot, {} of them STILL BOUND this frame (dropped past the {} cap: {}). The "
+                "still-bound ones are displaying bytes guest memory no longer holds, with nothing "
+                "left to dirty them -- aim DUMP MIPS at these: {}",
+                mirrorstale_addrs_.size(), still_live, kStaleAddrMax, mirrorstale_addrs_dropped_,
+                live_list.empty() ? "(none)" : live_list.c_str());
+  }
 }
 
 void ResourceTracker::PrefetchTextureAtDraw(const TextureFetchConstant& t) {
@@ -3724,6 +4089,84 @@ void ResourceTracker::LogCacheStats() {
               decodes_total_ ? partial_decodes_ * 100 / decodes_total_ : 0, partial_pages_sum_,
               decode_pages_sum_,
               decode_pages_sum_ ? partial_pages_sum_ * 100 / decode_pages_sum_ : 0);
+  // THE CORRECTED BASELINE. PARTIALSRC above counts ENTIRELY-zero pages and reports ~0% even when
+  // the screen is made of half-empty textures; this counts pages that are >= nx1_d3d9_starved_pct
+  // zero, which is what a truncated stream-in actually looks like. Printed unconditionally with
+  // both denominators so a zero is readable as measured-and-clean rather than never-ran.
+  REXGPU_WARN("nx1_d3d9: STARVEDSRC {} of {} decodes had >=1 STARVED source page ({}%) | {} of {} "
+              "pages were >={}% zero ({}%) | overall source zero fraction {}% of {} bytes sampled "
+              "-- PARTIALSRC's entirely-zero test cannot see this and reports ~0",
+              starved_decodes_, decodes_total_,
+              decodes_total_ ? starved_decodes_ * 100 / decodes_total_ : 0, starved_pages_sum_,
+              decode_pages_sum_, REXCVAR_GET(nx1_d3d9_starved_pct),
+              decode_pages_sum_ ? starved_pages_sum_ * 100 / decode_pages_sum_ : 0,
+              src_bytes_sampled_ ? src_bytes_zero_ * 100 / src_bytes_sampled_ : 0,
+              src_bytes_sampled_);
+  // THE DISCRIMINATING SIGNATURE. STARVEDSRC counts sparse sources and runs far too high to be the
+  // artifact on its own; this counts only bases that disagree with their OWN downsample, which
+  // sparse art cannot do. Denominator is decodes that HAD a distinct mip chain to compare against.
+  REXGPU_WARN("nx1_d3d9: DELIVERYHOLE {} of {} decodes with a mip chain had a base >={} points "
+              "emptier than its own chain ({}%) -- a mip is a downsample, so this disagreement is "
+              "a delivery hole, not dark art",
+              holetest_hits_, holetest_decodes_, REXCVAR_GET(nx1_d3d9_hole_margin_pct),
+              holetest_decodes_ ? holetest_hits_ * 100 / holetest_decodes_ : 0);
+  // THE CONTAMINATION CENSUS. Denominators printed unconditionally: `unmeasurable` must stay
+  // visible or a small `measured` would silently mean "almost nothing could be tested" while the
+  // percentage below it looked authoritative.
+  {
+    // READ THIS BEFORE THE COUNTS BELOW. Buckets span [-1,+1] in 0.2 steps, left to right.
+    // mip1-vs-mip2 SHOULD pile up in the rightmost buckets: a real mip chain is a downsample of
+    // itself. A flat spread means the thumbnail estimator is too noisy and nothing under it counts.
+    std::string hb, hm;
+    for (int i = 0; i < 10; ++i) {
+      hb += fmt::format("{} ", corr_hist_bm_[i]);
+      hm += fmt::format("{} ", corr_hist_mm_[i]);
+    }
+    REXGPU_WARN("nx1_d3d9: CORRHIST buckets -1.0..+1.0 step 0.2 | base-vs-mip1: {}| mip1-vs-mip2: "
+                "{}| a BIMODAL mip1-vs-mip2 spread is EXPECTED, not a failure -- about half the "
+                "guest mip chains hold noise and ~0 is correct for those. Judge the estimator on "
+                "CORRCTRL below, not on this shape",
+                hb, hm);
+    // THE VALIDATION. Read this before any CONTAMINATED count.
+    std::string sweep;
+    for (int k = 0; k < kCorrCuts; ++k) {
+      sweep += fmt::format("cut{:.1f}: {}/{} ({}%)  ", 0.4 + 0.1 * k, corr_healthy_chain_ok_at_[k],
+                           corr_healthy_at_[k],
+                           corr_healthy_at_[k] ? corr_healthy_chain_ok_at_[k] * 100 /
+                                                     corr_healthy_at_[k]
+                                               : 0);
+    }
+    REXGPU_WARN("nx1_d3d9: CORRCTRL of decodes whose base correlates >=cut with mip1, how many ALSO "
+                "have a chain correlating >=cut -- {}| a base cannot correlate strongly with a NOISE "
+                "chain, so this must approach 100% at some cut. If it stays ~60% at EVERY cut the "
+                "estimator is too weak and the CONTAMINATED counts are meaningless",
+                sweep);
+  }
+  REXGPU_WARN("nx1_d3d9: CONTAMINATED {} of {} measurable decodes had a SELF-CONSISTENT mip chain "
+              "that the base DISAGREES with ({}%) | chain self-consistent in {} | {} decodes "
+              "unmeasurable (flat/empty region, no variance) | thresholds agree>={}% disagree<{}%",
+              corr_base_bad_, corr_decodes_,
+              corr_decodes_ ? corr_base_bad_ * 100 / corr_decodes_ : 0, corr_chain_ok_,
+              corr_unmeasurable_, REXCVAR_GET(nx1_d3d9_corr_agree_pct),
+              REXCVAR_GET(nx1_d3d9_corr_disagree_pct));
+  // ARMING PROOF. With retention on, REBUILDSRC must show probe/recheck/partial at 0/0 -- but a
+  // 0/0 is otherwise indistinguishable from the cvar simply being off, which is the ambiguity that
+  // has wasted runs here before. State the mode explicitly beside it.
+  REXGPU_WARN("nx1_d3d9: CPUINV honour={} suppressed={} -- with it off NOTHING re-reads after the "
+              "first decode (full retention). Must climb, or the store path is not running and a "
+              "no-change result means nothing",
+              REXCVAR_GET(nx1_d3d9_cpu_invalidate) ? "ON" : "off",
+              cpu_invalidate_suppressed_.load(std::memory_order_relaxed));
+  REXGPU_WARN("nx1_d3d9: RETAIN mode={} -- with it ON, REBUILDSRC probe/recheck/partial MUST read "
+              "0/0 and only cpu_write/dma/gpu_write may rebuild; if any of those three is non-zero "
+              "the gating is incomplete and the run does not test the reference's model",
+              REXCVAR_GET(nx1_d3d9_retain_mirror) ? "ON (reference retention)" : "off (ours)");
+  REXGPU_WARN("nx1_d3d9: CHAINFIX {} of {} tested textures were rebuilt from the guest mip chain "
+              "because the base disagreed with a self-consistent chain (cvar={}). Zero WITH the "
+              "cvar on and a non-zero denominator means nothing qualified; zero denominator means "
+              "the detector never ran and the arm proves nothing",
+              chainfix_hits_, chainfix_tested_,
+              REXCVAR_GET(nx1_d3d9_mip_fallback) ? "on" : "off");
   REXGPU_INFO("nx1_d3d9: RESOLVEMAP served={} rejected_stale={} (entries={})", resolve_served_,
               resolve_rejected_, resolves_ ? static_cast<ResolveMap*>(resolves_)->size() : 0);
   REXGPU_INFO("nx1_d3d9: SRCCLASS repeating(placeholder-like)={} high-entropy(garbage-like)={} "
@@ -3847,9 +4290,26 @@ std::pair<uint32_t, uint32_t> ResourceTracker::MemWatchThunk(void* ctx, uint32_t
 }
 
 std::pair<uint32_t, uint32_t> ResourceTracker::OnMemoryWrite(uint32_t addr, uint32_t len, bool) {
-  {
+  // *** FULL RETENTION TEST: suppress the LAST invalidation source. See nx1_d3d9_cpu_invalidate.
+  //
+  // With DMA already silenced (nx1_d3d9_dma_invalidate) and probe/recheck/partial gated by retain
+  // mode, a trapped guest CPU store is the ONLY thing left that re-reads a texture. The user's
+  // church resolves when approached and breaks on retreat with everything else off, so this store
+  // is the trigger. Suppressing it makes the mirror fully retain: once a texture is decoded it is
+  // held until its cache entry dies, which is the extreme of the reference's model.
+  //
+  // CRITICAL: still return the page range unconditionally. The memory layer uses it to UNPROTECT
+  // the faulting page; returning nothing (or an empty range) leaves the page write-protected and
+  // the guest store re-faults forever. We suppress the INVALIDATION, never the protection update.
+  //
+  // The known cost is the whole point of measuring: a texture first decoded from a recycled slot
+  // is then held WRONG with nothing to correct it. The user reports the church always resolves on
+  // approach, so for it, holding the resolved decode should win.
+  if (REXCVAR_GET(nx1_d3d9_cpu_invalidate)) {
     std::lock_guard<std::mutex> lk(dirty_mu_);
     writes_pending_.push_back({addr, len, DirtySource::kCpuWrite});
+  } else {
+    cpu_invalidate_suppressed_.fetch_add(1, std::memory_order_relaxed);
   }
   const uint32_t p0 = addr & ~0xFFFu;
   const uint32_t p1 = (addr + len + 0xFFFu) & ~0xFFFu;
@@ -5009,10 +5469,17 @@ void ResourceTracker::AdvanceFrame() {
   DrainMemoryWrites();
 
   // Proactive early snapshot: capture physical memory into the mirror a chunk at a time over the
-  // first frames, mirroring the reference's full-buffer memexport request that snapshots memory
-  // early while textures are resident. On-demand MirrorSnapshot captures the rest; the write-watch
-  // re-captures pages as the real image streams in. ~16 MB/frame -> full 512 MB in ~2s.
-  if (mirror_ && phys_base_ && mirror_sweep_page_ < kMirrorPages) {
+  // first frames. This was DESCRIBED as "mirroring the reference's full-buffer memexport request"
+  // -- that is a MISREADING (see [[nx1-reference-retention-model]]). The reference's RequestRange is
+  // lazy-on-use, never an eager sweep: it uploads a page the first time a texture requests it while
+  // invalid, when the data is actually resident. This sweep instead captures pages while still
+  // EMPTY and then leans on CPU-store invalidation to re-capture them once filled -- which is what
+  // made CPU invalidation our PRIMARY mirror-population mechanism instead of a recycle detector, the
+  // inverse of the reference. MirrorSnapshot (:4892) already does the reference's lazy capture on
+  // every decode-touch, so with this off pages are captured fresh at first use rather than empty
+  // at startup. Default off; gate exists purely for A/B against the old behaviour.
+  if (REXCVAR_GET(nx1_d3d9_eager_sweep) &&
+      mirror_ && phys_base_ && mirror_sweep_page_ < kMirrorPages) {
     const uint32_t end = std::min(mirror_sweep_page_ + 4096, kMirrorPages);  // 4096 pages = 16 MB
     auto* mem = rex::system::kernel_state()->memory();
     for (uint32_t p = mirror_sweep_page_; p < end; ++p) {
@@ -5658,7 +6125,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // asynchronous, so a fixed delay would answer only for that one latency. DECODECHANGE reports
   // which of these rechecks actually found different bytes -- that number is the measurement,
   // and the picture is the confirmation.
-  if (entry.tex && entry.recheck_frame && frame_ >= entry.recheck_frame) {
+  // RETENTION: a timed recheck is a re-read the reference never performs -- its re-decodes are
+  // driven solely by a range watch firing, never by a clock.
+  if (entry.tex && entry.recheck_frame && frame_ >= entry.recheck_frame &&
+      !REXCVAR_GET(nx1_d3d9_retain_mirror)) {
     // FIRST CAUSE WINS. dirty_source used to be overwritten by whichever source fired last
     // before the rebuild, and the probe runs on every bind of every frame while the write and
     // DMA drains run at frame boundaries -- so the probe stole the attribution for changes it
@@ -5684,7 +6154,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   // Bounded to one probe per texture per frame -- the early-out below runs ~80k times a frame and
   // must stay cheap.
   if (entry.tex && entry.probe_hash && entry.probe_frame != frame_ &&
-      REXCVAR_GET(nx1_d3d9_content_probe)) {
+      REXCVAR_GET(nx1_d3d9_content_probe) && !REXCVAR_GET(nx1_d3d9_retain_mirror)) {
+    // RETENTION: this poll IS the divergence. The reference inspects content nowhere; it learns a
+    // page changed only from host page protection. Skipping the probe entirely (rather than just
+    // refusing its adoptions, as nx1_d3d9_probe_needs_write does) also skips the
+    // InvalidateMirrorPages below, which is what actually lets the mirror hold a page.
     entry.probe_frame = frame_;
     // PROBE THE WHOLE GUEST FOOTPRINT, NOT THE VISIBLE RECTANGLE.
     //
@@ -6097,43 +6571,92 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     // spot none of them could report. Compare what we are about to decode against what guest RAM
     // holds right now. Page-granular, because the corruption is: part of a texture correct, part
     // foreign, split on 4 KB boundaries.
-    if (REXCVAR_GET(nx1_d3d9_dbg_mirrorstale) && guest_bytes) {
-      if (const uint8_t* live = TranslatePhysical(t.base_address)) {
-        uint32_t pages = 0, diff = 0;
-        for (size_t off = 0; off < guest_bytes; off += 4096) {
-          const size_t len = std::min<size_t>(4096, guest_bytes - off);
-          ++pages;
-          if (std::memcmp(src + off, live + off, len) != 0) {
-            ++diff;
-          }
-        }
-        ++mirrorstale_decodes_;
-        mirrorstale_pages_ += pages;
-        if (diff) {
-          ++mirrorstale_stale_decodes_;
-          mirrorstale_stale_pages_ += diff;
-          if (mirrorstale_stale_decodes_ <= 12) {
-            REXGPU_WARN("nx1_d3d9: MIRRORSTALE {:08X} {}x{} fmt={} -- {} of {} snapshot pages "
-                        "DIFFER from live guest memory, so this decode is about to use bytes the "
-                        "slot no longer holds",
-                        t.base_address, t.width, height, t.format, diff, pages);
-          }
-        }
-        if ((mirrorstale_decodes_ % 2000) == 0) {
-          REXGPU_WARN("nx1_d3d9: MIRRORSTALE {} of {} decodes read a STALE snapshot ({} of {} "
-                      "pages differed from live memory). Nonzero means the DECODE SOURCE, not "
-                      "guest memory, is what holds the wrong texture",
-                      mirrorstale_stale_decodes_, mirrorstale_decodes_, mirrorstale_stale_pages_,
-                      mirrorstale_pages_);
-        }
-      }
-    }
+    CheckMirrorStale(StaleSite::kBase, src, t.base_address, guest_bytes, t, height);
   } else {
     // Live read, but still watch the pages: the watch used to be armed only as a side effect
     // of snapshotting, so reading live left every texture unwatched and a decode taken before
     // the guest filled the memory could never be redone.
     ArmWriteWatch(t.base_address, uint32_t(guest_bytes));
     src = TranslatePhysical(t.base_address);
+  }
+  // *** IS THE BASE WRONG WHILE THE GUEST MIP CHAIN IS INTACT? *** See nx1_d3d9_mip_fallback.
+  // Runs here because it needs `src` and `extent`, and still ahead of CreateTexture so the host
+  // format can be switched to A8R8G8B8 when it fires.
+  std::vector<Rgba8> chain_l1;
+  uint32_t chain_l1_w = 0, chain_l1_h = 0;
+  if (REXCVAR_GET(nx1_d3d9_mip_fallback) && src && t.mip_address &&
+      t.mip_address != t.base_address && host.decode == TexDecode::kNone &&
+      (host.d3d == D3DFMT_DXT1 || host.d3d == D3DFMT_DXT3 || host.d3d == D3DFMT_DXT5) &&
+      t.width >= 16 && height >= 16) {
+    namespace tu5 = rex::graphics::texture_util;
+    const auto gl5 = tu5::GetGuestTextureLayout(
+        rex::graphics::xenos::DataDimension::k2DOrStacked, pitch_pixels >> 5, t.width, height,
+        /*depth=*/1, t.tiled, static_cast<rex::graphics::xenos::TextureFormat>(t.format),
+        t.packed_mips, /*has_base=*/true, t.mip_max_level);
+    const uint32_t last5 = std::min(gl5.max_level, gl5.packed_level);
+    const uint32_t l1w = std::max(t.width >> 1, 1u), l1h = std::max(height >> 1, 1u);
+    const uint32_t l2w = std::max(t.width >> 2, 1u), l2h = std::max(height >> 2, 1u);
+    if (last5 >= 2 && l2w >= 4 && l2h >= 4) {
+      const uint32_t need = gl5.mip_offsets_bytes[2] + gl5.mips[2].level_data_extent_bytes;
+      if (const uint8_t* mbase = MirrorSnapshot(t.mip_address, need)) {
+        // Decode BOTH guest levels in full -- they are 1/4 and 1/16 of the base, so this is
+        // affordable, and it is the texel-level data that makes the comparison work. The base
+        // uses cheap per-block means instead; validated as equivalent offline.
+        const auto level_img = [&](uint32_t m, uint32_t lw, uint32_t lh,
+                                   std::vector<Rgba8>& outimg) {
+          rex::graphics::TextureExtent e = rex::graphics::TextureExtent::Calculate(
+              fmt, std::max(rex::next_pow2(t.width) >> m, 1u),
+              std::max(rex::next_pow2(height) >> m, 1u), /*depth=*/1, t.tiled, /*is_guest=*/true);
+          e.block_pitch_h = gl5.mips[m].row_pitch_bytes / bpb;
+          e.block_pitch_v = gl5.mips[m].z_slice_stride_block_rows;
+          e.block_width = (lw + fmt->block_width - 1) / fmt->block_width;
+          e.block_height = (lh + fmt->block_height - 1) / fmt->block_height;
+          uint32_t ox = 0, oy = 0;
+          if (m == gl5.packed_level && t.packed_mips) {
+            rex::graphics::TextureInfo::GetPackedTileOffset(
+                std::max(rex::next_pow2(t.width) >> m, 1u),
+                std::max(rex::next_pow2(height) >> m, 1u), fmt, 0, &ox, &oy);
+          }
+          uint8_t* sc = DetileScratch(size_t(e.block_width) * e.block_height * bpb);
+          DetileMip2D(sc, e.block_width * bpb, mbase + gl5.mip_offsets_bytes[m], e, bpb, t.endian,
+                      t.tiled, ox, oy);
+          DecodeBcImage(host.d3d, sc, e.block_width * bpb, lw, lh, outimg);
+        };
+        std::vector<Rgba8> l2img;
+        level_img(1, l1w, l1h, chain_l1);
+        level_img(2, l2w, l2h, l2img);
+        // Compare at level 2's resolution -- the coarsest of the three, so every side is
+        // downsampled rather than invented.
+        const uint32_t g = std::min(32u, std::max(4u, l2w));
+        std::vector<float> tb, t1, t2;
+        if (!chain_l1.empty() && !l2img.empty() &&
+            BcBlockMeanThumb(src, extent, bpb, t.tiled, host.d3d, g, tb) &&
+            Rgba8ThumbDown(chain_l1, l1w, l1h, g, t1) &&
+            Rgba8ThumbDown(l2img, l2w, l2h, g, t2)) {
+          const float c_bm = ThumbCorrelation(tb, t1);
+          const float c_mm = ThumbCorrelation(t1, t2);
+          const float agree = REXCVAR_GET(nx1_d3d9_corr_agree_pct) / 100.0f;
+          const float disagree = REXCVAR_GET(nx1_d3d9_corr_disagree_pct) / 100.0f;
+          ++chainfix_tested_;
+          // 2.0f is ThumbCorrelation's NOT-MEASURABLE sentinel (a flat region has no variance);
+          // it must never be read as agreement.
+          if (c_mm <= 1.5f && c_bm <= 1.5f && c_mm >= agree && c_bm <= disagree) {
+            host.d3d = D3DFMT_A8R8G8B8;
+            host.decode = TexDecode::kChainFallback;
+            host.opaque_block = false;
+            chain_l1_w = l1w;
+            chain_l1_h = l1h;
+            ++chainfix_hits_;
+            if (chainfix_hits_ <= 16 || (chainfix_hits_ % 500) == 0) {
+              NX1_LOGW_TEX("nx1_d3d9: CHAINFIX {:08X} {}x{} fmt={} -- base correlates {:.3f} with "
+                           "mip1 while mip1 correlates {:.3f} with mip2, so the chain is real and "
+                           "the base is not. Building level 0 from the chain instead",
+                           t.base_address, t.width, height, t.format, c_bm, c_mm);
+            }
+          }
+        }
+      }
+    }
   }
   // HOW FAR MAY THIS DECODE READ? See nx1_d3d9_clamp_alloc. The fetch constant can declare more
   // bytes than the pool allocated, in which case the tail of our read is the NEXT texture and
@@ -6290,7 +6813,29 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
   size_t staged_bytes = 0;
   const size_t argb_bytes = size_t(locked.Pitch) * height;
   if (dst) {
-    if (host.decode == TexDecode::kColorSwizzle) {
+    if (host.decode == TexDecode::kChainFallback) {
+      // LEVEL 0 FROM THE CHAIN. `chain_l1` is guest mip 1, already decoded by the detector above;
+      // magnify it 2x into the level-0 surface. Point magnification on purpose -- this is real
+      // half-resolution data being shown at full size, and interpolating would invent detail the
+      // guest never delivered. The result is a visibly softer texture instead of a hole.
+      argb_stage = ArgbScratch(argb_bytes);
+      for (uint32_t y = 0; y < height; ++y) {
+        uint8_t* row = argb_stage + size_t(y) * locked.Pitch;
+        const uint32_t sy = std::min(chain_l1_h - 1, y >> 1);
+        for (uint32_t x = 0; x < t.width; ++x) {
+          const uint32_t sx = std::min(chain_l1_w - 1, x >> 1);
+          const Rgba8& c = chain_l1[size_t(sy) * chain_l1_w + sx];
+          uint8_t* p = row + size_t(x) * 4;
+          p[0] = c.b;
+          p[1] = c.g;
+          p[2] = c.r;
+          p[3] = c.a;
+        }
+      }
+      std::memcpy(dst, argb_stage, argb_bytes);
+      mip_source = argb_stage;
+      staged_bytes = argb_bytes;
+    } else if (host.decode == TexDecode::kColorSwizzle) {
       // Detile the compressed colour blocks, then decode to A8R8G8B8 applying the channel swizzle
       // (the compressed host format cannot honour a broadcast swizzle) -- see src_bc above.
       uint8_t* scratch = DetileScratch(size_t(extent.block_width) * extent.block_height * bpb);
@@ -6694,7 +7239,12 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     // 17% and, once partial decodes started being replaced by a placeholder, turned much of the
     // world white. A texture is incomplete only if the region it reads from is.
     size_t scan_bytes = guest_bytes;
-    if (const auto* fi_scan = rex::graphics::FormatInfo::Get(t.format)) {
+    // Hoisted so the delivery-hole test below can size the MIP extent with the same format info
+    // rather than re-fetching it (and rather than reusing guest_bytes, which is the base's size).
+    const auto* const fi_scan_mip = rex::graphics::FormatInfo::Get(t.format);
+    const uint32_t bpb_scan = fi_scan_mip ? fi_scan_mip->bytes_per_block() : 0;
+    uint64_t samples_all = 0, zeros_all = 0;
+    if (const auto* fi_scan = fi_scan_mip) {
       const uint32_t bw_s = (t.width + fi_scan->block_width - 1) / fi_scan->block_width;
       const uint32_t bh_s = (height + fi_scan->block_height - 1) / fi_scan->block_height;
       const size_t level0 = size_t(bw_s) * bh_s * fi_scan->bytes_per_block();
@@ -6702,11 +7252,36 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
         scan_bytes = level0;
       }
     }
-    uint32_t pages_total = 0, pages_empty = 0;
+    uint32_t pages_total = 0, pages_empty = 0, pages_starved = 0;
+    const uint32_t starved_pct = REXCVAR_GET(nx1_d3d9_starved_pct);
     for (size_t off = 0; off < scan_bytes; off += 4096) {
       const size_t end = (off + 4096 < scan_bytes) ? off + 4096 : scan_bytes;
-      uint32_t nz = 0;
-      for (size_t i = off; i < end && nz == 0; ++i) nz += src[i] != 0 ? 1 : 0;
+      // ZERO FRACTION, not "is the whole page zero". The old scan broke at the first non-zero byte,
+      // so a page that is 90% zero but has one data chunk at byte 0 -- which is exactly what a
+      // truncated stream-in looks like, and exactly what the 16B1E000 specimen is -- scored fully
+      // populated. Count every sample instead and let the threshold decide.
+      //
+      // STRIDE 4 because this now runs to the end of every page on every decode rather than
+      // early-outing on byte 0, and some sources are megabytes (1A38F000 is 4 MB). A fraction does
+      // not need every byte; 1024 samples per page is far more resolution than a percentage
+      // threshold can use. It is a ratio, not a checksum -- same reasoning as the keep_best sampler.
+      uint32_t samples = 0, zeros = 0;
+      for (size_t i = off; i < end; i += 4) {
+        ++samples;
+        zeros += src[i] == 0 ? 1 : 0;
+      }
+      src_bytes_sampled_ += samples;
+      src_bytes_zero_ += zeros;
+      samples_all += samples;
+      zeros_all += zeros;
+      // `nz` preserved with its ORIGINAL meaning (any non-zero byte in the page at all) so the
+      // empty/ever_written logic below is untouched. Derived from the same scan rather than a
+      // second pass; the stride cannot miss a wholly-zero page, and a page whose only non-zero
+      // bytes all fall between samples is 99.9% zero and is caught by the starved test anyway.
+      const uint32_t nz = samples - zeros;
+      if (samples && uint64_t(zeros) * 100u >= uint64_t(samples) * starved_pct) {
+        ++pages_starved;
+      }
       ++pages_total;
       // NEVER WRITTEN, not merely zero. An all-zero page is not evidence of missing data: a UI
       // logo on a transparent background is genuinely zero over most of its area, and treating
@@ -6724,6 +7299,234 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     }
     partial_pages = pages_empty;
     src_pages_total = pages_total;
+    starved_pages_sum_ += pages_starved;
+    if (pages_starved) {
+      ++starved_decodes_;
+    }
+
+    // *** THE DELIVERY-HOLE TEST: BASE vs ITS OWN MIP CHAIN ***
+    //
+    // STARVEDSRC alone cannot be the verdict -- it ran at 41% of decodes, and the screen is not 41%
+    // wrecked. Plenty of textures are legitimately sparse (alpha masks, decals, UI on transparent).
+    // The discriminator is the one stated at :7845 and never actually counted: a mip is a
+    // DOWNSAMPLE of the base, and downsampling preserves the mean, so a base that is mostly zero
+    // while its own half-size copy is mostly populated is an INTERNAL INCONSISTENCY that dark or
+    // sparse art cannot produce. Sparse art has an equally sparse mip chain and scores ~0 here.
+    //
+    // WHY NOT THE EXACTLY-ZERO RULE THE AUTOTRACK LATCH USES (:7906). That rule --
+    // `base_empty * 2 > base_total` -- would MISS the confirmed specimen: 16B1E000 is 89% zero and
+    // visibly wrecked (its GUEST1 mip decodes as a complete brick wall) yet has NO entirely-zero
+    // page, which is precisely why PARTIALSRC scored it 0. Undelivered memory is not always exactly
+    // zero at page granularity; a truncated stream leaves real data at the start of each page.
+    // Use the CONTRAST and the absolute zero-ness stops mattering.
+    //
+    // Reported, never acted on. If this becomes the trigger for a mip-chain fallback it has to earn
+    // it on a census first -- the premise before the code.
+    if (fi_scan_mip && t.mip_address && t.mip_address != t.base_address && samples_all) {
+      // LEVEL-1 EXTENT, not guest_bytes. The existing autotrack scan reads `guest_bytes` -- the
+      // BASE size -- at mip_address (:7896), so for this specimen it scans 8192 bytes where the
+      // chain from level 1 is ~2730, and two thirds of its mip statistic is unrelated memory.
+      // Same math as the mip1 dump at :7001 so the two agree about what "the mip" is.
+      const uint32_t mw = t.width > 1 ? t.width >> 1 : 1;
+      const uint32_t mh = height > 1 ? height >> 1 : 1;
+      const rex::graphics::TextureExtent mx = rex::graphics::TextureExtent::Calculate(
+          fi_scan_mip, mw, mh, /*depth=*/1, t.tiled, /*is_guest=*/true);
+      const size_t mbytes = size_t(mx.block_pitch_h) * mx.block_pitch_v * bpb_scan;
+      const uint32_t mphys = PhysicalAddress(t.mip_address);
+      constexpr uint64_t kPhysWindowBytes = 0x20000000ull;
+      if (mbytes && mphys && uint64_t(mphys) + mbytes <= kPhysWindowBytes) {
+        if (const uint8_t* mp = TranslatePhysical(t.mip_address)) {
+          uint32_t ms = 0, mz = 0;
+          for (size_t i = 0; i < mbytes; i += 4) {
+            ++ms;
+            mz += mp[i] == 0 ? 1 : 0;
+          }
+          if (ms) {
+            const uint32_t base_zero_pct = uint32_t(uint64_t(zeros_all) * 100u / samples_all);
+            const uint32_t mip_zero_pct = uint32_t(uint64_t(mz) * 100u / ms);
+            ++holetest_decodes_;
+            // *** THE CONTAMINATION CENSUS -- the population the zero metrics cannot see. ***
+            //
+            // DELIVERYHOLE (zero-fraction contrast) catches STARVED bases. It is blind to the roof
+            // specimen 126BE000, whose base is 3% zero -- MORE populated than a healthy texture --
+            // and decodes to pure confetti while its guest mip 1 is a clean shingle wall. Noise is
+            // maximally non-zero, so every zero-based test ranks it healthiest in the set.
+            //
+            // Correlation separates them: validated offline on 10 labelled pairs, healthy textures
+            // scored 0.991 (14BD6000, 16702000) and the roof scored -0.002.
+            //
+            // TWO correlations, because a single one is ambiguous. base-vs-mip1 says they DISAGREE,
+            // not which is wrong -- 11358000 is the reverse case (healthy base, noise mip chain),
+            // and acting on it would destroy a good texture. mip1-vs-mip2 says whether the CHAIN is
+            // internally self-consistent, which only a real chain can be. The conclusion "the BASE
+            // is the wrong one" needs both, and this census exists to check that mip1-vs-mip2
+            // behaves as predicted at scale before any rendering decision depends on it.
+            // ONLY REAL DXT. The thumbnail reads RGB565 endpoints, which exist only in DXT1/2/3/4/5.
+            // Gating on "4x4 blocks and bpb 8 or 16" also admitted DXN/BC-alpha (format 49, whose
+            // host format is A8R8G8B8 because we CPU-decode it): those blocks are two BC4 halves
+            // with no RGB565 anywhere, so the census was reading index bits as colour and feeding
+            // the result in as data. Confirmed offline -- specimen 10D3E000 scored -0.20/-0.02,
+            // pure noise, and f49 is common. Gate on the HOST format instead of the block shape.
+            const bool real_dxt = host.d3d == D3DFMT_DXT1 || host.d3d == D3DFMT_DXT2 ||
+                                  host.d3d == D3DFMT_DXT3 || host.d3d == D3DFMT_DXT4 ||
+                                  host.d3d == D3DFMT_DXT5;
+            if (real_dxt && (bpb_scan == 8 || bpb_scan == 16) && t.tiled) {
+              constexpr uint32_t kN = 32;  // 1024 samples per region; cost independent of size
+              std::vector<float> tb, t1, t2;
+              const bool swap16 = t.endian != uint32_t(rex::graphics::xenos::Endian::kNone);
+              // *** USE THE LAYOUT FUNCTION, NOT HAND-ROLLED OFFSETS. ***
+              //
+              // The first version of this census placed level 2 at `mip1_ptr + mip1_bytes` -- levels
+              // laid end to end. That is wrong for the same two reasons guest_plan records twenty
+              // lines away: it misses the 4 KB per-level subresource alignment, and it ignores the
+              // packed-tail rules. The result was a mip1-vs-mip2 histogram peaking at ZERO
+              // correlation -- a texture correlated against unrelated memory -- which is exactly
+              // what the CORRHIST check was added to catch, and it caught it.
+              //
+              // GetGuestTextureLayout returns mip_offsets_bytes[] and per-level row pitches that
+              // already encode both rules. Same call, same arguments as guest_plan, so the census
+              // and the decoder agree about where a level lives.
+              namespace tu3 = rex::graphics::texture_util;
+              const auto gl3 = tu3::GetGuestTextureLayout(
+                  rex::graphics::xenos::DataDimension::k2DOrStacked,
+                  (t.pitch_pixels ? t.pitch_pixels : t.width) >> 5, t.width, height, /*depth=*/1,
+                  t.tiled, static_cast<rex::graphics::xenos::TextureFormat>(t.format),
+                  t.packed_mips, /*has_base=*/true, t.mip_max_level);
+              // Build a level's extent exactly as guest_plan does: next_pow2 dimensions, pitches
+              // taken from the layout rather than re-derived, visible block counts from the real
+              // level size, and the packed-tile origin when this is the packed level.
+              const auto level_extent = [&](uint32_t m, uint32_t lw, uint32_t lh, uint32_t* ox,
+                                            uint32_t* oy) {
+                rex::graphics::TextureExtent e = rex::graphics::TextureExtent::Calculate(
+                    fi_scan_mip, std::max(rex::next_pow2(t.width) >> m, 1u),
+                    std::max(rex::next_pow2(height) >> m, 1u), /*depth=*/1, t.tiled,
+                    /*is_guest=*/true);
+                e.block_pitch_h = gl3.mips[m].row_pitch_bytes / bpb_scan;
+                e.block_pitch_v = gl3.mips[m].z_slice_stride_block_rows;
+                e.block_width = (lw + 3u) / 4u;
+                e.block_height = (lh + 3u) / 4u;
+                *ox = *oy = 0;
+                if (m == gl3.packed_level && t.packed_mips) {
+                  rex::graphics::TextureInfo::GetPackedTileOffset(
+                      std::max(rex::next_pow2(t.width) >> m, 1u),
+                      std::max(rex::next_pow2(height) >> m, 1u), fi_scan_mip, 0, ox, oy);
+                }
+                return e;
+              };
+              rex::graphics::TextureExtent ex_b = rex::graphics::TextureExtent::Calculate(
+                  fi_scan_mip, t.pitch_pixels ? t.pitch_pixels : t.width, height, 1, t.tiled, true);
+              ex_b.block_width = std::min(ex_b.block_width, (t.width + 3u) / 4u);
+              ex_b.block_height = std::min(ex_b.block_height, (height + 3u) / 4u);
+              // The BASE carries its own packed origin, already computed at :6496.
+              const bool ok_b =
+                  SampleBcThumb(src, ex_b, bpb_scan, t.tiled, kN, tb, swap16, packed_ox, packed_oy);
+              uint32_t ox1 = 0, oy1 = 0, ox2 = 0, oy2 = 0;
+              const uint32_t l1w = std::max(t.width >> 1, 1u), l1h = std::max(height >> 1, 1u);
+              const uint32_t l2w = std::max(t.width >> 2, 1u), l2h = std::max(height >> 2, 1u);
+              const uint32_t last_stored = std::min(gl3.max_level, gl3.packed_level);
+              bool ok_1 = false, ok_2 = false;
+              if (last_stored >= 1 && l1w >= 4 && l1h >= 4) {
+                const auto e1 = level_extent(1, l1w, l1h, &ox1, &oy1);
+                const uint64_t o1 = gl3.mip_offsets_bytes[1];
+                if (uint64_t(mphys) + o1 + gl3.mips[1].level_data_extent_bytes <= kPhysWindowBytes) {
+                  ok_1 = SampleBcThumb(mp + o1, e1, bpb_scan, t.tiled, kN, t1, swap16, ox1, oy1);
+                }
+              }
+              if (last_stored >= 2 && l2w >= 4 && l2h >= 4) {
+                const auto e2 = level_extent(2, l2w, l2h, &ox2, &oy2);
+                const uint64_t o2 = gl3.mip_offsets_bytes[2];
+                if (uint64_t(mphys) + o2 + gl3.mips[2].level_data_extent_bytes <= kPhysWindowBytes) {
+                  ok_2 = SampleBcThumb(mp + o2, e2, bpb_scan, t.tiled, kN, t2, swap16, ox2, oy2);
+                }
+              }
+              const float c_bm = (ok_b && ok_1) ? ThumbCorrelation(tb, t1) : 2.0f;
+              const float c_mm = (ok_1 && ok_2) ? ThumbCorrelation(t1, t2) : 2.0f;
+              // 2.0f means NOT MEASURED (a flat region has no variance). Counted separately --
+              // folding it into "disagrees" is how an empty mip chain would masquerade as a
+              // contaminated base.
+              if (c_bm > 1.5f || c_mm > 1.5f) {
+                ++corr_unmeasurable_;
+              } else {
+                ++corr_decodes_;
+                // HISTOGRAM BOTH CORRELATIONS, and read it before reading the threshold counts.
+                //
+                // The thumbnail is an APPROXIMATION (block endpoint means, sampled on a 32x32 grid)
+                // and it could not be validated offline against the quantity it actually computes:
+                // the dumps carry no raw bytes for the mip region, so only thumb-vs-OUR-DECODE was
+                // testable, which is a harsher comparison than thumb-vs-thumb. So the run has to
+                // validate the estimator itself. If mip1-vs-mip2 for the bulk of textures does NOT
+                // pile up near +1.0, the estimator is too noisy to separate anything and every
+                // threshold count below it is meaningless -- read the histogram FIRST.
+                const auto bucket = [](float c) {
+                  const int b = int((c + 1.0f) * 5.0f);  // [-1,1] -> 0..10
+                  return b < 0 ? 0 : (b > 9 ? 9 : b);
+                };
+                ++corr_hist_bm_[bucket(c_bm)];
+                ++corr_hist_mm_[bucket(c_mm)];
+                // *** THE CONTROL THAT ACTUALLY VALIDATES THE ESTIMATOR. ***
+                //
+                // The marginal mip1-vs-mip2 histogram cannot do it: ~half the guest mip chains hold
+                // NOISE (3 of 7 dumped chains), and for those ~0 is the CORRECT answer, so a
+                // bimodal spread is what a WORKING estimator produces. The original criterion
+                // ("must pile up on the right") assumed every chain is real and was simply wrong.
+                //
+                // Condition instead. When base-vs-mip1 is HIGH the texture is demonstrably healthy
+                // AND its chain is demonstrably real -- there is no way to correlate strongly with
+                // a noise chain. So for that subset mip1-vs-mip2 MUST also be high. If it is not,
+                // the estimator is noisy and nothing built on it counts. This is a check the
+                // instrument can fail, on a subset selected by a signal independent of the one
+                // being validated.
+                // SWEEP THE THRESHOLD INSTEAD OF ASSUMING ONE. The 0.70 gate was borrowed from the
+                // DECODED-IMAGE experiment, where healthy textures scored 0.991. This estimator is
+                // weaker: the one clean specimen measured offline scores 0.704, i.e. sitting ON the
+                // threshold, so noise alone flips it either way and CORRCTRL reads ~62% whether or
+                // not the estimator works. Report the control at several cut points and let the
+                // data say where healthy actually sits, rather than importing a number from a
+                // different estimator.
+                for (int k = 0; k < kCorrCuts; ++k) {
+                  const float cut = 0.4f + 0.1f * float(k);  // 0.4 .. 0.8
+                  if (c_bm >= cut) {
+                    ++corr_healthy_at_[k];
+                    if (c_mm >= cut) {
+                      ++corr_healthy_chain_ok_at_[k];
+                    }
+                  }
+                }
+                const float agree = REXCVAR_GET(nx1_d3d9_corr_agree_pct) / 100.0f;
+                const float disagree = REXCVAR_GET(nx1_d3d9_corr_disagree_pct) / 100.0f;
+                const bool chain_ok = c_mm >= agree;
+                const bool base_bad = c_bm < disagree;
+                if (chain_ok) ++corr_chain_ok_;
+                if (chain_ok && base_bad) {
+                  ++corr_base_bad_;
+                  if (corr_base_bad_ <= 16 || (corr_base_bad_ % 500) == 0) {
+                    NX1_LOGW_TEX("nx1_d3d9: CONTAMINATED {:08X} {}x{} fmt={} -- base correlates "
+                                 "{:.3f} with its own mip1 while mip1 correlates {:.3f} with mip2. "
+                                 "The chain is self-consistent and the base disagrees with it, so "
+                                 "the BASE holds foreign data (base {}% zero, mip {}% zero)",
+                                 t.base_address, t.width, height, t.format, c_bm, c_mm,
+                                 base_zero_pct, mip_zero_pct);
+                  }
+                }
+              }
+            }
+            if (base_zero_pct >= mip_zero_pct + REXCVAR_GET(nx1_d3d9_hole_margin_pct)) {
+              ++holetest_hits_;
+              // Bounded, and prints BOTH percentages so the call can be checked rather than
+              // trusted -- this is close enough to "inferring badness from content" that a reader
+              // must be able to audit it.
+              if (holetest_hits_ <= 16 || (holetest_hits_ % 500) == 0) {
+                NX1_LOGW_TEX("nx1_d3d9: DELIVERYHOLE {:08X} {}x{} fmt={} -- base is {}% zero while "
+                             "its own mip chain at {:08X} is {}% zero. A mip is a downsample, so "
+                             "this disagreement cannot be dark art; the base was not delivered",
+                             t.base_address, t.width, height, t.format, base_zero_pct,
+                             t.mip_address, mip_zero_pct);
+              }
+            }
+          }
+        }
+      }
+    }
     if (pages_empty && budget) {
       uint64_t h = 1469598103934665603ull;
       const size_t hashed = size_t(dst_row_bytes) * extent.block_height;
@@ -7016,6 +7819,70 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
           DumpRgbaBmp(mpath, mimg, mw, mh);
           REXGPU_INFO("nx1_d3d9: MIPDUMP base={:08X} -> mip1 from {:08X} ({}x{})", t.base_address,
                       t.mip_address, mw, mh);
+        }
+      }
+      // RAW MIP-REGION BYTES + THE LAYOUT THAT DESCRIBES THEM.
+      //
+      // Without this, the only thing testable offline was thumbnail-vs-our-own-decode, which is a
+      // HARSHER comparison than the thumbnail-vs-thumbnail a runtime detector actually computes --
+      // so three estimator bugs had to be found by spending play-test runs instead of by iterating
+      // offline for free. The mip region is the half that was never dumped.
+      //
+      // THE LAYOUT IS WRITTEN OUT, NOT LEFT TO BE RE-DERIVED. Re-deriving it offline is exactly
+      // what produced a mip2 offset of `mip1 + mip1_bytes` and a census that correlated a texture
+      // against unrelated memory. Levels are not end-to-end: there is 4 KB subresource alignment
+      // and the packed-tail rules, both of which GetGuestTextureLayout already encodes. Emitting
+      // per-level offset/pitch/extent/packed-origin means an offline tool never has to guess.
+      namespace tu4 = rex::graphics::texture_util;
+      const auto gl4 = tu4::GetGuestTextureLayout(
+          rex::graphics::xenos::DataDimension::k2DOrStacked,
+          (t.pitch_pixels ? t.pitch_pixels : t.width) >> 5, t.width, height, /*depth=*/1, t.tiled,
+          static_cast<rex::graphics::xenos::TextureFormat>(t.format), t.packed_mips,
+          /*has_base=*/true, t.mip_max_level);
+      const uint32_t last_stored4 = std::min(gl4.max_level, gl4.packed_level);
+      uint32_t chain_bytes = 0;
+      for (uint32_t m = 1; m <= last_stored4; ++m) {
+        chain_bytes = std::max(chain_bytes,
+                               gl4.mip_offsets_bytes[m] + gl4.mips[m].level_data_extent_bytes);
+      }
+      if (chain_bytes && chain_bytes <= (1u << 24)) {
+        if (const uint8_t* craw = MirrorSnapshot(t.mip_address, chain_bytes)) {
+          char cpath[256];
+          std::snprintf(cpath, sizeof(cpath), "texdump/gmipraw_%08X_%ux%u_f%u.bin", t.mip_address,
+                        t.width, height, t.format);
+          if (FILE* f = std::fopen(cpath, "wb")) {
+            std::fwrite(craw, 1, chain_bytes, f);
+            std::fclose(f);
+          }
+          std::snprintf(cpath, sizeof(cpath), "texdump/gmipraw_%08X_%ux%u_f%u.txt", t.mip_address,
+                        t.width, height, t.format);
+          if (FILE* f = std::fopen(cpath, "wb")) {
+            std::fprintf(f,
+                         "base=%08X mip_address=%08X width=%u height=%u format=%u bpb=%u\n"
+                         "tiled=%u endian=%u packed_mips=%u mip_max_level=%u packed_level=%u "
+                         "max_level=%u chain_bytes=%u\n",
+                         t.base_address, t.mip_address, t.width, height, t.format, bpb,
+                         t.tiled ? 1u : 0u, t.endian, t.packed_mips ? 1u : 0u, t.mip_max_level,
+                         gl4.packed_level, gl4.max_level, chain_bytes);
+            for (uint32_t m = 1; m <= last_stored4; ++m) {
+              const uint32_t lw = std::max(t.width >> m, 1u), lh = std::max(height >> m, 1u);
+              uint32_t ox = 0, oy = 0;
+              if (m == gl4.packed_level && t.packed_mips) {
+                rex::graphics::TextureInfo::GetPackedTileOffset(
+                    std::max(rex::next_pow2(t.width) >> m, 1u),
+                    std::max(rex::next_pow2(height) >> m, 1u), fmt, 0, &ox, &oy);
+              }
+              std::fprintf(f,
+                           "level=%u w=%u h=%u offset=%u row_pitch_bytes=%u "
+                           "z_slice_stride_block_rows=%u extent_bytes=%u packed_ox=%u packed_oy=%u\n",
+                           m, lw, lh, gl4.mip_offsets_bytes[m], gl4.mips[m].row_pitch_bytes,
+                           gl4.mips[m].z_slice_stride_block_rows,
+                           gl4.mips[m].level_data_extent_bytes, ox, oy);
+            }
+            std::fclose(f);
+          }
+          REXGPU_INFO("nx1_d3d9: MIPRAW {:08X} chain {} bytes, levels 1..{} -> texdump/gmipraw_*",
+                      t.mip_address, chain_bytes, last_stored4);
         }
       }
     }
@@ -7393,6 +8260,10 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     const uint8_t* mip_base_src;
     if (REXCVAR_GET(nx1_d3d9_texture_mirror)) {
       mip_base_src = MirrorSnapshot(t.mip_address, guest_mip_bytes);
+      // The guest mip chain is a SEPARATE POOL SLOT from base_address and goes stale independently.
+      // Note the address passed is t.mip_address, not t.base_address -- comparing the mip snapshot
+      // against the base's live memory would have manufactured a 100% staleness rate.
+      CheckMirrorStale(StaleSite::kMip, mip_base_src, t.mip_address, guest_mip_bytes, t, height);
     } else {
       ArmWriteWatch(t.mip_address, guest_mip_bytes);
       mip_base_src = TranslatePhysical(t.mip_address);
@@ -7818,7 +8689,11 @@ IDirect3DBaseTexture9* ResourceTracker::GetTexture(const uint8_t* base,
     ++partial_decodes_;
     partial_pages_sum_ += partial_pages;
   }
-  const bool partial = partial_pages != 0 && REXCVAR_GET(nx1_d3d9_retry_partial);
+  // RETENTION: retrying because the SOURCE looked incomplete is a content judgement, and the
+  // reference makes none -- a load is retried only when it FAILED, never because the bytes looked
+  // wrong. (Measured cost anyway: 732 rebuilds, zero content changes.)
+  const bool partial = partial_pages != 0 && REXCVAR_GET(nx1_d3d9_retry_partial) &&
+                       !REXCVAR_GET(nx1_d3d9_retain_mirror);
   if (swizzle_all_zero || partial) {
     // FIRST CAUSE WINS. dirty_source used to be overwritten by whichever source fired last
     // before the rebuild, and the probe runs on every bind of every frame while the write and

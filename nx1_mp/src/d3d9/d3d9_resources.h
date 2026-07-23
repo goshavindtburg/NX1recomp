@@ -881,8 +881,51 @@ class ResourceTracker {
 
   /// Snapshot-staleness census (nx1_d3d9_dbg_mirrorstale): how often the bytes a decode is about
   /// to read differ from what guest memory holds at that instant.
-  uint64_t mirrorstale_decodes_ = 0, mirrorstale_stale_decodes_ = 0;
-  uint64_t mirrorstale_pages_ = 0, mirrorstale_stale_pages_ = 0;
+  ///
+  /// SPLIT BY SOURCE. The decode has TWO independent mirror reads -- level 0 from base_address and
+  /// the guest mip chain from mip_address -- and they are DIFFERENT POOL SLOTS (see
+  /// [[nx1-d3d9-mipmaps]]: mip_address usually points at another image entirely). Only the base was
+  /// ever instrumented, so a stale mip chain was invisible, and "the surface resolves when I get
+  /// close" is precisely a mip-level transition. Reporting one merged number would not have been
+  /// able to tell those two apart.
+  enum class StaleSite { kBase, kMip };
+  void CheckMirrorStale(StaleSite site, const uint8_t* snapshot, uint32_t base_address,
+                        size_t bytes, const TextureFetchConstant& t, uint32_t height);
+
+  /// Indexed by StaleSite. Every counter is printed unconditionally, including zero, alongside the
+  /// number of decodes EVALUATED -- a zero here must be readable as "measured, nothing stale"
+  /// rather than "the site never ran". See [[nx1-instruments-lie]].
+  uint64_t mirrorstale_decodes_[2] = {0, 0}, mirrorstale_stale_decodes_[2] = {0, 0};
+  uint64_t mirrorstale_pages_[2] = {0, 0}, mirrorstale_stale_pages_[2] = {0, 0};
+
+  /// CENSUS, NOT A RATE -- and the rate is the misleading number here.
+  ///
+  /// Every rebuild path calls InvalidateMirrorPages on the range before the decode reads it (the
+  /// probe explicitly, DrainMemoryWrites for write/DMA-driven rebuilds), so a RE-decode re-copies
+  /// the snapshot from live microseconds earlier and is clean BY CONSTRUCTION. Those dominate the
+  /// denominator, so the stale RATE is diluted by a population that could never have failed and
+  /// says nothing about exposure. See [[nx1-instruments-lie]]: a test whose result is forced by its
+  /// own construction proves nothing.
+  ///
+  /// What matters is the absolute set of ADDRESSES that were ever decoded from a stale snapshot and
+  /// are STILL BEING SERVED. Those are the "wrong forever" cases -- nothing will dirty them again,
+  /// so the bad decode is what stays on screen. A handful of them is enough to corrupt a whole
+  /// structure, since a building runs on a few materials.
+  ///
+  /// CAPTURED UNCONDITIONALLY, FILTERED AT REPORT TIME. Liveness is judged against live_bases_ when
+  /// the report runs, never at capture time -- filtering at capture is what biased FETCHSET's orphan
+  /// sample toward the start of the run and made one shader look responsible for 87% of a problem it
+  /// caused 9% of.
+  struct StaleAddr {
+    uint64_t first_frame = 0, last_frame = 0;
+    uint32_t decodes = 0, pages_stale = 0, pages_total = 0;
+    uint32_t width = 0, height = 0, format = 0;
+  };
+  std::map<uint32_t, StaleAddr> mirrorstale_addrs_;
+  /// Bounded so a pathological run cannot grow this without limit -- and the cap is REPORTED when
+  /// hit, never applied silently, or the census would read as complete while dropping addresses.
+  static constexpr size_t kStaleAddrMax = 4096;
+  uint64_t mirrorstale_addrs_dropped_ = 0;
 
   std::unordered_map<uint32_t, uint32_t> writeback_counts_;
 
@@ -941,6 +984,9 @@ class ResourceTracker {
   uint64_t mips_skip_nochain_ = 0;     ///< guest declares mip_max_level == 0
   uint64_t mips_skip_unsupported_ = 0; ///< no autogen and not block-compressed
   uint64_t dma_invalidations_ = 0;     ///< textures re-decoded after a mirrored DMA
+  /// Full-retention test (nx1_d3d9_cpu_invalidate off): CPU stores seen but NOT queued as
+  /// invalidations. Must climb, or a no-change result cannot be told from the path not running.
+  std::atomic<uint64_t> cpu_invalidate_suppressed_{0};
   uint64_t resolve_served_ = 0;        ///< binds served from the resolve map
   uint64_t resolve_rejected_ = 0;      ///< resolve hits refused on a size mismatch
   uint64_t repeating_source_binds_ = 0;    ///< source repeats at a short period
@@ -987,6 +1033,65 @@ class ResourceTracker {
   uint64_t partial_decodes_ = 0;       ///< of those, decoded with one or more empty source pages
   uint64_t decode_pages_sum_ = 0;      ///< source pages examined across all decodes
   uint64_t partial_pages_sum_ = 0;     ///< of those, pages that were entirely zero
+
+  /// STARVED = page is >= nx1_d3d9_starved_pct zero, as opposed to ENTIRELY zero.
+  ///
+  /// `partial_pages_sum_` above cannot see the artifact and never could. Its scan breaks at the
+  /// first non-zero byte and scores a page empty only if the WHOLE page is zero; the captured
+  /// specimen (16B1E000, a visibly wrecked roof) has a data chunk at byte 0 of both its pages and
+  /// is 89-91% zero overall, so it reads as fully populated. PARTIALSRC has therefore reported ~0%
+  /// while whole buildings were made of half-empty textures. The same defect was already found once
+  /// for autotrack (:725) and worked around locally instead of being fixed at the source.
+  ///
+  /// DELIBERATELY A SEPARATE COUNTER, NOT A REDEFINITION of partial_pages. That variable drives
+  /// behaviour -- `entry.decoded_from_partial` and the `nx1_d3d9_retry_partial` path -- so widening
+  /// it would change what the renderer DOES in the same edit that changes what it MEASURES, which
+  /// is the two-variable error this investigation keeps paying for. These are pure instrument.
+  uint64_t starved_decodes_ = 0;       ///< decodes with >=1 starved source page
+  uint64_t starved_pages_sum_ = 0;     ///< starved source pages across all decodes
+  uint64_t src_bytes_sampled_ = 0;     ///< bytes sampled by the zero-fraction scan
+  uint64_t src_bytes_zero_ = 0;        ///< of those, bytes that were zero
+
+  /// DELIVERY HOLE: base is much emptier than its OWN mip chain. A mip is a downsample and
+  /// downsampling preserves the mean, so this disagreement cannot be produced by dark or sparse
+  /// art -- which is what makes it a structural test rather than the seventh content classifier.
+  /// `holetest_decodes_` is the denominator (decodes that HAD a distinct mip chain to compare
+  /// against); without it a zero could not be told from "the comparison never ran".
+  uint64_t holetest_decodes_ = 0;
+  uint64_t holetest_hits_ = 0;
+
+  /// CONTAMINATION census: base disagrees with a mip chain that is internally self-consistent.
+  /// Catches the population every zero-based metric is blind to (the roof, 126BE000: base 3% zero
+  /// yet pure confetti). `corr_unmeasurable_` is counted separately and deliberately -- a flat or
+  /// empty region has no variance, and folding "cannot measure" into "disagrees" would make every
+  /// empty mip chain masquerade as a contaminated base.
+  uint64_t corr_decodes_ = 0;       ///< decodes where BOTH correlations were measurable
+  uint64_t corr_unmeasurable_ = 0;  ///< at least one region had no variance
+  uint64_t corr_chain_ok_ = 0;      ///< of the measurable, chain was self-consistent
+  uint64_t corr_base_bad_ = 0;      ///< of those, base disagreed with the chain
+  /// Distribution of both correlations, bucketed over [-1,+1] in 0.2 steps. THE ESTIMATOR'S OWN
+  /// VALIDATION: the thumbnail is an approximation that could not be checked offline against the
+  /// quantity it actually computes, so if mip1-vs-mip2 does not pile up near +1 for the bulk of
+  /// textures, it is too noisy to separate anything and the threshold counts mean nothing.
+  uint64_t corr_hist_bm_[10] = {};
+  uint64_t corr_hist_mm_[10] = {};
+  /// CONDITIONAL CONTROL. Of decodes whose base correlates strongly with mip1 (so the texture is
+  /// healthy AND the chain is provably real), how many ALSO show a self-consistent chain? Must be
+  /// near 100% if the estimator works. The marginal histogram cannot test this because ~half the
+  /// chains are genuinely noise and correctly read ~0.
+  /// Swept over cut points 0.4/0.5/0.6/0.7/0.8 rather than fixed at one, because the estimator's
+  /// "healthy" value is itself unknown -- borrowing 0.70 from the decoded-image experiment put the
+  /// cut exactly where clean textures land, so the control could not distinguish a working
+  /// estimator from a broken one.
+  static constexpr int kCorrCuts = 5;
+  uint64_t corr_healthy_at_[kCorrCuts] = {};
+  uint64_t corr_healthy_chain_ok_at_[kCorrCuts] = {};
+
+  /// nx1_d3d9_mip_fallback: textures where the detector RAN (both correlations measurable) and,
+  /// of those, how many were rebuilt from the guest chain. Both printed, because a hit count
+  /// without its denominator cannot distinguish "nothing qualified" from "the detector never ran".
+  uint64_t chainfix_tested_ = 0;
+  uint64_t chainfix_hits_ = 0;
   uint64_t torn_checked_ = 0;          ///< mirror pages double-copied for the torn-page test
   uint64_t torn_pages_ = 0;            ///< of those, how many changed mid-copy
 };

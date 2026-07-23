@@ -1177,6 +1177,23 @@ void NoteDmaChain(uint32_t dst, uint32_t src, uint32_t bytes, bool src_empty) {
 /// (the forced re-decode ladder re-read recycled slots). Every copy stamps its destination pages
 /// with a sequence number; a retry is abandoned if any newer copy has targeted the same pages,
 /// so we can never land bytes over a fresher occupant.
+/// Does the DMA mirror ANNOUNCE its writes to the texture cache?
+///
+/// The mirror exists because the guest's image-cache DMA does not otherwise happen on the host, and
+/// it is load-bearing -- with the copy off, smoke breaks and speckle worsens. But the reference has
+/// no such mechanism at all: it never writes guest RAM host-side, so it never sends this
+/// notification, and a texture whose slot is recycled keeps the bytes the reference banked while
+/// they were valid. We announce, the cache re-reads, and the distant surface picks up the new
+/// occupant's pixels -- which is exactly the "breaks when I back up, resolves when I get close"
+/// behaviour the user reproduced.
+///
+/// Turning this OFF keeps delivering the bytes and stops announcing them. Counter below so a
+/// no-change result can be told from the path not running.
+REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_invalidate, true, "GPU",
+                    "Announce DMA-mirror writes to the texture cache. Off = deliver the bytes but "
+                    "let the cache keep its existing decode, as the reference does");
+std::atomic<uint64_t> g_dma_invalidate_suppressed{0};
+
 REXCVAR_DEFINE_BOOL(nx1_d3d9_dma_retry, true, "GPU",
                     "Retry image-cache copies whose source was not yet filled at call time, "
                     "instead of dropping them. Off = the old drop-on-empty behaviour");
@@ -1571,8 +1588,24 @@ uint32_t CopyLiveSourcePages(uint8_t* base, uint32_t dst, uint32_t src, uint32_t
     if (REXCVAR_GET(nx1_d3d9_dbg_pageorigin)) {
       MarkDmaPageWritten(dst + off);
     }
-    nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange(
-        (dst + off) & 0x1FFFFFFF, chunk, nx1::d3d9::DirtySource::kDma);
+    // *** DELIVER THE BYTES, BUT DO NOT NECESSARILY ANNOUNCE THEM. See nx1_d3d9_dma_invalidate.
+    //
+    // The reference has NO equivalent of this mirror -- it never writes guest RAM host-side and
+    // has no image-cache DMA case at all, so it never sends a notification like this one either.
+    // Ours makes the texture cache re-read the slot, and DRAINHIT measures that landing on a live
+    // texture 9,853 times a run. When the streamer recycles a slot for a distant surface, that
+    // re-read is what swaps the old texture's pixels for the new occupant's.
+    //
+    // Note this is NOT the same experiment as nx1_d3d9_dmacopy_mirror=1: that stops the COPY,
+    // which is load-bearing (smoke depends on it and speckle got worse without it). This stops
+    // only the ANNOUNCEMENT while the bytes still land, which is the reference's behaviour and
+    // has never been tested separately.
+    if (REXCVAR_GET(nx1_d3d9_dma_invalidate)) {
+      nx1::d3d9::ResourceTracker::Get().InvalidateGuestRange(
+          (dst + off) & 0x1FFFFFFF, chunk, nx1::d3d9::DirtySource::kDma);
+    } else {
+      ++g_dma_invalidate_suppressed;
+    }
     ++copied;
   }
   return copied;
@@ -1932,6 +1965,12 @@ REX_HOOK_RAW(rex_ImageCache_DmaCopy) {
   }
   if ((n % 100) == 99) {  // fine-grained: the D3D9-mode run never even reached the old 500
     REXGPU_WARN("nx1_d3d9: DMACOPY volume {} calls, {} MiB total", n + 1, tb >> 20);
+    // ARMING PROOF for nx1_d3d9_dma_invalidate. A no-change result is only readable if this is
+    // non-zero with the cvar off -- otherwise "no change" and "the path never ran" look identical.
+    REXGPU_WARN("nx1_d3d9: DMAINV announce={} suppressed={} -- with nx1_d3d9_dma_invalidate off "
+                "this must climb, or the DMA copies are not reaching the gate at all",
+                REXCVAR_GET(nx1_d3d9_dma_invalidate) ? "ON" : "off",
+                g_dma_invalidate_suppressed.load(std::memory_order_relaxed));
   }
   if (mode >= 2) {
     // a5 confirmed as the byte count by the logged run: clean page multiples, and dst/size
